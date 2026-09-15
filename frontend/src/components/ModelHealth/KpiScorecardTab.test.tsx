@@ -98,6 +98,27 @@ describe("KpiScorecardTab", () => {
     expect(screen.getByText("kpiScorecard.noKpisDescription")).toBeTruthy();
   });
 
+  // Bug-9585 (round-3 external review): a failed request must not collapse
+  // into the "no KPIs" empty state — that misrepresents an outage as a
+  // legitimate finding. Mirrors NamedSetsScorecardTab's identical fix.
+  it("shows a retryable error, not the empty state, when the request fails", () => {
+    const refetch = vi.fn();
+    useKpisMock.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch,
+    });
+    useKpiBatchEvaluationMock.mockReturnValue({ data: undefined, isLoading: false });
+
+    renderTab();
+    expect(screen.getByText("kpiScorecard.loadError")).toBeTruthy();
+    expect(screen.queryByText("kpiScorecard.noKpisTitle")).toBeNull();
+
+    screen.getByText("common.retry").click();
+    expect(refetch).toHaveBeenCalled();
+  });
+
   it("renders KPI cards with batch evaluation data", () => {
     const kpis = [
       makeKpi("k1", "Revenue"),

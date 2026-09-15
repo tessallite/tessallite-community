@@ -235,36 +235,45 @@ class TestCredentialCacheInvalidation:
     """Bug-6309: a JWT must not be served after the auth material changes."""
 
     def test_put_evicts_prior_password_entry(self):
-        # A fresh login with a NEW password for the same (catalog, user) must
-        # evict the OLD-password entry so it cannot keep being served.
-        credential_cache.put("acme", "u@acme.com", "old-pw", "jwt-old")
-        assert credential_cache.get("acme", "u@acme.com", "old-pw") == "jwt-old"
-        credential_cache.put("acme", "u@acme.com", "new-pw", "jwt-new")
-        assert credential_cache.get("acme", "u@acme.com", "old-pw") is None
-        assert credential_cache.get("acme", "u@acme.com", "new-pw") == "jwt-new"
+        # A fresh login with a NEW password for the same user must evict the
+        # OLD-password entry so it cannot keep being served.
+        credential_cache.put("u@acme.com", "old-pw", "jwt-old")
+        assert credential_cache.get("u@acme.com", "old-pw") == "jwt-old"
+        credential_cache.put("u@acme.com", "new-pw", "jwt-new")
+        assert credential_cache.get("u@acme.com", "old-pw") is None
+        assert credential_cache.get("u@acme.com", "new-pw") == "jwt-new"
 
     def test_invalidate_purges_user_entry(self):
-        credential_cache.put("acme", "u@acme.com", "pw", "jwt")
-        credential_cache.invalidate("acme", "u@acme.com")
-        assert credential_cache.get("acme", "u@acme.com", "pw") is None
+        credential_cache.put("u@acme.com", "pw", "jwt")
+        credential_cache.invalidate("u@acme.com")
+        assert credential_cache.get("u@acme.com", "pw") is None
 
     def test_ttl_is_not_extended_by_reads(self):
         # A read must never refresh the entry's age (non-extendable lifetime),
         # so a disabled account / changed password cannot be kept alive by a
         # steady request burst. Serving with ttl<=0 proves the age gate fires.
-        credential_cache.put("acme", "u@acme.com", "pw", "jwt")
-        assert credential_cache.get("acme", "u@acme.com", "pw", ttl=0) is None
+        credential_cache.put("u@acme.com", "pw", "jwt")
+        assert credential_cache.get("u@acme.com", "pw", ttl=0) is None
         # And the expired entry was swept.
-        assert credential_cache.get("acme", "u@acme.com", "pw") is None
+        assert credential_cache.get("u@acme.com", "pw") is None
 
     def test_rejected_login_invalidates_stale_cache(self, monkeypatch):
         # Seed a cache entry for the old password, then present a new/changed
         # password that misses the cache and is REJECTED upstream. The rejection
         # must purge the stale old-password entry so it is no longer served.
-        credential_cache.put("", "u", "old-pw", "jwt-stale")
+        credential_cache.put("u", "old-pw", "jwt-stale")
 
         async def _reject(username, password):
-            raise ValueError("bad credentials")
+            # The shape production actually produces. This raised a bare
+            # ValueError until the Bug-5534 review: login_discover's own
+            # docstring says an all-tenants rejection is an HTTP 401, and the
+            # only ValueError it raises is a MISSING access_token cookie — a
+            # backend protocol fault, not a rejection. Simulating a rejection
+            # with ValueError tested a path that never occurs.
+            raise httpx.HTTPStatusError(
+                "401", request=httpx.Request("POST", "http://ms/login"),
+                response=httpx.Response(401),
+            )
 
         monkeypatch.setattr("src.dax.auth_basic.login_discover", _reject)
         client = _build_client()
@@ -272,7 +281,7 @@ class TestCredentialCacheInvalidation:
         resp = client.post("/api/v1/xmla", content=soap, headers=_basic("u", "new-pw"))
         assert resp.status_code == 401
         # The stale old-password token is gone.
-        assert credential_cache.get("", "u", "old-pw") is None
+        assert credential_cache.get("u", "old-pw") is None
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +315,47 @@ class TestCatalogNotTenant:
         assert resp.json()["jwt"] == "jwt-discovered"
         assert events == [("login", "modelx"), ("discover", "u")]
 
-    def test_operational_error_surfaces_as_401_not_swallowed(self, monkeypatch):
+    def test_locked_catalog_429_does_not_fall_through_to_discovery(self, monkeypatch):
+        """Bug-9799: a generic 429 is a real lockout, not an unknown Catalog.
+
+        Bug-9799's property — a lockout must NOT fall through to cross-tenant
+        discovery — is unchanged and still asserted by ``_fake_discover``.
+        What changed in the Bug-5534 review is the outward code: a lockout is
+        relayed as 429, not reported as 401. The credentials may be perfectly
+        correct and merely throttled, and a 401 carries WWW-Authenticate, which
+        prompts MSOLAP to ask for a new password mid-lockout.
+        """
+        async def _fake_login(catalog, username, password):
+            raise httpx.HTTPStatusError(
+                "429", request=httpx.Request("POST", "http://x"),
+                response=httpx.Response(429),
+            )
+
+        async def _fake_discover(username, password):  # pragma: no cover
+            raise AssertionError("locked tenant login must not fall through")
+
+        monkeypatch.setattr("src.dax.auth_basic.login_for_token", _fake_login)
+        monkeypatch.setattr("src.dax.auth_basic.login_discover", _fake_discover)
+        client = _build_client()
+        resp = client.post(
+            "/api/v1/xmla", content=_SOAP_WITH_CATALOG, headers=_basic("u", "pw")
+        )
+        assert resp.status_code == 429
+        assert "WWW-Authenticate" not in resp.headers
+        assert int(resp.headers["Retry-After"]) > 0
+
+    def test_operational_error_surfaces_as_503_not_swallowed(self, monkeypatch):
+        """An upstream 5xx is the authority failing to answer, not a rejection.
+
+        This asserted 401 until Bug-5534 item B. The INTENT — an operational
+        error must not be swallowed and must not fall through to discovery — is
+        unchanged and still asserted below; only the status changed, and that
+        change is the point: a cold Cloud Run model-service raising a timeout
+        was reported to Power BI as wrong credentials, so the operator
+        re-checked passwords through the very window a retry would have
+        survived. A 401 also carries WWW-Authenticate, which re-prompts for a
+        password that was never wrong.
+        """
         async def _fake_login(catalog, username, password):
             raise httpx.HTTPStatusError(
                 "503", request=httpx.Request("POST", "http://x"),
@@ -322,4 +371,32 @@ class TestCatalogNotTenant:
         resp = client.post(
             "/api/v1/xmla", content=_SOAP_WITH_CATALOG, headers=_basic("u", "pw")
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 503
+        assert "WWW-Authenticate" not in resp.headers
+
+
+class TestBug9869PaddedUserName:
+    """Bug-9869 (ALEX, 2026-09-04): a user name padded with whitespace reached
+    the login (which matched the account) while the credential cache and every
+    following request keyed on the padded value and answered 401. The name is
+    normalised once, before login and cache alike; the password is untouched."""
+
+    def test_padded_user_name_is_normalised_for_login_and_cache(self, monkeypatch):
+        seen = []
+
+        async def _fake_discover(username, password):
+            seen.append((username, password))
+            return "jwt-admin"
+
+        monkeypatch.setattr("src.dax.auth_basic.login_discover", _fake_discover)
+        client = _build_client()
+        soap = "<Envelope><Body><Discover/></Body></Envelope>"
+        padded = _basic(" admin@acme-demo.com ", " pw ")
+        clean = _basic("admin@acme-demo.com", " pw ")
+        for headers in (padded, clean, padded):
+            resp = client.post("/api/v1/xmla", content=soap, headers=headers)
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["jwt"] == "jwt-admin"
+        # One login for the burst: padded and clean spellings share the cache
+        # entry, and the password kept its own surrounding spaces.
+        assert seen == [("admin@acme-demo.com", " pw ")]

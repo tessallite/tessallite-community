@@ -67,7 +67,8 @@ def build_closure_context(
       ``table_identifiers`` — physical-name sets for the calc-dimension gate,
       derived from the snapshot's ``columns`` and ``tables``.
     """
-    ctx = ClosureContext()
+    # The snapshot's measure list IS the whole deployed universe.
+    ctx = ClosureContext(measure_universe_complete=True)
     for m in measures:
         mv = _AttrView(m)
         mid = m.get("id")

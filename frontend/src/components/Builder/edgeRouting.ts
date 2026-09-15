@@ -1,8 +1,24 @@
+/**
+ * Primitive edge-route geometry: points, the axis helpers, the plain
+ * orthogonal auto-router, the SVG path builder and the segment-drag maths.
+ *
+ * Card geometry and docking live in `edgeGeometry.ts`; manual orthogonal
+ * editing lives in `edgeOrthogonal.ts`. Both build on this module.
+ */
 import { Position } from "reactflow";
 
 export interface Pt {
   x: number;
   y: number;
+}
+
+/** Axis-alignment comparisons, at the tolerance every edge module works to. */
+export function sameX(a: Pt, b: Pt): boolean {
+  return Math.abs(a.x - b.x) < 0.01;
+}
+
+export function sameY(a: Pt, b: Pt): boolean {
+  return Math.abs(a.y - b.y) < 0.01;
 }
 
 export function awayVec(pos: Position): [number, number] {

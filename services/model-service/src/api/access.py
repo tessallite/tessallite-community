@@ -304,12 +304,12 @@ async def grant_access(
                 "model_id": str(body.model_id) if body.model_id else None,
             },
         )
+        await db.commit()
         await emit_webhook(current_user.tenant_id, "access.granted", {
             "user_identity": user_identity,
             "role": body.role,
             "project_id": str(project_id),
         })
-        await db.commit()
         await db.refresh(binding)
         return UserAccessBindingResponse.model_validate(binding)
 
@@ -428,12 +428,12 @@ async def repair_project_admin_binding(
                 "reason": "F-021-04 legacy binding-less project repair",
             },
         )
+        await db.commit()
         await emit_webhook(current_user.tenant_id, "access.granted", {
             "user_identity": user_identity,
             "role": "admin",
             "project_id": str(project_id),
         })
-        await db.commit()
         await db.refresh(binding)
         return UserAccessBindingResponse.model_validate(binding)
     raise HTTPException(status_code=500, detail="DB session exhausted")
@@ -484,10 +484,15 @@ async def revoke_access(
                 "project_id": str(project_id),
             },
         )
-        await emit_webhook(current_user.tenant_id, "access.revoked", {
+        webhook_payload = {
             "user_identity": binding.user_identity,
             "role": binding.role,
             "project_id": str(project_id),
-        })
+        }
         await db.delete(binding)
         await db.commit()
+        await emit_webhook(
+            current_user.tenant_id,
+            "access.revoked",
+            webhook_payload,
+        )

@@ -223,6 +223,7 @@ async def _validate_via_router(
         "raw_query": sql,
         "protocol": "jdbc",
         "dialect": "postgres",
+        "client_kind": "maintenance",
     }
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
@@ -1320,6 +1321,7 @@ async def _route_query(
         "raw_query": sql,
         "protocol": "jdbc",
         "dialect": "postgres",
+        "client_kind": "maintenance",
     }
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         resp = await client.post(url, json=body, headers=headers)

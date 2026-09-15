@@ -25,7 +25,8 @@ tessallite/scripts/tessallite-lookml-export \
   --model &lt;model-id-or-slug&gt; \
   --out generated/lookml \
   --connection tessallite_gateway</code></pre>
-    <p>Output contains table view files, an explore/model file, and <code>manifest.lkml</code> with model identity, deployed version, and drift hash. Generated views query <code>public.&lt;model_slug&gt;__&lt;table_alias&gt;</code>, exposed only when <code>LOOKER_GATEWAY_ENABLED=true</code>.</p>
+    <p>Output contains table view files, an explore/model file, and <code>manifest.lkml</code> with model identity, deployed version, and drift hash. Generated views query <code>public.&lt;model_slug&gt;__&lt;table_alias&gt;</code>, exposed only when <code>LOOKER_GATEWAY_ENABLED=true</code> and the connected user holds a modeller, tenant-admin or system-admin role.</p>
+    <p>The second condition is deliberate. These adapter relations carry hidden declared key columns and apply no persona narrowing, because Looker needs the declared key to write symmetric-aggregate SQL. That makes them a privileged technical surface rather than a business one, so point the LookML connection at a dedicated modeller-or-above service account. A viewer connecting to the same gateway sees only the ordinary persona-scoped model relations and never these.</p>
     <h2>Check drift</h2>
     <p>Re-export after model changes and add <code>--check</code>. A non-zero exit means checked-in generated output no longer matches the Tessallite snapshot.</p>
     <h2>Limits</h2>

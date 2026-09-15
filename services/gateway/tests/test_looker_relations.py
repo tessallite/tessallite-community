@@ -61,6 +61,12 @@ async def test_fetch_model_metadata_adds_table_scoped_looker_relations(monkeypat
     monkeypatch.setattr(client, "get_model_personas", personas)
     monkeypatch.setattr(client, "get_model_snapshot", snapshot)
     monkeypatch.setattr(client.settings, "LOOKER_GATEWAY_ENABLED", True)
+    # Bug-9898 / audit row A42: the generated-relation surface is persona-blind
+    # and hidden-column-exposing by design (Looker needs the declared key for
+    # symmetric aggregates), so owner decision 4.5(b) requires it to run on a
+    # PRIVILEGED, documented connection. This contract test is about the
+    # relation SHAPE; give it that connection.
+    monkeypatch.setattr(client, "_caller_is_privileged", lambda _t: True)
 
     (
         names,

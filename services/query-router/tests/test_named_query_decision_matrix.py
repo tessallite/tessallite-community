@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from result_fakes import ScalarResult
 from fastapi import HTTPException
 from sqlalchemy.exc import OperationalError
 
@@ -235,10 +236,11 @@ def _persona(
     included_measure_ids: list | None = None,
     included_dimension_ids: list | None = None,
     included_hierarchy_ids: list | None = None,
+    bypass_row_security: bool = False,
 ) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         id=_PERSONA_ID,
-        bypass_row_security=False,
+        bypass_row_security=bypass_row_security,
         default_filters=default_filters or {},
         included_measure_ids=included_measure_ids or [],
         included_dimension_ids=included_dimension_ids or [],
@@ -286,7 +288,7 @@ class _ScalarsAll:
         self._rows = list(rows)
 
     def scalars(self) -> "_ScalarsAll":
-        return self
+        return ScalarResult(self._rows)
 
     def all(self) -> list[object]:
         return self._rows
@@ -420,16 +422,17 @@ async def _run(
         exec_mock.side_effect = exec_error
     live_mock = AsyncMock(return_value=live_response)
     record_mock = AsyncMock()
-    mocks = {"exec": exec_mock, "live": live_mock, "record": record_mock}
+    compile_rls_mock = AsyncMock(return_value=compiled_rls)
+    mocks = {
+        "exec": exec_mock, "live": live_mock, "record": record_mock,
+        "compile_rls": compile_rls_mock,
+    }
     patches: list[object] = [
         patch.object(
             _routes, "load_named_queries",
             new=AsyncMock(return_value={"@leads": nq or _definition()}),
         ),
-        patch.object(
-            _routes, "compile_row_security",
-            new=AsyncMock(return_value=compiled_rls),
-        ),
+        patch.object(_routes, "compile_row_security", new=compile_rls_mock),
         patch(
             "shared.aggregate_connection.resolve_source_connection",
             new=AsyncMock(return_value=types.SimpleNamespace()),
@@ -578,13 +581,28 @@ def _real_execute_patches(
 
     captured: dict = {}
 
-    async def _capture_body(body, db, persona_id):
+    # Bug-9893 added keyword-only persona/principal/identity arguments to
+    # ``_bind_query_parameters`` (the named-list serve-time gate needs the
+    # caller's row-security context). Absorb them: this stub only records
+    # the SQL that reached the binder.
+    async def _capture_body(body, db, persona_id, **_kwargs):
         captured["raw_query"] = body.raw_query
 
     _population: list[dict] = list(rows) if rows else [{"v": 1}]
 
     async def _fake_observation(*, bound, decision, db, user_identity,
                                 tenant_id, persona, client_kind, **_kwargs):
+        # Bug-9899: what the gates actually left in the projection. The live
+        # body now carries the FULL expansion (the build's own definition) and
+        # the persona/CLS gates narrow it, so the narrowing must be asserted on
+        # what is SERVED rather than on the SQL text that went in.
+        captured["served_fields"] = sorted(
+            [d.name for d in bound.resolved_dimensions]
+            + [m.name for m in bound.resolved_measures]
+        )
+        captured["star_expanded"] = bool(
+            getattr(bound.logical_query, "star_expanded", False)
+        )
         routed_decision = types.SimpleNamespace(
             route_type="source",
             reason="force_route=source set on request; aggregate + pocket matchers bypassed",
@@ -638,16 +656,29 @@ def _assert_live_real(
     mocks: dict[str, AsyncMock],
     skip_reason: str,
     expected_raw_query: str,
+    expected_served_fields: list[str] | None = None,
 ) -> None:
-    """The NQ2C-F1 live assertion: the physical table is never read, the REAL
+    """The live assertion: the physical table is never read, the REAL
     ``_handle_execute`` ran (REAL persona gate + REAL CLS check) and did NOT
-    403 — the live body carried exactly the persona/CLS-narrowed projection."""
+    403, and the SERVED projection is the persona/CLS-narrowed one.
+
+    Bug-9899 moved WHERE the narrowing happens. ``expected_raw_query`` is now
+    the FULL expanded definition — byte-identical to what the refresh build
+    compiles, which is the point: the live body no longer differs from the
+    build's. ``expected_served_fields`` is what the gates left, and that is
+    where the narrowing is proven.
+    """
     mocks["exec"].assert_not_awaited()
     assert response.route_type == "source"
     assert response.reason.startswith(
         f"Named Query @leads served live ({skip_reason})"
     )
     assert mocks["live_body"]["raw_query"] == expected_raw_query
+    if expected_served_fields is not None:
+        assert mocks["live_body"]["served_fields"] == expected_served_fields
+        # The projection was expanded by the server, so both gates must have
+        # been in NARROW mode -- a deny would have raised 403 above.
+        assert mocks["live_body"]["star_expanded"] is True
 
 
 def _assert_live(
@@ -777,26 +808,27 @@ async def test_cell_4_rls_active_aggregated_shape_serves_live() -> None:
 
 
 async def test_cell_5_cls_restriction_present_serves_live() -> None:
-    """The R1-critical cell, now through the REAL gates (NQ2C-F1): a persona
-    WITH a tag restriction must keep ``_cls_active`` True (the probe returned a
-    row) and serve LIVE — CLS column projection of a shared cache is v1
-    live-only. The live body is the CLS-NARROWED projection (the restricted
-    ``branch_id`` removed), and the REAL ``_handle_execute`` — REAL persona
-    gate, REAL ``route_query`` with the REAL ``_check_column_restrictions`` —
-    must NOT 403 on it. Before NQ2C-F1 the live body was the FULL expanded
-    projection and the real CLS check blocked ``branch_id`` (403); the
-    ``_handle_execute`` mock hid that regression. The physical materialised
-    table is never read."""
+    """The R1-critical cell, through the REAL gates: a persona WITH a tag
+    restriction must keep ``_cls_active`` True (the probe returned a row) and
+    serve LIVE — CLS column projection of a shared cache is v1 live-only. The
+    REAL ``_handle_execute`` — REAL persona gate, REAL ``route_query`` with
+    the REAL ``_check_column_restrictions`` — must NOT 403, and what it SERVES
+    must have the restricted ``branch_id`` removed.
+
+    Bug-9899: the live body is now the FULL expanded projection (identical to
+    what the refresh build compiles) and the CLS gate does the narrowing,
+    because the dispatch marks the projection ``star_expanded``. Before that,
+    the handler pre-narrowed the body from its OWN copy of the CLS star
+    narrowing — one gate implemented twice. The narrowing is asserted on the
+    served fields, which is where it has to hold either way. The physical
+    materialised table is never read."""
     _tag = uuid.uuid4()
     script = _ExecuteScript(
         [
             _ScalarOne(_artifact_row()),
             _ScalarOne(_policy_row()),
             _ClsProbe(types.SimpleNamespace(data_tag_id=_tag)),
-            # Handler-side narrowing: restriction tags -> restricted columns.
-            _ScalarsAll([types.SimpleNamespace(data_tag_id=str(_tag))]),
-            _ScalarsAll(["c-branch"]),
-            # Real route_query CLS check: the same two queries again.
+            # Real route_query CLS check: restriction tags -> restricted cols.
             _ScalarsAll([types.SimpleNamespace(data_tag_id=str(_tag))]),
             _ScalarsAll(["c-branch"]),
             # Dialect resolution: no touched-table rows -> no source ->
@@ -811,17 +843,15 @@ async def test_cell_5_cls_restriction_present_serves_live() -> None:
     # Explicit ``_cls_active`` assertion: the probe WAS issued and returned a
     # restriction row -> ``_cls_active`` True -> live.
     assert "persona_tag_restrictions" in str(executed.calls[2])
-    # The narrowing's restriction enumeration (calls 3-4) and the REAL
-    # route_query CLS check (calls 5-6) must both have run. The trailing
+    # The REAL route_query CLS check ran (calls 3-4). The trailing
     # dialect-resolution queries are consumed only when the conftest's
     # autouse dialect stub is not active, so their count is not pinned.
     assert "persona_tag_restrictions" in str(executed.calls[3])
     assert "data_tag_columns" in str(executed.calls[4])
-    assert "persona_tag_restrictions" in str(executed.calls[5])
-    assert "data_tag_columns" in str(executed.calls[6])
     _assert_live_real(
         response, mocks, "cls_or_default_filters_live",
-        expected_raw_query='SELECT "amount" FROM acme',
+        expected_raw_query='SELECT "branch_id", "amount" FROM acme',
+        expected_served_fields=["amount"],
     )
 
 
@@ -913,6 +943,67 @@ async def test_cell_8a_rls_projection_proof_holds_serves_materialised_with_predi
     )
 
 
+async def test_cell_8c_bypass_row_security_serves_materialised_without_predicate() -> None:
+    """Bug-9168, cell one of two: an AUTHORISED row-security bypass.
+
+    ``bypass_row_security`` forces ``_rls_active`` False even though the rules
+    compile, so the artifact serves with NO predicate injected. That is the
+    intended Phase 8.C.1 X2 behaviour and it is also the single cell where a
+    materialised read is served to a principal whose rules compiled -- exactly
+    the branch an unnoticed edit could invert into a silent RLS bypass for
+    NON-bypass personas. No cell drove it until now.
+
+    Test escape: the matrix pinned every other persona shape but never
+    ``bypass_row_security=True``. Guard: this cell. Tier: T3.
+    """
+    response, _, mocks = await _run(
+        _ExecuteScript(
+            [
+                _ScalarOne(_artifact_row(manifest=_proof_manifest())),
+                _ScalarOne(_policy_row()),
+                _ClsProbe(None),
+                _ScalarOne(_model_row()),
+            ],
+        ),
+        persona=_persona(bypass_row_security=True),
+        principal=_principal(),
+        compiled_rls=_compiled_rls(),
+        nq=_definition(shape="projection", definition_sql=_PROJECTION_DEF),
+    )
+    # ``predicate=None`` asserts the compiled predicate is ABSENT from the SQL.
+    _assert_materialised(response, mocks, sql_fragment=_TABLE_REF, predicate=None)
+
+
+async def test_cell_8d_persona_without_principal_skips_rls_and_serves_materialised() -> None:
+    """Bug-9168, cell two of two: a persona present with NO principal.
+
+    Row security is compiled from the PRINCIPAL, so ``principal is None`` skips
+    the compile entirely and ``_rls_active`` stays False. The artifact then
+    serves with no predicate. Documented and intentional -- a caller with no
+    principal has no row-security subject to filter on -- but until now no cell
+    proved the compile is skipped rather than silently failing open on a
+    principal that *should* have been resolved.
+
+    Test escape: as above. Guard: this cell. Tier: T3.
+    """
+    response, executed, mocks = await _run(
+        _ExecuteScript(
+            [
+                _ScalarOne(_artifact_row(manifest=_proof_manifest())),
+                _ScalarOne(_policy_row()),
+                _ClsProbe(None),
+                _ScalarOne(_model_row()),
+            ],
+        ),
+        persona=_persona(),
+        principal=None,
+        compiled_rls=_compiled_rls(),
+        nq=_definition(shape="projection", definition_sql=_PROJECTION_DEF),
+    )
+    mocks["compile_rls"].assert_not_awaited()
+    _assert_materialised(response, mocks, sql_fragment=_TABLE_REF, predicate=None)
+
+
 async def test_r001_cell_8a_materialised_served_when_owners_populated() -> None:
     """R-001 regression at the Named-Query materialised site (routes.py:4873) —
     the SAME single-materialised-scan exposure as the pocket/aggregate sites.
@@ -966,26 +1057,23 @@ async def test_cell_9_cls_probe_db_error_fails_closed_serves_live() -> None:
     """A GENUINE DB/operational error on the probe must still fail closed
     (``_cls_active`` True -> live), never serve the unprojected cache.
 
-    NQ2C-F1 update: the narrowing's restriction enumeration hits the SAME
-    DB error (step 4) and fails closed to the typed 403 — no field can be
-    proven permitted, and the live CLS check would hit the identical error,
-    so the unclassified 500 is converted to the existing OBJECT_NOT_AVAILABLE
-    refusal. The materialised cache is never served either way.
+    Bug-9899: the handler no longer runs a second restriction enumeration of
+    its own (the persona/CLS narrowing lives in the gates), so the ONE
+    remaining probe decides. Its failure sets ``_cls_active`` True and the
+    request diverts to live under the consumer's own column-level security —
+    the shared materialised cache is never served on an undecided verdict.
 
-    Exercises the narrowed ``except SQLAlchemyError`` branches (no pragma
+    Exercises the narrowed ``except SQLAlchemyError`` branch (no pragma
     exemption needed)."""
     script = _ExecuteScript(
         [
             _ScalarOne(_artifact_row()),
             _ScalarOne(_policy_row()),
             OperationalError("SELECT", {}, Exception("connection refused")),
-            OperationalError("SELECT", {}, Exception("connection refused")),
         ],
     )
-    with pytest.raises(HTTPException) as exc_info:
-        await _run(script, persona=_persona())
-    assert exc_info.value.status_code == 403
-    assert exc_info.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+    response, _, mocks = await _run(script, persona=_persona())
+    _assert_live(response, mocks, "cls_or_default_filters_live")
 
 
 async def test_cell_10_cls_probe_coding_error_surfaces_not_masked() -> None:
@@ -1007,37 +1095,37 @@ async def test_cell_10_cls_probe_coding_error_surfaces_not_masked() -> None:
 
 
 @pytest.mark.parametrize(
-    ("allow_list_field", "expected_body"),
+    ("allow_list_field", "expected_served"),
     [
-        # included_measure_ids only: measures restricted away (the star branch
-        # would hide them); the exposed dim stays.
-        ("included_measure_ids", 'SELECT "branch_id" FROM acme'),
+        # included_measure_ids only: the measure is outside the allow-list and
+        # the star branch narrows it away; the exposed dim stays.
+        ("included_measure_ids", ["branch_id"]),
         # included_dimension_ids allowing the snapshot's dim: the dim stays;
         # the measure is dropped (a projected plain measure binds as a
-        # measure-as-dimension and the dimension allow-list's deny branch
-        # would 403 it).
-        ("included_dimension_ids", 'SELECT "branch_id" FROM acme'),
+        # measure-as-dimension, so the dimension allow-list narrows it out).
+        ("included_dimension_ids", ["branch_id"]),
         # included_hierarchy_ids only: the matrix snapshot's dim carries no
         # hierarchy (a hierarchy-less dim is kept, exactly like enforce_persona),
-        # so the body is the full exposure — the cell still proves the REAL
-        # gate does not 403 a hierarchy allow-list principal.
-        ("included_hierarchy_ids",
-         'SELECT "branch_id", "amount" FROM acme'),
+        # so nothing is narrowed — the cell still proves the REAL gate does not
+        # 403 a hierarchy allow-list principal.
+        ("included_hierarchy_ids", ["amount", "branch_id"]),
     ],
 )
 async def test_cell_11_persona_allow_list_forces_live(
-    allow_list_field: str, expected_body: str,
+    allow_list_field: str, expected_served: list[str],
 ) -> None:
-    """NQ1R1-F1 / Bug-9167 activation guard, now through the REAL gates
-    (NQ2C-F1): a persona carrying ANY populated include list must NEVER be
-    served from the shared materialised cache — the live branch applies the
-    persona gate. The live body is the persona-NARROWED projection, and the
-    REAL ``_handle_execute`` (REAL ``enforce_persona_gate``) must NOT 403 on
-    it. Before NQ2C-F1 the live body was the FULL expanded projection and the
-    real gate's deny branch 403'd on the disallowed field; the ``_handle_execute``
-    mock hid that regression. Red before the allow-list term is added to the
-    live-forcing branch; the reason label is diagnostics — the physical-table
-    non-read is the security contract."""
+    """NQ1R1-F1 / Bug-9167 activation guard, through the REAL gates: a persona
+    carrying ANY populated include list must NEVER be served from the shared
+    materialised cache — the live branch applies the persona gate. The REAL
+    ``_handle_execute`` (REAL ``enforce_persona_gate``) must NOT 403, and what
+    it SERVES is the persona-narrowed projection.
+
+    Bug-9899: the live body is the FULL expanded definition and the gate does
+    the narrowing (the dispatch marks it ``star_expanded``), instead of the
+    handler pre-trimming the body from a second copy of the same rules. Red
+    before the allow-list term is added to the live-forcing branch; the reason
+    label is diagnostics — the physical-table non-read is the security
+    contract."""
     steps: list[object] = [
         _ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
         _ClsProbe(None),
@@ -1064,19 +1152,29 @@ async def test_cell_11_persona_allow_list_forces_live(
     assert response.route_type == "source"
     assert "served live" in response.reason
     _assert_live_real(
-        response, mocks, "persona_allow_list_live", expected_body,
+        response, mocks, "persona_allow_list_live",
+        expected_raw_query='SELECT "branch_id", "amount" FROM acme',
+        expected_served_fields=expected_served,
     )
 
 
 async def test_cell_11e_allow_list_narrowing_to_nothing_reproduces_the_cls_403() -> None:
-    """NQ2C-F1 empty-narrowed case: persona allow-lists that exclude EVERY
-    exposed field (the dimension list names nothing on the model, the measure
-    list too) must reproduce the EXISTING CLS 403 — ``OBJECT_NOT_AVAILABLE`` /
-    "No columns are available" (the router's star-fully-restricted shape) —
-    NOT the expansion's ValueError, which would read as a definition error."""
+    """Empty-narrowed case: persona allow-lists that exclude EVERY exposed
+    field (the dimension list names nothing on the model, the measure list
+    too) must refuse with ``OBJECT_NOT_AVAILABLE`` / "No columns are
+    available" — never hand the pipeline an empty projection that falls back
+    to a raw star scan of the source.
+
+    Bug-9899 moved the refusal into ``enforce_persona`` (M-2 parity with the
+    column-level-security gate's own star-fully-restricted guard), where the
+    narrowing now lives, so it holds for a literal ``SELECT *`` as well as for
+    a Named Query's server-expanded one. The REAL gates must run for this cell
+    to observe it."""
     script = _ExecuteScript([
         _ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
         _ClsProbe(None),
+        _ScalarsAll([]),   # dimension allow-list -> excluded level attrs
+        _ScalarsAll([]),   # measure allow-list -> excluded measure backing
     ])
     with pytest.raises(HTTPException) as exc_info:
         await _run(
@@ -1085,6 +1183,7 @@ async def test_cell_11e_allow_list_narrowing_to_nothing_reproduces_the_cls_403()
                 included_dimension_ids=[str(uuid.uuid4())],
                 included_measure_ids=[str(uuid.uuid4())],
             ),
+            real_execute=True,
         )
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"

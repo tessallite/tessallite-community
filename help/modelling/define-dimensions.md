@@ -2,7 +2,7 @@
 title: "Define Dimensions"
 audience: modeller
 area: modelling
-updated: 2026-04-17
+updated: 2026-09-10
 ---
 
 ![Model Builder — Dimension creation form.](../assets/screencaps/model-builder-dimension-form.png)
@@ -25,6 +25,21 @@ A dimension is a named grouping attribute that maps a business-friendly label to
 A dimension maps a business name to a column in the model's source tables. For example, `orders.status_cd` might be exposed as a dimension named `Order Status`. BI tools see `Order Status` as a queryable column in the model's virtual schema.
 
 Dimensions can come from any table in the model -- fact tables, dimension tables, or any other joined table. Which table a dimension belongs to affects whether it can participate in aggregate routing (dimensions on tables included in the aggregate grain) or whether queries using it are served from raw source data.
+
+## Flat fields and large value lists
+
+A dimension is one field. It is not a drill hierarchy. Excel groups these flat
+fields under **Dimensions** so they are easy to find.
+
+Prefer fields with a useful, short list of values for everyday grouping. Status,
+country, channel, and product category are good examples. A transaction ID,
+payment reference, or exact timestamp may have a different value on almost every
+row. Keep such a field only when people need to find or filter exact records.
+
+Tessallite does not load every field's values when Excel first reads the field
+list. It asks for the distinct values of one field after that field is selected,
+filtered, or expanded. This keeps large identifier lists from slowing the first
+connection.
 
 ---
 

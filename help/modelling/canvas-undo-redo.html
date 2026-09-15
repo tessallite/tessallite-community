@@ -19,16 +19,23 @@
 <p>The Model Canvas records your editing actions and lets you step backwards and forwards through them with <strong>Ctrl+Z</strong> (undo) and <strong>Ctrl+Y</strong> (redo). This page explains what gets tracked, what happens when you reload the page, the keyboard shortcuts, and the toolbar buttons.</p>
 
 <h2>What is tracked</h2>
-<p>One user action equals one undo step. The canvas tracks four kinds of actions:</p>
+<p>One user action equals one undo step. The canvas tracks these kinds of actions:</p>
 <table>
 <thead><tr><th>Action</th><th>What undo does</th></tr></thead>
 <tbody>
-<tr><td><strong>Moving a table</strong> (one drag gesture, however far)</td><td>Puts the table back where the drag started.</td></tr>
-<tr><td><strong>Applying a layout preset</strong> (radial, hierarchical, compact)</td><td>Restores every table to its position before the redraw &mdash; the whole redraw is one step.</td></tr>
+<tr><td><strong>Moving a table</strong> (one drag gesture, however far)</td><td>Puts the table back where the drag started, together with any relationship lines the move caused to be redrawn.</td></tr>
+<tr><td><strong>Resizing a table</strong></td><td>Restores the previous size, and the lines that were redrawn to fit it.</td></tr>
+<tr><td><strong>Arranging the model</strong> (any preset, whole model or selection)</td><td>Restores every table to its position before the arrangement, and every relationship to the route it had &mdash; the whole arrangement is one step.</td></tr>
+<tr><td><strong>Rerouting the links</strong></td><td>Restores the previous routes. No table moved, so nothing else changes.</td></tr>
+<tr><td><strong>Editing a route by hand</strong> (a bend, or an attachment point)</td><td>Restores the previous path.</td></tr>
+<tr><td><strong>Locking or unlocking a relationship</strong></td><td>Reverses the lock, and with it the path the lock froze.</td></tr>
+<tr><td><strong>Locking or unlocking a table's position</strong></td><td>Reverses the lock. The tables do not move &mdash; locking a position changes no coordinate.</td></tr>
 <tr><td><strong>Renaming a table</strong></td><td>Restores the previous display name.</td></tr>
 <tr><td><strong>Creating or deleting a join</strong></td><td>Deletes the created join, or recreates the deleted one.</td></tr>
 </tbody>
 </table>
+<p>A move or resize is one step even though it changes two things &mdash; the table's geometry and the relationship lines that had to be redrawn around it. Undo puts both back together, because splitting them would let you undo a move and be left with lines drawn for where the table used to be.</p>
+<p>A gesture the canvas refuses records nothing. Dragging a table across a locked relationship's path puts the tables back, and there is no undo step for it: the move did not happen.</p>
 <p>The very first drag is immediately undoable &mdash; move a table, press Ctrl+Z, and it snaps back. Undo always reverses the <strong>most recent</strong> action first; pressing it again walks further back, one action at a time. Redo replays the undone actions in order. Making a new change after an undo clears the redo history, just like a text editor.</p>
 
 <h2>How to undo and redo</h2>
@@ -62,10 +69,11 @@
 <h2>Related</h2>
 <ul>
 <li><a href="model-canvas-tour.html">Model Canvas Tour</a></li>
+<li><a href="arrange-the-canvas.html">Arrange the Canvas</a></li>
 <li><a href="define-joins.html">Define Joins</a></li>
 <li><a href="define-dimensions.html">Define Dimensions</a></li>
 </ul>
-<nav class="page-nav"><a href="model-canvas-tour.html" class="page-nav-btn prev">&larr; Model Canvas Tour</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="define-joins.html" class="page-nav-btn next">Define Joins &rarr;</a></nav>
+<nav class="page-nav"><a href="arrange-the-canvas.html" class="page-nav-btn prev">&larr; Arrange the Canvas</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="define-joins.html" class="page-nav-btn next">Define Joins &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
 </body>

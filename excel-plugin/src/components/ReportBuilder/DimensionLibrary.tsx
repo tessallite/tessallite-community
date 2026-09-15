@@ -43,18 +43,21 @@ export default function DimensionLibrary({
     <>
       <Box
         sx={{
-          display: 'flex', alignItems: 'center', px: 1.5, py: 0.75,
+          display: 'flex', alignItems: 'center', px: 1.25, height: 24,
           cursor: dimensions.length > 0 || loading ? 'pointer' : 'default',
           borderTop: `1px solid ${tokens.colorBorderLight}`,
+          borderBottom: `1px solid ${tokens.colorBorderLight}`,
+          bgcolor: tokens.colorSubtleFill,
           opacity: dimensions.length > 0 || loading ? 1 : 0.68,
         }}
         onClick={() => {
           if (dimensions.length > 0 || loading || searchQuery) onToggleExpanded();
         }}
       >
-        <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          {templates.library.dimensionsHeader(dimensions.length)}
+        <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, flex: 1, textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+          {strings.library.dimensionsSection}
         </Typography>
+        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{dimensions.length}</Typography>
         {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {(dimensions.length > 0 || loading || searchQuery) && (
           <IconButton
@@ -62,18 +65,23 @@ export default function DimensionLibrary({
             onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
             aria-expanded={expanded}
             aria-label={templates.library.toggleSectionAria(expanded, strings.library.dimensionsSection)}
-            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+            sx={{ width: 22, height: 22, color: tokens.colorTextSecondary }}
           >
             {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
           </IconButton>
         )}
       </Box>
-      <Collapse in={expanded} sx={{ overflow: 'visible' }}>
+      {/* Bug-9752 round 3: no `overflow: visible` override. MUI already sets
+          `overflow: visible` on an ENTERED Collapse, so nothing inside an open
+          section is clipped; forcing it in every state only let the collapsed
+          and mid-animation content paint outside the box, over the sections
+          below. The other four library sections never overrode it. */}
+      <Collapse in={expanded}>
         {loading ? (
           <Box sx={{ p: 0.5 }}>
-            <Skeleton variant="rectangular" height={64} sx={{ mb: 0.5, borderRadius: 1 }} />
-            <Skeleton variant="rectangular" height={64} sx={{ mb: 0.5, borderRadius: 1 }} />
-            <Skeleton variant="rectangular" height={64} sx={{ mb: 0.5, borderRadius: 1 }} />
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
           </Box>
         ) : dimensions.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
@@ -102,7 +110,7 @@ export default function DimensionLibrary({
               />
             ))}
             {memberPreviewDimId && (
-              <Box sx={{ mx: 0.5, mb: 1, p: 1, bgcolor: tokens.colorSubtleFill, borderRadius: 1, maxHeight: 160, overflowY: 'auto' }}>
+              <Box sx={{ mx: 0.5, mb: 0.5, p: 0.75, bgcolor: tokens.colorSubtleFill, borderRadius: 0.5, maxHeight: 160, overflowY: 'auto' }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.5 }}>
                   <Typography sx={{ fontSize: 10, fontWeight: 600, color: tokens.colorTextSecondary, flex: 1 }}>
                     {strings.dimensionLibrary.membersLabel}
@@ -124,9 +132,13 @@ export default function DimensionLibrary({
                 {membersPreviewLoading ? (
                   <CircularProgress size={14} sx={{ color: tokens.colorPrimary }} />
                 ) : memberPreview && memberPreview.members.length > 0 ? (
-                  memberPreview.members.slice(0, 20).map(m => (
-                    <Typography key={m.key} sx={{ fontSize: 10, color: tokens.colorCharcoal }}>{m.name}</Typography>
-                  ))
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.25 }}>
+                  {memberPreview.members.slice(0, 20).map(m => (
+                    <Box key={m.key} component="span" sx={{ px: 0.5, py: 0.125, bgcolor: tokens.colorWhite, border: `1px solid ${tokens.colorBorderLight}`, borderRadius: 0.5, fontSize: 10, color: tokens.colorCharcoal }}>
+                      {m.name}
+                    </Box>
+                  ))}
+                  </Box>
                 ) : (
                   <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{strings.dimensionLibrary.noMembersFound}</Typography>
                 )}

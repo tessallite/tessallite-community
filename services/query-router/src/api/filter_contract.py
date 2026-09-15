@@ -67,7 +67,7 @@ from typing import Any
 from fastapi import HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.ir.logical_query import LogicalFilter
+from src.ir.logical_query import LogicalFilter, LogicalMeasurePredicate
 
 
 class StrictModel(BaseModel):
@@ -191,6 +191,37 @@ class SemanticFilter(StrictModel):
             "(exactly 2 values). For scalar operators values[0] is "
             "accepted as a fallback when value is absent."
         ),
+    )
+
+
+class SemanticMeasureFilter(StrictModel):
+    """A grouped-value predicate in the plugin semantic-query contract.
+
+    Measure predicates use the stable deployed measure id rather than a UI
+    caption. ``effective_aggregation`` is carried by the producer for
+    observability; binding remains authoritative and derives the effective
+    value from the deployed measure definition.
+    """
+
+    measure_id: str = Field(
+        min_length=1,
+        description="Stable semantic measure id to filter after grouping.",
+    )
+    operator: str = Field(default="eq")
+    value: Any = Field(
+        default=None,
+        description="Scalar payload for comparison and LIKE operators.",
+    )
+    values: list[Any] = Field(
+        default_factory=list,
+        description=(
+            "List payload for in/not_in and between; scalar operators may use "
+            "values[0]."
+        ),
+    )
+    effective_aggregation: str = Field(
+        min_length=1,
+        description="Producer-carried aggregation identity; deployed metadata wins.",
     )
 
 
@@ -351,6 +382,36 @@ def build_logical_filters(filters: list[SemanticFilter]) -> list[LogicalFilter]:
     return result
 
 
+def build_logical_measure_filters(
+    filters: list[SemanticMeasureFilter],
+) -> list[LogicalMeasurePredicate]:
+    """Validate plugin measure predicates with the canonical filter rules.
+
+    Reusing ``build_logical_filters`` keeps scalar/list/null/operator behavior
+    identical while changing only the semantic identity carried by the IR.
+    """
+    result: list[LogicalMeasurePredicate] = []
+    for measure_filter in filters:
+        validated = build_logical_filters([
+            SemanticFilter(
+                dimension=measure_filter.measure_id,
+                operator=measure_filter.operator,
+                value=measure_filter.value,
+                values=measure_filter.values,
+            )
+        ])[0]
+        result.append(
+            LogicalMeasurePredicate(
+                measure_id=measure_filter.measure_id,
+                operator=validated.operator,
+                value=validated.value,
+                effective_aggregation=measure_filter.effective_aggregation,
+                like_escape=validated.like_escape,
+            )
+        )
+    return result
+
+
 # QueryLog.raw_query is a preview surface (query history in the frontend
 # and the MCP get_query_history tool) — cap the canonical representation
 # so a pathological filter list cannot bloat the log row.
@@ -389,6 +450,7 @@ def semantic_fingerprint(
     measures: list[str],
     dimensions: list[str],
     filters: list[SemanticFilter],
+    measure_filters: list[SemanticMeasureFilter] | None = None,
     order_by: list[tuple[str, str]] | None = None,
     limit: Any = None,
     offset: Any = None,
@@ -439,6 +501,48 @@ def semantic_fingerprint(
         "dimensions": sorted(dimensions),
         "filters": canonical_filters,
     }
+    if measure_filters:
+        canonical_measure_filters = []
+        for f in measure_filters:
+            op = OPERATOR_ALIASES.get(f.operator, f.operator)
+            if op in _SCALAR_OPERATORS:
+                value = f.value if f.value is not None else (
+                    f.values[0] if f.values else None
+                )
+                canonical_measure_filters.append({
+                    "m": f.measure_id,
+                    "op": op,
+                    "v": value,
+                    "agg": f.effective_aggregation,
+                })
+            elif op in _LIST_OPERATORS:
+                values = f.values if f.values else (
+                    list(f.value) if isinstance(f.value, (list, tuple)) else
+                    [f.value] if f.value is not None else []
+                )
+                canonical_measure_filters.append({
+                    "m": f.measure_id,
+                    "op": op,
+                    "vs": sorted(str(x) for x in values),
+                    "agg": f.effective_aggregation,
+                })
+            elif op == "between":
+                bounds = f.values if f.values else (
+                    list(f.value) if isinstance(f.value, (list, tuple)) else []
+                )
+                canonical_measure_filters.append({
+                    "m": f.measure_id,
+                    "op": op,
+                    "vs": [str(x) for x in bounds],
+                    "agg": f.effective_aggregation,
+                })
+            else:
+                canonical_measure_filters.append({
+                    "m": f.measure_id,
+                    "op": op,
+                    "agg": f.effective_aggregation,
+                })
+        payload["measure_filters"] = canonical_measure_filters
     if order_by:
         payload["order_by"] = order_by
     if limit is not None:
@@ -454,6 +558,7 @@ def canonical_raw_query(
     measures: list[str],
     dimensions: list[str],
     filters: list[SemanticFilter],
+    measure_filters: list[SemanticMeasureFilter] | None = None,
     order_by: list[tuple[str, str]] | None = None,
     limit: Any = None,
     offset: Any = None,
@@ -477,6 +582,17 @@ def canonical_raw_query(
             for f in filters
         ],
     }
+    if measure_filters:
+        payload["measure_filters"] = [
+            {
+                "measure_id": f.measure_id,
+                "operator": f.operator,
+                **({"value": f.value} if f.value is not None else {}),
+                **({"values": f.values} if f.values else {}),
+                "effective_aggregation": f.effective_aggregation,
+            }
+            for f in measure_filters
+        ]
     if order_by:
         payload["order_by"] = [list(o) for o in order_by]
     if limit is not None:
@@ -495,7 +611,9 @@ __all__ = [
     "OPERATOR_ALIASES",
     "StrictModel",
     "SemanticFilter",
+    "SemanticMeasureFilter",
     "build_logical_filters",
+    "build_logical_measure_filters",
     "canonical_raw_query",
     "normalize_order_by",
     "project_ids_match",

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from src.planning.contracts import FieldRole, ShapeContract, ShapeLimits
 from src.planning.enums import AnalyticalShape, AxisRole, ValueRole
-from src.planning.intent import AnalyticalIntent
-from src.planning.shape import normalize_result_shape
+from src.planning.intent import AnalyticalIntent, detect_analytical_intent
+from src.planning.shape import add_average_comparison_fact, normalize_result_shape
 
 
 def _role(name, role, source="dimension"):
@@ -122,6 +122,38 @@ def test_ranking_facts_are_present_only_for_ranking_intent():
     }
 
 
+def test_Bug_9971_most_result_has_explicit_top_boundary_facts():
+    intent = detect_analytical_intent(
+        "Which account type has processed the most money in 2026?"
+    )
+    shaped = normalize_result_shape(
+        ["account_type", "transaction_amount"],
+        [{"account_type": "WALLET", "transaction_amount": 32829598.09}],
+        intent,
+        [
+            _role("account_type", AxisRole.CATEGORY),
+            _role("transaction_amount", ValueRole.SINGLE_METRIC, source="measure"),
+        ],
+        _contract(
+            AnalyticalShape.RANKING,
+            {"x": "transaction_amount", "y": "account_type"},
+            chart="h_bar",
+        ),
+        ShapeLimits(),
+    )
+
+    assert shaped.shape == AnalyticalShape.RANKING
+    assert shaped.narration_facts.ranking == {
+        "sort_metric": "transaction_amount",
+        "direction": "desc",
+        "limit": 1,
+        "limit_explicit": True,
+        "top_boundary": {"account_type": "WALLET", "transaction_amount": 32829598.09},
+        "bottom_boundary": {"account_type": "WALLET", "transaction_amount": 32829598.09},
+        "row_count": 1,
+    }
+
+
 def test_table_only_quality_facts_are_serialised_for_narration():
     shaped = normalize_result_shape(
         ["category", "amount"],
@@ -212,3 +244,157 @@ def test_composition_shape_derives_share_percentages_for_pie_output():
     assert shaped.rows[0] == ["BANK_TRANSFER", 32.92]
     assert shaped.contract.renderer_binding["value"] == "Revenue Share (%)"
     assert shaped.narration_facts.value_label == "Revenue Share (%)"
+
+
+def test_Bug_9974_grouped_temporal_axis_uses_validated_source_filter_range():
+    rows = [
+        {"business_date_year": "2026-01-01T00:00:00Z", "amount": 10},
+        {"business_date_year": "2026-01-01T00:00:00Z", "amount": 20},
+    ]
+    shaped = normalize_result_shape(
+        ["business_date_year", "amount"],
+        rows,
+        AnalyticalIntent(shape_hint=AnalyticalShape.BREAKDOWN, wants_breakdown=True),
+        [
+            _role("business_date_year", AxisRole.TEMPORAL),
+            _role("amount", ValueRole.SINGLE_METRIC, source="measure"),
+        ],
+        _contract(
+            AnalyticalShape.BREAKDOWN,
+            {"x": "business_date_year", "y": "amount"},
+            chart="bar",
+        ),
+        ShapeLimits(),
+        filter_where=[{
+            "name": "business_date",
+            "op": "between",
+            "value": ["2026-01-01", "2026-09-10"],
+        }],
+    )
+
+    assert shaped.narration_facts.date_range["business_date_year"] == (
+        "2026-01-01",
+        "2026-09-10",
+    )
+
+    # A raw date axis continues to report observed rows rather than widening
+    # them to the requested filter when the source has a narrower result.
+    raw = normalize_result_shape(
+        ["business_date", "amount"],
+        [
+            {"business_date": "2026-02-01", "amount": 10},
+            {"business_date": "2026-03-01", "amount": 20},
+        ],
+        AnalyticalIntent(shape_hint=AnalyticalShape.BREAKDOWN, wants_breakdown=True),
+        [
+            _role("business_date", AxisRole.TEMPORAL),
+            _role("amount", ValueRole.SINGLE_METRIC, source="measure"),
+        ],
+        _contract(
+            AnalyticalShape.BREAKDOWN,
+            {"x": "business_date", "y": "amount"},
+            chart="bar",
+        ),
+        ShapeLimits(),
+        filter_where=[{
+            "name": "business_date",
+            "op": "between",
+            "value": ["2026-01-01", "2026-09-10"],
+        }],
+    )
+    assert raw.narration_facts.date_range["business_date"] == (
+        "2026-02-01",
+        "2026-03-01",
+    )
+
+
+def test_Bug_9973_average_fact_requires_complete_grouped_rows_and_target():
+    rows = [
+        {"account_type": "WALLET", "base_amount": 36_487_318.78},
+        {"account_type": "LOAN", "base_amount": 36_245_683.67},
+        {"account_type": "CREDIT", "base_amount": 36_179_774.10},
+        {"account_type": "SAVINGS", "base_amount": 35_965_373.66},
+        {"account_type": "CURRENT", "base_amount": 35_842_415.96},
+    ]
+    shaped = normalize_result_shape(
+        ["account_type", "base_amount"],
+        rows,
+        AnalyticalIntent(shape_hint=AnalyticalShape.BREAKDOWN, wants_breakdown=True),
+        [
+            _role("account_type", AxisRole.CATEGORY),
+            _role("base_amount", ValueRole.SINGLE_METRIC, source="measure"),
+        ],
+        _contract(
+            AnalyticalShape.BREAKDOWN,
+            {"x": "account_type", "y": "base_amount"},
+            chart="bar",
+        ),
+        ShapeLimits(),
+    )
+    question = (
+        "What is the total base amount for each account type, and is CREDIT "
+        "above or below the average?"
+    )
+
+    add_average_comparison_fact(
+        shaped.narration_facts,
+        rows,
+        user_message=question,
+        complete=True,
+        requested=True,
+    )
+    fact = shaped.narration_facts.average_comparison
+    assert fact is not None
+    assert fact["status"] == "available"
+    assert fact["target_category"] == "CREDIT"
+    assert fact["target_relation"] == "above"
+    assert fact["average_value"] == 36_144_113.234
+    assert fact["comparisons"]["CREDIT"] == {
+        "value": 36_179_774.10,
+        "relation": "above",
+    }
+
+    incomplete = normalize_result_shape(
+        ["account_type", "base_amount"],
+        rows,
+        AnalyticalIntent(shape_hint=AnalyticalShape.BREAKDOWN, wants_breakdown=True),
+        [
+            _role("account_type", AxisRole.CATEGORY),
+            _role("base_amount", ValueRole.SINGLE_METRIC, source="measure"),
+        ],
+        _contract(AnalyticalShape.BREAKDOWN, {"x": "account_type", "y": "base_amount"}),
+        ShapeLimits(),
+    )
+    add_average_comparison_fact(
+        incomplete.narration_facts,
+        rows,
+        user_message=question,
+        complete=False,
+        requested=True,
+    )
+    assert incomplete.narration_facts.average_comparison == {
+        "status": "unavailable",
+        "reason": "complete_grouped_rows_required",
+    }
+
+    # A different comparison question must not acquire a benchmark fact merely
+    # because its result happens to be a complete grouped breakdown.
+    control = normalize_result_shape(
+        ["account_type", "base_amount"],
+        rows,
+        AnalyticalIntent(shape_hint=AnalyticalShape.BREAKDOWN, wants_breakdown=True),
+        [
+            _role("account_type", AxisRole.CATEGORY),
+            _role("base_amount", ValueRole.SINGLE_METRIC, source="measure"),
+        ],
+        _contract(AnalyticalShape.BREAKDOWN, {"x": "account_type", "y": "base_amount"}),
+        ShapeLimits(),
+    )
+    add_average_comparison_fact(
+        control.narration_facts,
+        rows,
+        user_message="What is the difference between WALLET and CREDIT?",
+        complete=True,
+        requested=False,
+    )
+    assert control.narration_facts.average_comparison is None

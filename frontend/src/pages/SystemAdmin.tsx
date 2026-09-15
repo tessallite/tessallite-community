@@ -38,6 +38,7 @@ import { adminApi, authApi, tenantsApi } from "../api/client";
 import { meetsPasswordPolicy, showsPasswordPolicyError } from "../auth/passwordPolicy";
 import type { LocalUserRole, Tenant, User } from "../api/types";
 import HelpIconButton from "../components/HelpIconButton";
+import SystemLogsPanel from "../components/Admin/SystemLogsPanel";
 
 const USER_ROLES: LocalUserRole[] = ["member", "tenant_admin", "model_technical"];
 
@@ -196,6 +197,8 @@ export default function SystemAdmin() {
           }
         />
       </Box>
+
+      <SystemLogsPanel />
 
       <TenantDialogForm
         dialog={tenantDialog}

@@ -79,6 +79,12 @@ def _model_with_personas(**extras):
         "slug": "sales",
         "display_name": "Sales",
         "id": "m1",
+        # Bug-9825: a catalog is named by the combination that is unique —
+        # tenant, project, model — because a model slug repeats across projects
+        # and a project slug across tenants. The fixture carries all three so
+        # these assertions exercise the real published name.
+        "tenant_slug": "acme",
+        "project_slug": "alpha",
         "personas": personas,
         **extras,
     }
@@ -88,8 +94,8 @@ def test_rows_catalogs_emits_business_base_plus_one_per_persona():
     tenant_models = [_model_with_personas()]
     rows = mdschema._rows_catalogs("", tenant_models)
     catalog_names = {r["CATALOG_NAME"] for r in rows}
-    assert "sales" in catalog_names
-    assert "sales_technical" in catalog_names
+    assert "acme__alpha__sales" in catalog_names
+    assert "acme__alpha__sales__technical" in catalog_names
 
 
 def test_rows_catalogs_emits_custom_persona_catalog():
@@ -98,14 +104,18 @@ def test_rows_catalogs_emits_custom_persona_catalog():
     ])]
     rows = mdschema._rows_catalogs("", tenant_models)
     catalog_names = {r["CATALOG_NAME"] for r in rows}
-    assert catalog_names == {"sales", "sales_technical", "sales_finance"}
+    assert catalog_names == {
+        "acme__alpha__sales",
+        "acme__alpha__sales__technical",
+        "acme__alpha__sales__finance",
+    }
 
 
 def test_rows_cubes_enumerates_all_variants_when_no_catalog_restriction():
     tenant_models = [_model_with_personas()]
     rows = mdschema._rows_cubes("", tenant_models=tenant_models)
     cube_names = {r["CUBE_NAME"] for r in rows}
-    assert cube_names == {"sales", "sales_technical"}
+    assert cube_names == {"acme__alpha__sales", "acme__alpha__sales__technical"}
 
 
 def test_rows_cubes_returns_single_cube_when_bound_to_catalog():
@@ -238,8 +248,8 @@ def test_named_list_refresh_vintage_is_available_in_gateway_set_catalogue():
         }],
     )
     assert len(rows) == 1
-    assert "last refreshed 2026-04-13 14:00:00" in rows[0]["SET_DESCRIPTION"]
-    assert "source: bigquery" in rows[0]["SET_DESCRIPTION"]
+    assert "last refreshed 2026-04-13 14:00:00" in rows[0]["DESCRIPTION"]
+    assert "source: bigquery" in rows[0]["DESCRIPTION"]
 
 
 # ---------------------------------------------------------------------------

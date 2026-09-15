@@ -45,6 +45,7 @@ import {
 } from "../../api/hooks";
 import { useConfirm } from "../Confirm";
 import { useT } from "../../i18n";
+import { extractApiError } from "../../utils/extractApiError";
 import type {
   AssetType,
   DownstreamAsset,
@@ -97,6 +98,14 @@ export default function ImpactPanel() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState<AssetFormState>(EMPTY_FORM);
+  // Bug-8937/R2-B01: createMut/updateMut had no onError at all — a failed
+  // save (e.g. a duplicate asset name, a validation error) closed silently
+  // with no indication anything went wrong.
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Bug-9576 (R3-04, round-2 recheck): deleteMut/scanMut were left out of the
+  // Bug-8937 fix above — a failed delete or scan also failed silently.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
 
   const assets = useDownstreamAssets(projectId!, modelId!);
   const summary = useDownstreamAssetSummary(projectId!, modelId!);
@@ -115,6 +124,9 @@ export default function ImpactPanel() {
       invalidate();
       setDialogOpen(false);
     },
+    onError: (err: unknown) => {
+      setSaveError(extractApiError(err, t("impact.saveFailed")));
+    },
   });
 
   const updateMut = useMutation({
@@ -124,25 +136,39 @@ export default function ImpactPanel() {
       invalidate();
       setDialogOpen(false);
     },
+    onError: (err: unknown) => {
+      setSaveError(extractApiError(err, t("impact.saveFailed")));
+    },
   });
 
   const deleteMut = useMutation({
     mutationFn: (id: string) =>
       downstreamAssetsApi.delete(projectId!, modelId!, id),
-    onSuccess: invalidate,
+    onSuccess: () => {
+      setDeleteError(null);
+      invalidate();
+    },
+    onError: (err: unknown) => {
+      setDeleteError(extractApiError(err, t("impact.deleteFailed")));
+    },
   });
 
   const scanMut = useMutation({
     mutationFn: () => impactScanApi.scan(projectId!, modelId!),
     onSuccess: () => {
+      setScanError(null);
       qc.invalidateQueries({ queryKey: ["gateway-query-refs", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["column-usage", projectId, modelId] });
+    },
+    onError: (err: unknown) => {
+      setScanError(extractApiError(err, t("impact.scanFailed")));
     },
   });
 
   const openCreate = () => {
     setEditId(null);
     setForm(EMPTY_FORM);
+    setSaveError(null);
     setDialogOpen(true);
   };
 
@@ -155,6 +181,7 @@ export default function ImpactPanel() {
       owner: a.owner || "",
       notes: a.notes || "",
     });
+    setSaveError(null);
     setDialogOpen(true);
   };
 
@@ -178,7 +205,10 @@ export default function ImpactPanel() {
       title: t("impact.deleteConfirmTitle", { name: a.asset_name }),
       message: t("impact.deleteConfirmMessage"),
     });
-    if (ok) deleteMut.mutate(a.id);
+    if (ok) {
+      setDeleteError(null);
+      deleteMut.mutate(a.id);
+    }
   };
 
   const summaryText = summary.data
@@ -221,6 +251,12 @@ export default function ImpactPanel() {
               {t("impact.addAssetButton")}
             </Button>
           </Stack>
+
+          {deleteError && (
+            <Alert severity="error" sx={{ mb: 1 }}>
+              {deleteError}
+            </Alert>
+          )}
 
           {assets.isLoading && <CircularProgress size={24} />}
 
@@ -303,6 +339,12 @@ export default function ImpactPanel() {
               {scanMut.isPending ? t("impact.scanningButton") : t("impact.runScanButton")}
             </Button>
           </Stack>
+
+          {scanError && (
+            <Alert severity="error" sx={{ mb: 1 }}>
+              {scanError}
+            </Alert>
+          )}
 
           {scanMut.isSuccess && (
             <Alert
@@ -460,6 +502,7 @@ export default function ImpactPanel() {
         </DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
+            {saveError && <Alert severity="error">{saveError}</Alert>}
             <FormControl fullWidth size="small">
               <InputLabel>{t("impact.typeFieldLabel")}</InputLabel>
               <Select

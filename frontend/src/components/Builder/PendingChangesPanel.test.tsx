@@ -46,13 +46,14 @@ function measureAdded(slug: string) {
   };
 }
 
-function renderPanel(canRevert = true) {
+function renderPanel(canRevert = true, canModel = true) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <PendingChangesPanel
         projectId={PROJECT_ID}
         modelId={MODEL_ID}
+        canModel={canModel}
         canRevert={canRevert}
       />
     </QueryClientProvider>,
@@ -196,6 +197,31 @@ describe("PendingChangesPanel", () => {
     expect(
       screen.getByRole("button", { name: /discard unsaved edits/i }),
     ).toBeInTheDocument();
+  });
+
+  // Bug-9387: "Discard unsaved edits" POSTs /discard-draft, which the backend
+  // gates on require_role("modeler"). The button previously rendered for a
+  // caller who cannot author the model (viewer / read-only share link) and
+  // 403s on click. It must be hidden behind the same authoring capability that
+  // gates Save, with a hint instead of a dead actionable button.
+  it("hides discard-unsaved for a caller who cannot author the model (Bug-9387)", async () => {
+    seedDirtyStore();
+    renderPanel(true, false);
+
+    await screen.findByText("Unsaved edits");
+    expect(
+      screen.queryByRole("button", { name: /discard unsaved edits/i }),
+    ).not.toBeInTheDocument();
+    // The read-only hint explains the withdrawn action.
+    expect(
+      screen.getByText("This model is open read-only, so pending edits cannot be discarded."),
+    ).toBeInTheDocument();
+    // Reviewing changes remains available to a viewer.
+    expect(
+      screen.getAllByRole("button", { name: /review changes/i }).length,
+    ).toBeGreaterThanOrEqual(1);
+    // A viewer can never author unsaved edits, so the mutation stays untouched.
+    expect(discardMock).not.toHaveBeenCalled();
   });
 
   it("shows a 'no pending changes' message when everything is in sync", async () => {

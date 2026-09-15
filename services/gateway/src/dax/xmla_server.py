@@ -40,6 +40,7 @@ import re
 # threading import removed: Bug-6937 — the inflight-task registry is
 # guarded by asyncio.Lock (correct for single-threaded event loop),
 # not threading.Lock (wrong primitive for asyncio concurrency).
+import time as _time
 import uuid
 import zlib
 from collections.abc import Sequence
@@ -55,20 +56,36 @@ from shared.config.settings import get_settings as _get_settings
 from shared.connector_qualify import quote_identifier as _qi
 from shared.connector_qualify import quote_literal as _ql
 from shared.semantic.hierarchy_resolver import resolve_hierarchy_dimension_map as _build_hierarchy_dimension_map
-from src.auth.base import validate_session_upstream, verify_jwt_token
+from src.auth.base import (
+    SessionValidationUnavailable,
+    validate_session_upstream,
+    verify_jwt_token,
+)
 from src.dax import member_cache
 from src.dax import session_store
+from src.dax.catalog_naming import (
+    CATALOG_PART_SEPARATOR,
+    AmbiguousCatalogError,
+    build_catalog_name,
+)
 from src.dax.cube_model import (
+    HIERARCHY_GROUP_UNIQUE_NAME,
     STANDALONE_GROUP_NAME,
+    STANDALONE_GROUP_UNIQUE_NAME,
+    TIME_GROUP_UNIQUE_NAME,
     build_cube_dimensions,
+    dimension_unique_name_for,
+    field_list_grouping_enabled,
     filter_cube_dimensions_by_persona,
     is_standalone_attribute,
+    is_time_group_member,
 )
 from src.dax.adapter import XmlaAdapter
 from src.dax.constants import SERVER_NAME
 from src.dax.dax_parser import translate_dax, find_kpi_member_functions
 from src.dax.drillthrough_handler import handle_drillthrough
 from src.dax.kpi_persona_filter import (
+    filter_kpis_for_native_xmla,
     filter_kpis_for_persona,
     _kpi_lineage_measure_ids as kpi_lineage_measure_ids,
     _measure_name_to_id as kpi_persona_measure_name_to_id,
@@ -122,6 +139,7 @@ from src.router_client import (
     get_dimension_members,
     list_all_models_for_tenant,
     list_models_for_tenant,
+    visible_named_queries,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,6 +226,28 @@ _xmla_inflight_tasks: dict[str, asyncio.Task] = {}
 # scheduling points) and can mask concurrency bugs.  ``asyncio.Lock``
 # serialises at the coroutine-scheduling level, matching the execution model.
 _xmla_inflight_lock = asyncio.Lock()
+
+
+def _flat_rollup_attribute_names(
+    dimensions_meta: list[dict[str, Any]],
+    hierarchy_defs: list[dict[str, Any]],
+) -> set[str]:
+    """Return flat fields that need Excel subtotal lattice registration."""
+    cube_dimensions = build_cube_dimensions(dimensions_meta, hierarchy_defs)
+    return {
+        str(dimension.get("name") or "")
+        for dimension in cube_dimensions
+        if (
+            dimension.get("name")
+            and (
+                is_standalone_attribute(dimension)
+                or (
+                    dimension.get("source") != "hierarchy"
+                    and is_time_group_member(dimension)
+                )
+            )
+        )
+    }
 
 
 def _parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
@@ -382,12 +422,21 @@ async def xmla_server_endpoint(request: Request) -> Response:
     try:
         verify_jwt_token(jwt_token)
     except Exception:
+        if session_id:
+            await session_store.delete(session_id)
         return _soap_fault("Authentication required.", "Client", status_code=401)
 
     # Bug-7322 (gateway consumer half): validate that the session has not
     # been revoked (deactivated user, role demotion, stale token_version).
     try:
         await validate_session_upstream(jwt_token)
+    except SessionValidationUnavailable as exc:
+        return _soap_fault(
+            "Session authority is temporarily unavailable; retry shortly.",
+            "Server",
+            status_code=503,
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
     except ValueError:
         if session_id:
             await session_store.delete(session_id)
@@ -593,6 +642,11 @@ async def _build_catalogs_all_tenants(
         for model, personas_or_exc in zip(models, persona_results):
             base_slug = model.get("slug") or str(model["id"])
             display = model.get("display_name", "")
+            # Bug-9825: the published name is the qualified identity; the
+            # readable project and model names move into the caption, which is
+            # where a display name belongs. Falls back to the slug only when the
+            # ids are unusable, so a malformed identity is never published.
+            project_label = model.get("project_slug") or ""
             personas = personas_or_exc if isinstance(personas_or_exc, list) else []
             variants: list[tuple[str, str]] = [("", "")]
             for persona in personas:
@@ -600,10 +654,12 @@ async def _build_catalogs_all_tenants(
                 if not pslug:
                     continue
                 pname = persona.get("description") or persona.get("name") or pslug
-                variants.append((f"_{pslug}", f" ({pname})"))
-            for suffix, label_suffix in variants:
+                variants.append((pslug, f" ({pname})"))
+            for persona_slug, label_suffix in variants:
                 rows.append({
-                    "CATALOG_NAME": f"{base_slug}{suffix}",
+                    "CATALOG_NAME": build_catalog_name(
+                        jwt_tenant, project_label, base_slug, persona_slug,
+                    ),
                     "DESCRIPTION": f"{display}{label_suffix}".strip(),
                     "ROLES": "",
                     "DATE_MODIFIED": str(system_snapshot_get("xmla.metadata_modified_at")),
@@ -871,17 +927,28 @@ async def _handle_xmla_request(tenant_slug: str, username: str, jwt_token: str, 
     )
 
     if not jwt_token:
+        if session_id:
+            await session_store.delete(session_id)
         return _soap_fault("Authentication required.", "Client", status_code=401)
 
     try:
         verify_jwt_token(jwt_token)
     except Exception:
+        if session_id:
+            await session_store.delete(session_id)
         return _soap_fault("Authentication required.", "Client", status_code=401)
 
     # Bug-7322 (gateway consumer half): validate that the session has not
     # been revoked (deactivated user, role demotion, stale token_version).
     try:
         await validate_session_upstream(jwt_token)
+    except SessionValidationUnavailable as exc:
+        return _soap_fault(
+            "Session authority is temporarily unavailable; retry shortly.",
+            "Server",
+            status_code=503,
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
     except ValueError:
         if session_id:
             await session_store.delete(session_id)
@@ -950,6 +1017,49 @@ def _normalize_restrictions(restrictions: dict[str, list[str]]) -> dict[str, lis
     return out
 
 
+def _member_discover_targets_one_field(
+    restrictions: dict[str, list[str]],
+    dimensions: list[dict[str, Any]],
+) -> bool:
+    """Return whether a member request targets one field instead of the cube.
+
+    Bug-9887: an unrestricted MDSCHEMA_MEMBERS request used to enumerate every
+    leaf value of every attribute hierarchy.  On the demo model that exposed
+    79,576 distinct members and produced 71 MB of XML before a user selected a
+    field.  High-cardinality classification cannot be the safety boundary
+    because imported models may legitimately have no profiler estimates.
+
+    Hierarchy, level, and member restrictions identify a field directly.  A
+    DIMENSION_UNIQUE_NAME is targeted only when it maps to exactly one served
+    dimension; group nodes such as [Dimensions] and [Time] must not reintroduce
+    a whole-cube scan.
+    """
+    norm = _normalize_restrictions(restrictions)
+    if any(
+        norm.get(key)
+        for key in (
+            "HIERARCHY_UNIQUE_NAME",
+            "LEVEL_UNIQUE_NAME",
+            "MEMBER_UNIQUE_NAME",
+        )
+    ):
+        return True
+    dim_filter = (norm.get("DIMENSION_UNIQUE_NAME") or [None])[0]
+    if not dim_filter:
+        return False
+    if field_list_grouping_enabled() and dim_filter in {
+        STANDALONE_GROUP_UNIQUE_NAME,
+        HIERARCHY_GROUP_UNIQUE_NAME,
+        TIME_GROUP_UNIQUE_NAME,
+    }:
+        return False
+    matches = sum(
+        1 for dimension in dimensions
+        if dimension_unique_name_for(dimension) == dim_filter
+    )
+    return matches == 1
+
+
 def _member_page_limit() -> int:
     """Bounded first-page size for a whole-level member enumeration (Bug-6602).
 
@@ -983,6 +1093,62 @@ def _hier_level_names(dimension: dict[str, Any]) -> list[str]:
         ordered = sorted(levels, key=lambda item: int(item.get("ordinal", 0)))
         return [str(item.get("name", "")).strip() for item in ordered if str(item.get("name", "")).strip()]
     return [str(item).strip() for item in levels if str(item).strip()]
+
+
+_DAX_STATEMENT_RE = re.compile(r"^\s*(?:EVALUATE|DEFINE)\b", re.IGNORECASE)
+
+
+def _normalize_wire_mdx(
+    text: str,
+    dimensions_meta: list[dict[str, Any]] | None = None,
+    hierarchy_defs: list[dict[str, Any]] | None = None,
+) -> str:
+    """Rewrite WIRE grouped hierarchy references to the INTERNAL grammar.
+
+    ``[Dimensions].[account_type]`` -> ``[account_type].[account_type]``
+
+    Bug-9771. Excel addresses a grouped field by the conformant wire name the
+    MDSCHEMA rowsets advertise, but every parser, member resolver and axis
+    builder in this gateway works in the internal ``[Name].[Name]`` form.
+
+    MODEL-AWARE, not syntactic. The translation is driven by the SAME identity
+    map the outbound side uses (``mdx_execute.wire_hierarchy_map``, derived from
+    ``cube_model.build_cube_dimensions``), so inbound and outbound can never
+    drift apart. An earlier version pattern-matched the literal group names,
+    which would happily rewrite a reference to a genuine field NAMED
+    ``Dimensions`` or ``Hierarchies``, and would rewrite unknown hierarchies
+    that no longer exist in the model. Only names the model actually maps are
+    touched; anything else is left exactly as the client sent it.
+
+    Level/member suffixes are preserved because the match is an exact-prefix
+    swap: ``[Dimensions].[account_type].[(All)].Members`` becomes
+    ``[account_type].[account_type].[(All)].Members``.
+
+    Idempotent, and a no-op on an ungrouped field (the flat time dimensions),
+    whose wire and internal names are already identical.
+
+    DAX (``EVALUATE`` / ``DEFINE``) is returned UNCHANGED: DAX does not use the
+    MDX hierarchy grammar, and blindly rewriting matching text inside a DAX
+    expression or string literal could alter a RESULT VALUE rather than an
+    identity.
+    """
+    if not text or "[" not in text:
+        return text
+    if _DAX_STATEMENT_RE.match(_strip_leading_mdx_comments(text)):
+        return text
+    from src.dax.mdx_execute import wire_hierarchy_map
+
+    hier_map = wire_hierarchy_map(dimensions_meta, hierarchy_defs)
+    if not hier_map:
+        return text
+    # Longest wire name first so a field whose name prefixes another's cannot
+    # be partially rewritten.
+    for internal, wire in sorted(
+        hier_map.items(), key=lambda kv: len(kv[1]), reverse=True
+    ):
+        if wire in text:
+            text = text.replace(wire, internal)
+    return text
 
 
 def _build_discover_dimensions(
@@ -1056,6 +1222,33 @@ def _to_preview_member_row(member: dict[str, Any], ordinal: int) -> dict[str, An
     }
 
 
+def _member_level_index(
+    member_filter: str | None,
+    level_filter: str | None,
+    dimension: dict[str, Any],
+    level_names: list[str],
+    level_count: int,
+) -> int:
+    """Level index of a requested member (Bug-9870).
+
+    Excel's MDSCHEMA_MEMBERS drill requests (TREE_OP self / children /
+    siblings) carry the member unique name and TREE_OP only, never
+    LEVEL_UNIQUE_NAME. The level is named inside the unique name
+    (``[H].[H].[City].&[GB]&[London]``); failing that, the key-path depth
+    gives it; a flat caption-form member is level 0.
+    """
+    idx = _level_index_from_unique_name(level_filter, dimension)
+    if idx is not None and idx >= 0:
+        return idx
+    _, level_name, _, key_path = parse_member_uname(member_filter)
+    lower = [n.lower() for n in level_names]
+    if level_name and level_name.lower() in lower:
+        return lower.index(level_name.lower())
+    if key_path and len(key_path) > 1:
+        return min(len(key_path) - 1, max(level_count - 1, 0))
+    return 0
+
+
 async def _load_hierarchy_member_data(
     *,
     model_id: str,
@@ -1078,37 +1271,66 @@ async def _load_hierarchy_member_data(
     tree_op_raw = (norm.get("TREE_OP") or [None])[0]
     tree_op = int(tree_op_raw) if tree_op_raw and str(tree_op_raw).isdigit() else 0
     parsed_member = _extract_member_name(member_filter)
+    _member_hier, _member_level, member_grammar, _member_keys = parse_member_uname(
+        member_filter,
+    )
+    # A real flat source key named ``All`` is emitted as ``.&[All]`` by the
+    # canonical member producer (Bug-9789).  It must take the ordinary member
+    # path below; only the synthetic bare ``.[All]``/``.[(All)]`` member gets
+    # the All short-circuit.  Keep the historical caption-form lowercase
+    # spelling compatible, where its identity is inherently ambiguous.
+    parsed_member_is_all = member_grammar == "all" or (
+        member_grammar == "caption"
+        and parsed_member is not None
+        and parsed_member.strip().lower() == "all"
+    )
 
     members_by_level: dict[str, list[dict[str, Any]]] = {}
 
     # All-member self-only requests need no preview query.
-    if parsed_member and parsed_member.lower() == "all" and tree_op and (tree_op & 8) and not (tree_op & 1 or tree_op & 16):
+    if parsed_member and parsed_member_is_all and tree_op and (tree_op & 8) and not (tree_op & 1 or tree_op & 16):
         return {"members": [], "levels": level_names, "members_by_level": members_by_level}
 
     # Specific-member self-only requests can be answered without parent discovery.
-    if parsed_member and parsed_member.lower() != "all" and (not tree_op or ((tree_op & 8) and not (tree_op & 1 or tree_op & 16))):
-        current_level = _level_index_from_unique_name(level_filter, dimension)
-        if current_level is None or current_level < 0:
-            current_level = 0
+    # Bug-9870: a NON-LEAF member's self row must still carry its real
+    # CHILDREN_CARDINALITY. Excel asks for the member with TREE_OP 8 when the
+    # user clicks the expand control and decides from that count whether to
+    # expand at all; with only the member's own level loaded the count was
+    # always 0, so a placed hierarchy could never be expanded by hand (the
+    # harness drives DrilledDown through COM and never saw it). For a non-leaf
+    # member the children are loaded below with the same parent-bounded
+    # preview the TREE_OP 1 path uses, and the self row is added afterwards.
+    self_only_row: dict[str, Any] | None = None
+    if parsed_member and not parsed_member_is_all and (not tree_op or ((tree_op & 8) and not (tree_op & 1 or tree_op & 16))):
+        current_level = _member_level_index(member_filter, level_filter, dimension, level_names, level_count)
+        _, _, _, _self_path = parse_member_uname(member_filter)
         if current_level < level_count:
-            members_by_level[str(current_level)] = [{
+            # The full ancestor key path, so the matcher recognises a
+            # path-qualified member below the first level ([City].&[GB]&[London])
+            # and the emitted row carries its real parent.
+            self_only_row = {
                 "name": parsed_member,
                 "ordinal": 0,
-                "parent": "",
+                "parent": _self_path[-2] if len(_self_path) >= 2 else "",
                 "level": level_names[current_level],
-            }]
-        return {
-            "members": members_by_level.get("0", []),
-            "levels": level_names,
-            "members_by_level": members_by_level,
-        }
+                "key_path": list(_self_path) if _self_path else [parsed_member],
+                "_level_index": current_level,
+            }
+        if self_only_row is None or current_level >= level_count - 1:
+            if self_only_row is not None:
+                members_by_level[str(current_level)] = [self_only_row]
+            return {
+                "members": members_by_level.get("0", []),
+                "levels": level_names,
+                "members_by_level": members_by_level,
+            }
 
     # Bug-5431: TREE_OP parent(2)/ancestors(32). The canonical member_filter
     # carries the full ancestor key path, so parent/ancestor members are
     # synthesised straight from it (no source query). Skipped when children/
     # descendants are also requested (those need the live fetch below).
     if (
-        parsed_member and parsed_member.lower() != "all"
+        parsed_member and not parsed_member_is_all
         and tree_op and (tree_op & 2 or tree_op & 32)
         and not (tree_op & 1 or tree_op & 16)
     ):
@@ -1139,20 +1361,32 @@ async def _load_hierarchy_member_data(
 
     expand_level = 0
     parent_key: str | None = None
+    # Bug-9871: the keys of the levels above the parent (root first) so the
+    # preview bounds the drill by the full ancestor path.
+    ancestor_keys: list[str] = []
+    if self_only_row is not None:
+        # Bug-9870: children of the self member, one level down.
+        expand_level = min(int(self_only_row["_level_index"]) + 1, max(level_count - 1, 0))
+        parent_key = parsed_member
+        ancestor_keys = [str(k) for k in self_only_row["key_path"][:-1]]
     sibling_mode = False
-    if parsed_member and parsed_member.lower() != "all":
-        current_level = _level_index_from_unique_name(level_filter, dimension)
-        if current_level is None or current_level < 0:
-            current_level = 0
+    if self_only_row is not None:
+        pass  # Bug-9870: expand_level / parent_key already set above
+    elif parsed_member and not parsed_member_is_all:
+        # Bug-9870: Excel's children/siblings requests carry no
+        # LEVEL_UNIQUE_NAME either; derive the level the same way.
+        current_level = _member_level_index(member_filter, level_filter, dimension, level_names, level_count)
+        _, _, _, _fp = parse_member_uname(member_filter)
         if tree_op & 1 or tree_op & 16:
             expand_level = min(current_level + 1, max(level_count - 1, 0))
             parent_key = parsed_member
+            ancestor_keys = [str(k) for k in (_fp or [])[:-1]]
         elif tree_op & 4:
             # Bug-5431: siblings = the member's own parent's children.
             expand_level = current_level
-            _, _, _, _fp = parse_member_uname(member_filter)
             if len(_fp) >= 2:
                 parent_key = _fp[-2]
+                ancestor_keys = [str(k) for k in _fp[:-2]]
                 sibling_mode = True
         else:
             expand_level = current_level
@@ -1182,12 +1416,17 @@ async def _load_hierarchy_member_data(
             sample_size=sample_size,
             expand_level=expand_level,
             parent_key=parent_key,
+            ancestor_keys=ancestor_keys or None,
             persona_id=persona_id,
             # Bug-3617 (Phase 0.5b): ask for ancestor key paths; the model-service
             # only returns them for the parent-less single-table enumeration case
             # (target_level>0, no parent_key), so this is a no-op on the root and
             # drill paths and safe to pass unconditionally.
             include_key_path=True,
+            # Bug-9895: this path reads ``members`` only. The per-level distinct
+            # counts are routed queries now, so asking for them here would spend
+            # one query per level on a value nothing below consumes.
+            include_level_counts=False,
         )
     except Exception as exc:
         logger.warning(
@@ -1196,6 +1435,9 @@ async def _load_hierarchy_member_data(
             hierarchy_id,
             exc,
         )
+        if self_only_row is not None:
+            _lvl = self_only_row.pop("_level_index")
+            return {"members": [], "levels": level_names, "members_by_level": {str(_lvl): [self_only_row]}}
         return {"members": [], "levels": level_names, "members_by_level": {}}
 
     preview_members = preview.get("members") or []
@@ -1235,6 +1477,11 @@ async def _load_hierarchy_member_data(
         if mapped is not None:
             served_level = mapped
     members_by_level[str(served_level)] = preview_rows
+    if self_only_row is not None:
+        # Bug-9870: the requested member itself, above its freshly loaded
+        # children, so the member row reports the real CHILDREN_CARDINALITY.
+        _lvl = self_only_row.pop("_level_index")
+        members_by_level[str(_lvl)] = [self_only_row]
     if sibling_mode:
         # Bug-5431: siblings sit at the filter member's level sharing its parent;
         # stamp the canonical ancestor path (parent path + own key) so the matcher
@@ -1277,6 +1524,35 @@ async def _load_discover_member_data(
     member_filter = (norm.get("MEMBER_UNIQUE_NAME") or [None])[0]
     level_filter = (norm.get("LEVEL_UNIQUE_NAME") or [None])[0]
     tree_op = (norm.get("TREE_OP") or [None])[0]
+
+    # Bug-9771: Excel restricts a member/level/hierarchy lookup by the WIRE
+    # unique name it was given (`[Dimensions].[account_type]...`), but the
+    # narrowing and member-resolution below match against the INTERNAL
+    # `[Name].[Name]` grammar. Normalise the three unique-name restrictions to
+    # the internal form so an Excel EXPAND (which restricts by
+    # MEMBER_UNIQUE_NAME + TREE_OP, or by LEVEL_UNIQUE_NAME) still resolves to
+    # exactly one owning dimension instead of falling through to a full scan or
+    # returning nothing. DIMENSION_UNIQUE_NAME is deliberately NOT normalised:
+    # `[Dimensions]` is a real group node here and is matched as such below.
+    from src.dax.mdx_execute import wire_hierarchy_map_from_cube_dims
+
+    _disc_wire_map = wire_hierarchy_map_from_cube_dims(dimensions)
+    if _disc_wire_map:
+        def _to_internal(value: str) -> str:
+            # Longest wire name first: a field whose name prefixes another's
+            # must not be partially rewritten.
+            for internal, wire in sorted(
+                _disc_wire_map.items(), key=lambda kv: len(kv[1]), reverse=True
+            ):
+                if value == wire:
+                    return internal
+                if value.startswith(wire + "."):
+                    return internal + value[len(wire):]
+            return value
+
+        hier_filter = _to_internal(hier_filter) if hier_filter else hier_filter
+        member_filter = _to_internal(member_filter) if member_filter else member_filter
+        level_filter = _to_internal(level_filter) if level_filter else level_filter
 
     # Bug-6602: restriction-aware narrowing. Previously ``dims_to_fetch`` was
     # narrowed ONLY by DIMENSION/HIERARCHY_UNIQUE_NAME, so an Excel expand --
@@ -1366,6 +1642,18 @@ async def _load_discover_member_data(
         is_specific_member = _mgr in ("key", "caption")
     apply_flat_cap = not is_specific_member
 
+    # Bug-9865: when the browse cap applies, bound the SOURCE query too. The
+    # flat path asked the query-router for MEMBER_DISCOVERY_LIMIT (100,000)
+    # distinct values and then discarded everything past ``page_limit``, so an
+    # unrestricted MDSCHEMA_MEMBERS ran one unbounded `SELECT DISTINCT ...
+    # ORDER BY` per dimension to throw most of each result away. Ask for one
+    # more than the page so ``_cap_flat`` can still SEE the overflow and log
+    # the truncation — the Bug-5436a contract that truncation is never silent.
+    # A specific-member lookup keeps the uncapped fetch (a member past the page
+    # boundary must still resolve), and the cache key carries the bound so a
+    # capped value is never served to an uncapped caller.
+    flat_fetch_limit = (page_limit + 1) if apply_flat_cap else None
+
     def _cap_flat(result: dict[str, Any], *, log: bool, dname: str) -> dict[str, Any]:
         """Bound a whole-level flat enumeration to the first page (browse only)."""
         if not isinstance(result, dict):
@@ -1395,13 +1683,18 @@ async def _load_discover_member_data(
         is_hier = d.get("source") == "hierarchy"
         # Bug-6602: the cache key is scoped by persona AND per-caller principal
         # (security contexts). Flat dimensions enumerate the whole level
-        # irrespective of the member/level restriction, so the cached value is
-        # the FULL level (constant shape) and the browse page cap is applied
-        # AFTER the cache read; hierarchy dimensions vary by member/level/tree-op.
+        # irrespective of the member/level restriction, so their shape does not
+        # vary by member/level/tree-op the way a hierarchy's does — it varies
+        # only by the fetch bound (Bug-9865, below). Hierarchy dimensions vary
+        # by member/level/tree-op.
         if is_hier:
             restriction_shape = f"{member_filter or ''}|{level_filter or ''}|{tree_op or ''}"
         else:
-            restriction_shape = ""
+            # Bug-9865: the flat value is no longer always the full level — a
+            # browse now fetches only the bounded page — so the bound is part
+            # of the key. Without it a capped browse result would be served to
+            # a later specific-member lookup, which must see the whole level.
+            restriction_shape = f"limit={flat_fetch_limit or ''}"
         ckey = member_cache.member_key(
             model_id=model_id,
             persona_id=persona_id,
@@ -1440,23 +1733,78 @@ async def _load_discover_member_data(
             tasks.append(get_dimension_members(
                 model_id, dname, tenant_slug, jwt_token,
                 persona_id=persona_id,
+                limit=flat_fetch_limit,
             ))
 
     if not tasks:
         return member_data
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Bug-9865: bound the fan-out. An unrestricted MDSCHEMA_MEMBERS browses
+    # EVERY dimension, and the previous unbounded ``gather`` launched one
+    # model-service preview per dimension at once (111 on the demo technical
+    # catalog). The tenant connection pool is TENANT_DB_POOL_SIZE (default 2),
+    # so the surplus requests sat on the pool until SQLAlchemy's pool timeout
+    # and came back 500: the Discover's wall clock was set by that timeout, not
+    # by the work, and every timed-out dimension silently disappeared from the
+    # rowset (the same request returned 101k-131k rows run to run). Running the
+    # fetches through a semaphore sized just above the pool keeps the pool
+    # saturated without queueing anything to death, so the request is both
+    # faster and deterministic. A restricted Discover already narrows
+    # ``dims_to_fetch`` to one dimension (Bug-6602) and is unaffected.
+    _limit = max(1, int(_get_settings().XMLA_MEMBER_FETCH_CONCURRENCY))
+    _sem = asyncio.Semaphore(_limit)
+    _elapsed: list[float] = [0.0] * len(tasks)
+
+    async def _bounded(idx, coro):
+        async with _sem:
+            _t0 = _time.perf_counter()
+            try:
+                return await coro
+            finally:
+                _elapsed[idx] = _time.perf_counter() - _t0
+
+    results = await asyncio.gather(
+        *[_bounded(i, t) for i, t in enumerate(tasks)], return_exceptions=True
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        _slowest = sorted(zip(_elapsed, dim_names), reverse=True)[:10]
+        logger.debug(
+            "Member discovery fetched %d dimensions at concurrency %d "
+            "(Bug-9865); slowest: %s",
+            len(dim_names), _limit,
+            ", ".join(f"{n}={s:.2f}s" for s, n in _slowest),
+        )
+    failed: list[str] = []
     for dname, is_hier, ckey, result in zip(dim_names, dim_is_hier, cache_keys, results):
         if not isinstance(result, dict):
+            # Bug-9865: a failed fetch used to drop the dimension from the
+            # rowset with no trace on this path (only the hierarchy branch
+            # logged, and never with the resulting row-count loss). Record it so
+            # an incomplete member rowset is visible instead of looking like a
+            # dimension that legitimately has no members.
+            failed.append(dname)
             continue
-        # Cache the FULL (uncapped) flat level so a browse and a specific-member
-        # lookup share one entry; the browse page cap is a per-request
-        # presentation step applied below.
+        # Cache under a key that carries the fetch bound (Bug-9865): a browse
+        # stores its bounded page, a specific-member lookup stores the full
+        # level, and the two never share an entry. The page SLICE is still a
+        # per-request presentation step applied below, so the overflow row the
+        # bound deliberately leaves in place can be seen and logged.
         member_cache.put_member_data(ckey, result)
         if not is_hier and apply_flat_cap:
             member_data[dname] = _cap_flat(result, log=True, dname=dname)
         else:
             member_data[dname] = result
+    if failed:
+        logger.warning(
+            "Member discovery for model=%s could not fetch %d of %d dimensions "
+            "(%s); those dimensions are ABSENT from the member rowset "
+            "(Bug-9865). Check the model-service logs — a connection-pool "
+            "timeout here means XMLA_MEMBER_FETCH_CONCURRENCY (%d) is too high "
+            "for TENANT_DB_POOL_SIZE.",
+            model_id, len(failed), len(dim_names),
+            ", ".join(failed[:10]) + ("..." if len(failed) > 10 else ""),
+            _limit,
+        )
     return member_data
 
 
@@ -1637,7 +1985,9 @@ async def _load_model_metadata_cached(
     to a restricted viewer, nor a viewer-primed trimmed snapshot to an admin
     (Bug-6602 / Fable F-1). The per-caller fingerprint isolates security
     contexts while a single caller's connect burst still de-duplicates (same
-    JWT), preserving the N+1 elimination. The gateway applies its own
+    JWT), preserving the N+1 elimination. The deployed version is also part of
+    the key so a newly deployed description snapshot cannot reuse the prior
+    version's metadata. The gateway applies its own
     catalog-persona allow-list + ``is_hidden`` trimming AFTER this returns. Deep
     copies are returned (and stored) so a caller's in-place edit — including
     nested ``levels`` lists on hierarchy defs — can never poison the snapshot.
@@ -1681,9 +2031,12 @@ async def _load_model_metadata_cached(
     # and modelx_technical within one session gets separate cached snapshots.
     principal_key = member_cache.principal_fingerprint(jwt_token)
     persona_suffix = str(persona_id) if persona_id else ""
+    deployed_suffix = str(deployed_version_id) if deployed_version_id else ""
     meta_key = member_cache.metadata_key(
         tenant_slug=tenant_slug, model_id=model_id,
-        principal_key=f"{principal_key}\x01{persona_suffix}",
+        principal_key=(
+            f"{principal_key}\x01{persona_suffix}\x01{deployed_suffix}"
+        ),
     )
     cached = member_cache.get_metadata(meta_key)
     if cached is not None:
@@ -1723,12 +2076,12 @@ async def _load_model_metadata_cached(
     except Exception as exc:
         logger.warning("Failed to fetch model metadata: %s", exc)
 
-    # Bug-7959: overlay deployed snapshot effective_description onto live
-    # metadata so XMLA serves the same deployment-pinned descriptions as
-    # JDBC.  If the deployed snapshot is unavailable or has no
-    # effective_description fields (pre-fix snapshot), the live values are
-    # kept — matching the additive-field fallback contract.
+    # Bug-7959 / Bug-9829: a deployed model may expose only descriptions from
+    # its immutable deployed snapshot. Mutable live descriptions are removed
+    # before the overlay, so a missing/old/unavailable snapshot can omit text
+    # but can never leak draft text across the deployment boundary.
     if deployed_version_id and (measures or raw_dimensions):
+        _clear_effective_descriptions(measures, raw_dimensions)
         try:
             deployed_snap = await get_model_version_snapshot(
                 model_id, deployed_version_id, tenant_slug, jwt_token,
@@ -1738,11 +2091,9 @@ async def _load_model_metadata_cached(
                 measures, raw_dimensions, deployed_snap,
             )
         except Exception as _snap_exc:
-            # Non-fatal: if the snapshot overlay fails, XMLA degrades to
-            # live effective_description rather than failing the request.
             logger.warning(
                 "Bug-7959: deployed snapshot overlay failed for model %s "
-                "(version %s): %s — falling back to live descriptions.",
+                "(version %s): %s — deployed descriptions omitted.",
                 model_id, deployed_version_id, _snap_exc,
             )
 
@@ -1772,10 +2123,11 @@ def _overlay_deployed_effective_descriptions(
     helper overlays those deployed values onto the live metadata so XMLA
     serves the same pinned descriptions as JDBC.
 
-    Fallback: if the deployed snapshot lacks ``effective_description`` (pre-fix
-    snapshot format), the live value is kept.  This ensures backward
-    compatibility with snapshots created before Bug-7959 was fixed.
+    Callers must clear mutable live descriptions first. A pre-fix snapshot that
+    lacks ``effective_description`` therefore results in omitted text, never a
+    substitution from current draft metadata.
     """
+    _clear_effective_descriptions(measures, dimensions)
     if not deployed_snapshot:
         return
 
@@ -1802,6 +2154,15 @@ def _overlay_deployed_effective_descriptions(
             meas["effective_description"] = pinned
 
 
+def _clear_effective_descriptions(
+    measures: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]],
+) -> None:
+    """Remove mutable descriptions before applying a deployed snapshot."""
+    for item in (*measures, *dimensions):
+        item.pop("effective_description", None)
+
+
 async def _handle_discover(
     method_el: ET.Element,
     tenant_slug: str,
@@ -1818,9 +2179,17 @@ async def _handle_discover(
     logger.debug("xmla discover: type=%r catalog=%r", request_type, catalog)
 
     # Resolve model + persona from the catalog name.
-    model_id, project_id, persona, deployed_version_id = await _resolve_model_id(
-        catalog, tenant_slug, jwt_token,
-    )
+    try:
+        model_id, project_id, persona, deployed_version_id = await _resolve_model_id(
+            catalog, tenant_slug, jwt_token,
+        )
+    except AmbiguousCatalogError as exc:
+        # Bug-9825: refuse rather than pick. Serving one of several models
+        # that share a slug is how a workbook silently binds to the wrong
+        # project. The fault names the collision so the user can reconnect
+        # using the qualified identity from the catalog list.
+        logger.warning("Ambiguous catalog %r: %s", exc.catalog, exc.matches)
+        return _soap_fault(str(exc))
     is_technical_view = _persona_includes_hidden(persona)
 
     # Bug-XMLA-002 + Bug-XMLA-005 fix: validate the Catalog property at
@@ -1866,18 +2235,6 @@ async def _handle_discover(
     # Previously persona_id was extracted only after the metadata fetch, so
     # the metadata call went without persona_id.
     persona_id = str(persona["id"]) if persona and persona.get("id") else None
-
-    # Bug-9178 remediation: Named Queries carry no per-object persona allow-list
-    # AND the deployed snapshot does not record which dimensions a Named Query
-    # projects, so the catalogue cannot prove a given NQ is within a restricted
-    # persona's dimension scope (unlike named sets, which persona-scope by
-    # referenced-dimension id per Bug-5963). Until per-NQ dimension provenance
-    # exists, NQs are advertised ONLY on catalogue surfaces where the persona
-    # narrows NO dimensions (full-visibility); on a surface where the persona
-    # hides at least one dimension they are suppressed, so a restricted persona
-    # can never enumerate a Named Query that might reference a hidden dimension.
-    # Set True below iff filter_cube_dimensions_by_persona actually drops a dim.
-    _nq_persona_narrows_dimensions = False
 
     measures: list[dict[str, Any]] = []
     raw_dimensions: list[dict[str, Any]] = []
@@ -1975,18 +2332,9 @@ async def _handle_discover(
         # Filtering the whole list by included_dimension_ids alone (the old
         # behaviour) silently deleted every hierarchy from a persona that
         # populated only that list (Fable symptom 2, finding b).
-        _nq_dims_before_persona = {
-            str(d.get("name") or "") for d in discover_dimensions
-        }
         discover_dimensions = filter_cube_dimensions_by_persona(
             discover_dimensions, persona,
         )
-        # Bug-9178 remediation: this persona narrowed the visible dimension set,
-        # so it is a restricted surface — Named Queries are suppressed below.
-        if {
-            str(d.get("name") or "") for d in discover_dimensions
-        } != _nq_dims_before_persona:
-            _nq_persona_narrows_dimensions = True
 
     # Phase 5 of the semantic-layer plan: append synthetic trust-signal
     # measures so Excel users can drag freshness / source / owner straight
@@ -2020,6 +2368,11 @@ async def _handle_discover(
             _persona_results = await _aio_disc.gather(*_persona_tasks, return_exceptions=True)
             for m, p_or_exc in zip(tenant_models, _persona_results):
                 m["personas"] = p_or_exc if isinstance(p_or_exc, list) else []
+                # Bug-9825: a catalog is identified by tenant + project + model,
+                # never by the model name alone. The row builders caption with
+                # all three, so the model dict carries the tenant the listing
+                # was made under.
+                m.setdefault("tenant_slug", tenant_slug)
         except Exception as exc:
             logger.warning("Failed to list tenant models: %s", exc)
 
@@ -2027,7 +2380,16 @@ async def _handle_discover(
     # Bug-5189 / Bug-6628: persona_id extracted above (before the metadata
     # cache call) so member enumeration is scoped to the resolved persona.
     member_data = {}
-    if model_id and request_type.upper() == "MDSCHEMA_MEMBERS":
+    # Bug-9865: the member fetch and the rowset build are timed separately so
+    # the [XMLA-DISCOVER] line below attributes a slow Discover to the source
+    # fan-out or to the Python row builder without needing a profiler attached.
+    _member_fetch_s = 0.0
+    if (
+        model_id
+        and request_type.upper() == "MDSCHEMA_MEMBERS"
+        and _member_discover_targets_one_field(restrictions, discover_dimensions)
+    ):
+        _t_fetch = _time.perf_counter()
         member_data = await _load_discover_member_data(
             model_id=model_id,
             project_id=project_id,
@@ -2037,6 +2399,7 @@ async def _handle_discover(
             restrictions=restrictions,
             persona_id=persona_id,
         )
+        _member_fetch_s = _time.perf_counter() - _t_fetch
 
     named_sets: list[dict[str, Any]] = []
     kpis_list: list[dict[str, Any]] = []
@@ -2062,22 +2425,17 @@ async def _handle_discover(
                 kpis_list = await get_model_kpis(
                     model_id, tenant_slug, jwt_token, project_id=project_id,
                 )
-                # Bug-7227: filter KPIs BY LINEAGE for a measure-restricted
-                # persona (was Bug-5587, which blanked the ENTIRE list — a
-                # persona restricted to some measures then saw ZERO KPIs). A KPI
-                # is advertised iff every measure in its transitive lineage is in
-                # the persona allow-list; fail closed on unverifiable lineage.
-                # Same policy the query-router $KPIs data path uses
-                # (_kpi_allowed_by_persona), applied here to the XMLA catalogue.
-                if persona and kpis_list:
-                    allow_m = {
-                        str(x)
-                        for x in (persona.get("included_measure_ids") or [])
-                    }
-                    if allow_m:
-                        kpis_list = filter_kpis_for_persona(
-                            kpis_list, measures, allow_m,
-                        )
+                # Bug-9830: get_model_kpis requests deployed_only=true. Apply
+                # the native XMLA eligibility contract after the persona has
+                # narrowed the executable measure surface. The same filtered
+                # list feeds MDSCHEMA_KPIS and synthetic goal/status measures.
+                allow_m = {
+                    str(x)
+                    for x in (persona.get("included_measure_ids") or [])
+                } if persona else None
+                kpis_list = filter_kpis_for_native_xmla(
+                    kpis_list, measures, allow_m or None,
+                )
         except _discovery_httpx().HTTPStatusError as exc:
             # Bug-8384: a 409 DEPLOYED_SNAPSHOT_INVALID means the model's
             # deployed serving authority is genuinely broken, not that a
@@ -2121,31 +2479,40 @@ async def _handle_discover(
     # the DEPLOYED snapshot only (invariant 7): an undeployed draft never
     # enters the catalogue.
     #
-    # Bug-9178 PERSONA remediation: advertise Named Queries ONLY on catalogue
-    # surfaces where the persona narrows no dimensions
-    # (``_nq_persona_narrows_dimensions`` False). A restricted persona could
-    # otherwise enumerate a Named Query — and its column list — that projects a
-    # dimension outside its scope, defeating the persona dimension-scope
-    # boundary every sibling BI surface enforces (measures / dimensions / KPIs /
-    # hierarchies / named sets, Bug-6628/6263/5963/6800). Data rows stay
-    # RLS/CLS-protected at query time regardless; this closes the CATALOGUE
-    # (structure) leak. Full-visibility surfaces (persona=None or a persona that
-    # hides nothing) still see every deployed Named Query. Per-NQ dimension-
-    # scope filtering (so restricted personas see the NQs they ARE entitled to)
-    # is tracked as a follow-up once the snapshot records NQ dimension refs.
+    # Bug-9178 closed the catalogue leak: a restricted persona could enumerate a
+    # Named Query — and its full column list — that projects a dimension outside
+    # its scope, defeating the boundary every sibling BI surface enforces
+    # (measures / dimensions / KPIs / hierarchies / named sets,
+    # Bug-6628/6263/5963/6800). Data rows stay RLS/CLS-protected at query time
+    # regardless; this is the CATALOGUE (structure) boundary.
+    #
+    # Bug-9186 makes it per-object AND makes the test the real one. It used to
+    # scan the identifiers a definition mentions against the dimension names
+    # this persona's filter had removed — a metadata check that cannot see a
+    # restricted MEASURE, a column-level-security tag or a persona default
+    # filter, so a Named Query aggregating a measure outside the persona's
+    # allow-list was advertised here and refused at execute time. Visibility
+    # now follows the BIND (rule 4): the query-router plans each deployed
+    # definition under this persona and the catalogue advertises exactly the
+    # ones it accepts, which is the same verdict its executor applies. The
+    # JDBC catalogue asks the same authority, so the two agree.
     #
     # Bug-8384 parity: a 409 DEPLOYED_SNAPSHOT_INVALID fails LOUD as a SOAP
     # fault instead of rendering a deceptive empty table list — same policy
     # as the named-set / KPI fetches above.
     if (
-        not _nq_persona_narrows_dimensions
-        and model_id and deployed_version_id
+        model_id and deployed_version_id
         and request_type.upper() in ("DBSCHEMA_TABLES", "DBSCHEMA_COLUMNS")
     ):
         try:
-            named_queries = await get_deployed_named_queries(
-                model_id, deployed_version_id, tenant_slug, jwt_token,
-                project_id=project_id,
+            named_queries = await visible_named_queries(
+                await get_deployed_named_queries(
+                    model_id, deployed_version_id, tenant_slug, jwt_token,
+                    project_id=project_id,
+                ),
+                model_id=model_id,
+                persona_id=persona_id,
+                jwt_token=jwt_token,
             )
         except _discovery_httpx().HTTPStatusError as exc:
             if getattr(exc.response, "status_code", None) == 409:
@@ -2161,6 +2528,7 @@ async def _handle_discover(
         except Exception as exc:
             logger.warning("Failed to load named_queries: %s", exc)
 
+    _t_build = _time.perf_counter()
     xml_body = build_discover_response(
         request_type=request_type,
         catalog_name=catalog,
@@ -2177,6 +2545,25 @@ async def _handle_discover(
         named_sets=named_sets,
         kpis=kpis_list,
         named_queries=named_queries,
+    )
+    _build_s = _time.perf_counter() - _t_build
+
+    # Bug-9787: log every DISCOVER the way [XMLA-EXEC] logs every Execute.
+    # Schema traffic was completely invisible, which is why an Excel-side save
+    # failure could not be diagnosed at all -- the client asks for metadata,
+    # fails, and the server log shows nothing. Row count and byte size are on
+    # the line because an oversized rowset is itself a candidate cause: an
+    # unrestricted MDSCHEMA_MEMBERS on this model is 82,034 rows / 74 MB / 25s.
+    logger.info(
+        "[XMLA-DISCOVER] type=%s restrictions=%r rows=%d bytes=%d "
+        "member_fetch_s=%.2f build_s=%.2f",
+        request_type,
+        {k: (v[:80] if isinstance(v, str) else v)
+         for k, v in (restrictions or {}).items()},
+        xml_body.count("<row>"),
+        len(xml_body),
+        _member_fetch_s,
+        _build_s,
     )
 
     full_response = (
@@ -2232,9 +2619,17 @@ async def _handle_tmschema_dmv(
     dimensions: list[dict[str, Any]] = []
     hierarchy_defs: list[dict[str, Any]] = []
 
-    model_id, project_id, persona, _dmv_dvid = await _resolve_model_id(
-        catalog, tenant_slug, jwt_token,
-    )
+    try:
+        model_id, project_id, persona, _dmv_dvid = await _resolve_model_id(
+            catalog, tenant_slug, jwt_token,
+        )
+    except AmbiguousCatalogError as exc:
+        # Bug-9825: refuse rather than pick. Serving one of several models
+        # that share a slug is how a workbook silently binds to the wrong
+        # project. The fault names the collision so the user can reconnect
+        # using the qualified identity from the catalog list.
+        logger.warning("Ambiguous catalog %r: %s", exc.catalog, exc.matches)
+        return _soap_fault(str(exc))
     # Bug-6628: thread persona_id into metadata fetches.
     _dmv_persona_id = str(persona["id"]) if persona and persona.get("id") else None
     if model_id:
@@ -2454,6 +2849,20 @@ async def _handle_execute(
     properties = _parse_properties(method_el)
     catalog = properties.get("Catalog", "")
 
+    # Bug-9766: ``REFRESH CUBE [<cube>]`` is DDL, not a SELECT the MDX parser
+    # accepts — intercept before it reaches that gate (see _is_refresh_cube_statement)
+    # and acknowledge success. No catalog/model resolution needed: there is no
+    # server-side cube cache here to look up or invalidate.
+    if _is_refresh_cube_statement(dax_statement):
+        return _soap_response(
+            '<tns:ExecuteResponse>'
+            '<return>'
+            '<root xmlns="urn:schemas-microsoft-com:xml-analysis:empty"/>'
+            '</return>'
+            '</tns:ExecuteResponse>',
+            session_id=session_id,
+        )
+
     # Bug-5430: Power BI / Tabular clients issue DMV-style Execute statements
     # (``SELECT ... FROM $SYSTEM.TMSCHEMA_*``) to read the Tabular metadata
     # surface. Intercept before MDX translation — the parser does not
@@ -2463,9 +2872,17 @@ async def _handle_execute(
             dax_statement, catalog, tenant_slug, jwt_token, session_id,
         )
 
-    model_id, _project_id, persona, _exec_dvid = await _resolve_model_id(
-        catalog, tenant_slug, jwt_token,
-    )
+    try:
+        model_id, _project_id, persona, _exec_dvid = await _resolve_model_id(
+            catalog, tenant_slug, jwt_token,
+        )
+    except AmbiguousCatalogError as exc:
+        # Bug-9825: refuse rather than pick. Serving one of several models
+        # that share a slug is how a workbook silently binds to the wrong
+        # project. The fault names the collision so the user can reconnect
+        # using the qualified identity from the catalog list.
+        logger.warning("Ambiguous catalog %r: %s", exc.catalog, exc.matches)
+        return _soap_fault(str(exc))
     is_technical_view = _persona_includes_hidden(persona)
     persona_id = str(persona["id"]) if persona and persona.get("id") else None
 
@@ -2474,6 +2891,22 @@ async def _handle_execute(
             f"Model not found for catalog '{catalog or tenant_slug}'. "
             "Verify the model exists in the tenant.",
             "Client",
+        )
+
+    # Bug-9846: the SQL FROM table is the MODEL's slug, never the catalog
+    # identity the client connected with. Resolved once here and threaded to
+    # every statement builder below so the two cannot drift apart again.
+    try:
+        model_slug = await _resolve_model_slug(
+            catalog, model_id, tenant_slug, jwt_token,
+        )
+    except ModelSlugUnresolvedError as exc:
+        logger.warning("Execute refused: %s", exc)
+        return _soap_fault(
+            "The model behind this catalog could not be resolved to its "
+            "source table. Please retry; if it persists, reconnect to the "
+            "catalog.",
+            "Server",
         )
 
     # Fetch model metadata for classifying result columns (Bug-6602: shared
@@ -2510,6 +2943,12 @@ async def _handle_execute(
     # inlining, the axis extractors see a bare name — not a dimension or
     # measure reference — so the axis renders empty.
     execute_named_sets: list[dict[str, Any]] = []
+    # Bug-9979: send a conservative superset of names present in the statement
+    # instead of asking model-service to persona-check every deployed set. The
+    # service resolves these tokens against exact deployed set names before it
+    # performs any bind probes; the exact reference guard below still decides
+    # whether a returned hidden set is actually referenced.
+    _named_set_candidates = _mdx_named_set_reference_candidates(dax_statement)
     try:
         # Bug-6263: scope Execute-time inlining to the resolved persona so a
         # restricted persona never has a set built on a dimension it cannot see
@@ -2517,10 +2956,18 @@ async def _handle_execute(
         # inlining (the unscoped call tripped a "please select one" 403 that
         # left every set un-inlined). persona_id is resolved from the catalog
         # name above.
-        execute_named_sets = await get_model_named_sets(
-            model_id, tenant_slug, jwt_token, project_id=_project_id,
-            persona_id=persona_id,
-        )
+        # Bug-9877: ask for the persona-HIDDEN sets too. Discover advertises
+        # only the sets that bind (``persona_visible`` is not false); Execute
+        # additionally needs to tell "no such set" apart from "this set does
+        # not bind for your persona", so a reference to a hidden set is refused
+        # with a clear fault instead of silently leaving an empty axis.
+        if _named_set_candidates:
+            execute_named_sets = await get_model_named_sets(
+                model_id, tenant_slug, jwt_token, project_id=_project_id,
+                persona_id=persona_id,
+                include_persona_hidden=bool(persona_id),
+                reference_names=_named_set_candidates,
+            )
     except Exception as exc:
         # Bug-7254: fail CLOSED on a named-set fetch failure. The previous
         # behavior silently swallowed the error (DEBUG log only) and proceeded
@@ -2532,8 +2979,13 @@ async def _handle_execute(
         # sets return an empty list (not an error), so this only fires on
         # actual API/network failures.
         logger.error(
-            "Named-set fetch failed for Execute; failing the query to avoid "
-            "returning misleading empty axes (Bug-7254): %s", exc,
+            "XMLA Execute refused for model=%s persona=%s: the saved named-set "
+            "catalogue was required but could not be checked (%s: %s). No "
+            "query was executed (Bug-7254, Bug-9979).",
+            model_id,
+            persona_id or "automatic",
+            type(exc).__name__,
+            exc,
         )
         # Bug-8384: sending ``deployed_only=true`` made 409
         # DEPLOYED_SNAPSHOT_INVALID a reachable outcome on THIS call, where it
@@ -2545,13 +2997,57 @@ async def _handle_execute(
         # surfaces agree instead of contradicting each other.
         if getattr(getattr(exc, "response", None), "status_code", None) == 409:
             return _soap_fault(_deployed_snapshot_fault_message(catalog), "Server")
-        raise
+        return _soap_fault(
+            "The saved named-set catalogue could not be checked, so this query "
+            "was refused. Retry the request; if it continues, ask an "
+            "administrator to check the gateway and model-service logs.",
+            "Server",
+            status_code=503,
+        )
+    if execute_named_sets:
+        # Bug-9877 (audit row A20): refuse a reference to a set that does not
+        # bind for this persona BEFORE inlining, so Discover and Execute give
+        # the same answer — the set is not advertised and it is not executable.
+        _hidden_sets = [
+            ns for ns in execute_named_sets if ns.get("persona_visible") is False
+        ]
+        for _ns in _hidden_sets:
+            if _mdx_references_named_set(dax_statement, _ns.get("name", "")):
+                logger.info(
+                    "XMLA Execute refused named set '%s' for persona %s on "
+                    "model %s: it does not bind over the persona model query "
+                    "(Bug-9877).",
+                    _ns.get("name"), persona_id, model_id,
+                )
+                return _soap_fault(
+                    f"The named set '{_ns.get('name')}' is not available in "
+                    f"this perspective. It is built on model objects your "
+                    f"access does not include.",
+                    "Client",
+                )
+        execute_named_sets = [
+            ns for ns in execute_named_sets if ns.get("persona_visible") is not False
+        ]
     if execute_named_sets:
         dax_statement = _inline_named_sets(dax_statement, execute_named_sets)
         logger.debug(
             "[XMLA-EXEC] inlined %d named set(s) into MDX",
             len(execute_named_sets),
         )
+
+    # Bug-9771: Excel addresses grouped fields by their conformant WIRE name
+    # (`[Dimensions].[account_type]`), but every parser, member resolver and
+    # axis builder downstream works in the INTERNAL `[Name].[Name]` grammar.
+    # Normalise ONCE here, AFTER named-set inlining — a saved set's stored
+    # expression is spliced in above, so normalising before the splice would
+    # let any set referencing a grouped field bypass this bridge entirely
+    # (this model ships 6 deployed named sets, so that path is reachable).
+    # Everything downstream — MDX parsing, axis extraction, SQL translation,
+    # DRILLTHROUGH dispatch — reads the normalised statement. The outbound half
+    # lives in `mdx_execute.build_real_execute_response`.
+    dax_statement = _normalize_wire_mdx(
+        dax_statement, dimensions_meta, hierarchy_defs,
+    )
 
     (
         dim_names,
@@ -2693,6 +3189,35 @@ async def _handle_execute(
     # dragged `[Measures].[_info_last_refreshed]` onto a pivot we don't
     # want to hand a meaningless SELECT to the query router — we want
     # the actual timestamp surfaced in a single-cell result.
+    # Owner's manual review 2026-09-04: an info measure (last refreshed,
+    # source system, owner) is one model-wide value, like a KPI goal or
+    # status. With a dimension on an axis the info-only path answered one
+    # cell against no members and Excel showed nothing, silently. Refuse the
+    # breakdown with the same message shape as the KPI members instead.
+    _info_in_statement = _referenced_info_measures(dax_statement)
+    if _info_in_statement and not _DAX_STATEMENT_RE.match(
+        _strip_leading_mdx_comments(dax_statement)
+    ):
+        _info_axis_dims = _mdx_extract_dimensions(
+            _mdx_axis_expr(dax_statement, 0) + " " + _mdx_axis_expr(dax_statement, 1),
+            dim_names=dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+        )
+        if _info_axis_dims:
+            _rep = _info_in_statement[0]
+            logger.info(
+                "Execute refused: info measure %r requested with a dimension "
+                "breakdown on %s", _rep, sorted(_info_axis_dims),
+            )
+            return _soap_fault(
+                f"Info measure '{_rep}' was requested with a dimension "
+                "breakdown. Model information (last refreshed, source system, "
+                "owner) is one value for the whole model, so query it without a "
+                "dimension breakdown.",
+                "Client",
+            )
+
     info_measure_values = await _maybe_resolve_info_measures(
         dax_statement, model_id, tenant_slug, jwt_token
     )
@@ -2741,7 +3266,7 @@ async def _handle_execute(
             hierarchy_level_dim_map=hierarchy_level_dim_map,
             hierarchy_default_dim_map=hierarchy_default_dim_map,
             dim_names=dim_names,
-            model_slug=catalog or "",
+            model_slug=model_slug,
             persona_id=persona_id,
             is_technical_view=is_technical_view,
             persona_included_measure_ids=_persona_allow_m,
@@ -2778,20 +3303,214 @@ async def _handle_execute(
     # before SQL generation so the detail query includes all hierarchy dims.
     from src.dax.subtotal_engine import (
         detect_subtotal_hierarchies as _detect_subtotals,
+        detect_flat_attribute_rollups as _detect_attribute_rollups,
+        detect_drilldown_hierarchy_rollups as _detect_drilldown_hierarchy_rollups,
+        rewrite_drilldown_level_hierarchy_all as _rewrite_drilldown_hierarchy_all,
+        rewrite_hierarchy_all_members_to_first_level as _rewrite_all_members_first_level,
         build_subtotal_queries as _build_subtotal_queries,
         compute_last_non_empty_subtotals as _compute_lne_subtotals,
         merge_grain_results as _merge_grain_results,
         build_multi_subtotal_queries as _build_multi_subtotal_queries,
         compute_multi_lne_subtotals as _compute_multi_lne_subtotals,
         merge_multi_hierarchy_results as _merge_multi_hierarchy_results,
+        uncovered_axis_dimensions as _uncovered_axis_dimensions,
+        detect_level_set_hierarchies as _detect_level_set_hierarchies,
+        detect_flat_member_set_rollups as _detect_flat_member_set_rollups,
+        detect_drilldown_member_plan as _detect_drilldown_member_plan,
+        apply_drilldown_member_plan as _apply_drilldown_member_plan,
+        _resolve_drilldown_member_hierarchy,
+        hierarchy_drilldown_rollup as _hierarchy_drilldown_rollup,
+        apply_hierarchy_drilldown_members as _apply_hierarchy_drilldown_members,
         GrainResult as _GrainResult,
         GrainQuery as _GrainQuery,
+        RollupGrainBudgetExceeded,
+        build_lattice_query as _build_lattice_query,
+        split_lattice_results as _split_lattice_results,
+        LatticeUnavailable,
     )
     col_expr = _mdx_axis_expr(dax_statement, 0)
     row_expr = _mdx_axis_expr(dax_statement, 1)
+    _standalone_attribute_names = {
+        str(d.get("name") or "")
+        for d in build_cube_dimensions(dimensions_meta, hierarchy_defs)
+        if d.get("name") and is_standalone_attribute(d)
+    }
+    # Bug-9940: a flat time field has its own time-typed catalogue node, so it
+    # is deliberately absent from the standalone-attribute set above. On the
+    # Execute axis it is still a single self-named attribute, and Excel's
+    # DrilldownLevel(All) request needs the same subtotal registration as any
+    # other flat field. Keep real calendar hierarchies on the hierarchy path.
+    _flat_rollup_names = _flat_rollup_attribute_names(
+        dimensions_meta, hierarchy_defs,
+    )
+    # Bug-9764: detect hierarchy DrilldownLevel-on-All from the pre-rewrite axis,
+    # then rewrite to an explicit level-1 .Members reference before SQL translation
+    # so the shared All->leaf resolver is never consulted for this shape.
+    _drilldown_hierarchy_rollups = _detect_drilldown_hierarchy_rollups(
+        col_expr,
+        row_expr,
+        hierarchy_defs,
+        hierarchy_level_dim_map,
+        _standalone_attribute_names,
+    )
+    _rewritten = _rewrite_drilldown_hierarchy_all(
+        dax_statement,
+        hierarchy_defs,
+        hierarchy_level_dim_map,
+        _standalone_attribute_names,
+    )
+    if _rewritten != dax_statement:
+        dax_statement = _rewritten
+        col_expr = _mdx_axis_expr(dax_statement, 0)
+        row_expr = _mdx_axis_expr(dax_statement, 1)
+    # Bug-9873: Excel's expand (+) on a member of a placed hierarchy is the
+    # two-argument DrilldownMember on the same hierarchy. Resolve it to the
+    # deepest level's .Members, register the level chain without an All
+    # grain, and remember which members are expanded for the post-merge filter.
+    _rewritten, _member_drills = _resolve_drilldown_member_hierarchy(
+        dax_statement, hierarchy_defs, hierarchy_level_dim_map,
+        _standalone_attribute_names,
+    )
+    if _rewritten != dax_statement:
+        dax_statement = _rewritten
+        col_expr = _mdx_axis_expr(dax_statement, 0)
+        row_expr = _mdx_axis_expr(dax_statement, 1)
+        _have_hkeys = {h.hierarchy_name.lower() for h in _drilldown_hierarchy_rollups}
+        for _hkey, _drill in _member_drills.items():
+            _bracket = f"[{_drill.dim_part}].[{_drill.hier_part}]".lower()
+            _axis = 0 if _bracket in col_expr.lower() else 1
+            _rollup = _hierarchy_drilldown_rollup(_drill, _axis)
+            _drilldown_hierarchy_rollups = [
+                h for h in _drilldown_hierarchy_rollups
+                if h.hierarchy_name.lower() != _rollup.hierarchy_name.lower()
+            ] + [_rollup]
+    _rewritten = _rewrite_all_members_first_level(
+        dax_statement,
+        col_expr,
+        row_expr,
+        hierarchy_defs,
+        hierarchy_level_dim_map,
+        _standalone_attribute_names,
+    )
+    if _rewritten != dax_statement:
+        dax_statement = _rewritten
+        col_expr = _mdx_axis_expr(dax_statement, 0)
+        row_expr = _mdx_axis_expr(dax_statement, 1)
     subtotal_hierarchies = _detect_subtotals(
         col_expr, row_expr, hierarchy_defs, hierarchy_level_dim_map,
     )
+    if _drilldown_hierarchy_rollups:
+        _have = {h.hierarchy_name.lower() for h in subtotal_hierarchies}
+        subtotal_hierarchies = subtotal_hierarchies + [
+            h for h in _drilldown_hierarchy_rollups
+            if h.hierarchy_name.lower() not in _have
+        ]
+    # Bug-9766 (flat-attribute scope): a SEPARATE detection pass and result
+    # list from subtotal_hierarchies above -- see detect_flat_attribute_
+    # rollups's docstring. subtotal_hierarchies itself stays hierarchy-only
+    # everywhere it already feeds LAST_NON_EMPTY gating below; only the
+    # grain-query/merge block further down combines it with
+    # attribute_rollups (as all_rollups) to actually compute the requested
+    # subtotal/grand-total VALUES for a flat attribute dimension.
+    attribute_rollups = _detect_attribute_rollups(
+        col_expr, row_expr, _flat_rollup_names,
+    )
+
+    # Bug-9783: Excel's PivotTable expand/collapse. `DrilldownMember(base,
+    # targets, [hier])` asks for a MIXED GRAIN -- a rollup row for every outer
+    # member, plus detail rows for the DRILLED ones only. The inner hierarchy
+    # therefore joins the ordinary rollup path below (nothing about grain query
+    # generation or merging changes), and the plan is applied as a post-merge
+    # filter that drops the detail rows of members that are not drilled.
+    #
+    # It only ADDS a rollup, so a shape the detector does not recognise leaves
+    # every existing path exactly as it was.
+    drilldown_plan = _detect_drilldown_member_plan(
+        col_expr, row_expr, _standalone_attribute_names,
+    )
+    if drilldown_plan is not None:
+        _have = {r.mdx_dim_name.lower() for r in attribute_rollups}
+        _have |= {r.mdx_dim_name.lower() for r in subtotal_hierarchies}
+        attribute_rollups = attribute_rollups + [
+            r for r in drilldown_plan.rollups
+            if r.mdx_dim_name.lower() not in _have
+        ]
+
+    # Bug-9891: a hierarchy LEVEL set (``[Geography].[Geography].[City].Members``,
+    # Excel's shape for a hierarchy expanded to one grain) sharing the query
+    # with rollups. No detector above claims it, so the coverage guard below
+    # used to drop every rollup for it and the other axis lost all of its
+    # subtotals. Register it leaf-only: covered, ancestor columns fetched,
+    # no grain of its own served. Only when rollups exist -- alone, the
+    # plain path already renders a level set correctly.
+    if subtotal_hierarchies or attribute_rollups:
+        subtotal_hierarchies = subtotal_hierarchies + _detect_level_set_hierarchies(
+            col_expr, row_expr, hierarchy_defs, hierarchy_level_dim_map,
+            registered={h.hierarchy_name for h in subtotal_hierarchies},
+        )
+        # Bug-9902: the same class in its flat-attribute spelling. A standalone
+        # attribute's bare ``.Members`` set (Excel's shape for a field with
+        # subtotals off) is claimed by no detector when the rollup sits on the
+        # OTHER axis, and never in the grouped ``[a].[a].[a].Members`` wire
+        # spelling -- so the guard below dropped every rollup in the query.
+        # Register it leaf-only for the same reason: covered, no grain of its
+        # own. Only when rollups exist; alone, the plain path is correct.
+        attribute_rollups = attribute_rollups + _detect_flat_member_set_rollups(
+            col_expr, row_expr, _flat_rollup_names,
+            registered=(
+                {r.mdx_dim_name for r in attribute_rollups}
+                | {lvl.dim_name for h in subtotal_hierarchies for lvl in h.levels}
+                | {h.mdx_dim_name for h in subtotal_hierarchies}
+            ),
+        )
+
+    # ---- Bug-9785: COVERAGE GUARD -------------------------------------------
+    # The rollup set must name EVERY dimension the axis will group by. Grain
+    # queries GROUP BY only the rollup dimensions and the merge keys rows on
+    # them, so a rollup covering a SUBSET silently drops the uncovered
+    # dimension's column -- and the axis is then emitted with that hierarchy
+    # MISSING from AxisInfo while its tuples still reference it. Excel does not
+    # degrade on that: it CRASHES. Verified live -- a Calendar or a flat time
+    # dimension CrossJoined with a flat attribute produced an Axis1 declaring
+    # one hierarchy against 1836-2203 tuples, and Excel died on it.
+    #
+    # This is the THIRD occurrence of the same invariant (Bug-9777 dropped a
+    # CrossJoin sibling, Bug-9783 dropped the outer dimension), so it is now
+    # enforced STRUCTURALLY here rather than relied upon at each detection site.
+    # The detectors only recognise standalone ATTRIBUTES by design; a time
+    # dimension or a user hierarchy on the same axis can therefore never be
+    # covered by them, which is exactly the case that crashed.
+    #
+    # Failing SAFE means dropping the rollups, not the query: the plain path
+    # emits every hierarchy correctly and merely lacks the All/subtotal rows.
+    # A missing subtotal row is a display gap; a malformed axis takes Excel down.
+    # Bug-9862 F6: remember what the client ASKED for before any guard below
+    # may drop it. The response validator proves the finished axis covers this
+    # lattice; without it, dropping every rollup produces a response that every
+    # structural check calls perfect while the user sees blank subtotal rows
+    # (Bug-9891 -- 210 leaf tuples served for a 336-tuple request, no error).
+    requested_rollups = list(subtotal_hierarchies) + list(attribute_rollups)
+
+    if subtotal_hierarchies or attribute_rollups:
+        _axis_dims = set(_mdx_extract_dimensions(
+            col_expr + " " + row_expr,
+            dim_names=dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+        ))
+        _uncovered = _uncovered_axis_dimensions(
+            _axis_dims, subtotal_hierarchies + attribute_rollups,
+        )
+        if _uncovered:
+            logger.info(
+                "[XMLA-ROLLUP-COVERAGE] dropping rollups: axis dims %s are not "
+                "covered -- emitting the plain axis instead of one missing a "
+                "hierarchy",
+                sorted(_uncovered),
+            )
+            subtotal_hierarchies = []
+            attribute_rollups = []
+            drilldown_plan = None
 
     # Bug-6888: resolve static-KPI goal support members ([Measures].[<KPI> Goal])
     # to their constant values. They are not SQL columns — drop them from SQL
@@ -2811,9 +3530,15 @@ async def _handle_execute(
     )
 
     def _persona_filter_kpis(_kpis: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if _persona_allow_m and _kpis:
-            return filter_kpis_for_persona(_kpis, _kpi_surface_measures, _persona_allow_m)
-        return _kpis
+        if not _kpis:
+            return []
+        # Bug-9830: native KPI support members must use the same executable,
+        # deployed-snapshot/persona-aligned set as MDSCHEMA_KPIS. Without this
+        # gate Execute could resolve a goal/status member for a KPI whose
+        # catalogue row was withheld.
+        return filter_kpis_for_native_xmla(
+            _kpis, _kpi_surface_measures, _persona_allow_m or None,
+        )
 
     kpi_goal_consts: dict[str, str] = {}
     if model_id and "Goal]" in dax_statement:
@@ -2863,6 +3588,32 @@ async def _handle_execute(
                 if _goal_val:
                     _seen_goal_supports.add(_support)
                     kpi_goal_consts[_support] = _goal_val
+        # Owner decision 2026-09-04 (manual KPI review): a KPI goal is one
+        # model-wide target, like the status. Repeating it on every axis
+        # member invited misreading (and summing) it as a per-member figure,
+        # so a goal member with a dimension breakdown is refused exactly like
+        # the status. Only the KPI value slices.
+        if kpi_goal_consts:
+            _goal_axis_dims = _mdx_extract_dimensions(
+                col_expr + " " + row_expr,
+                dim_names=dim_names,
+                hierarchy_level_dim_map=hierarchy_level_dim_map,
+                hierarchy_default_dim_map=hierarchy_default_dim_map,
+            )
+            if _goal_axis_dims:
+                _rep = next(iter(kpi_goal_consts))
+                logger.info(
+                    "Execute refused: KPI goal %r requested with a dimension "
+                    "breakdown on %s (owner decision 2026-09-04)",
+                    _rep, sorted(_goal_axis_dims),
+                )
+                return _soap_fault(
+                    f"KPI goal member '{_rep}' was requested with a dimension "
+                    "breakdown. A KPI goal is one target for the whole model, so "
+                    "query the goal without a dimension breakdown; only the KPI "
+                    "value can be broken down by dimension.",
+                    "Client",
+                )
 
     # Bug-8288: resolve synthetic governed-status support members
     # ([Measures].[<KPI> Status]) to the governed −1/0/1 RAG verdict. A native
@@ -2945,6 +3696,14 @@ async def _handle_execute(
             ) if _status_where else {}
             if _status_axis_dims:
                 _rep = _status_members[0][0]
+                # Owner's manual KPI review 2026-09-04: Excel shows only its
+                # generic "query did not run" for this fault, so log it or
+                # the refusal is invisible in the gateway log (Bug-9868).
+                logger.info(
+                    "Execute refused: KPI status %r requested with a dimension "
+                    "breakdown on %s (Bug-8288, by design)",
+                    _rep, sorted(_status_axis_dims),
+                )
                 return _soap_fault(
                     f"KPI status member '{_rep}' was requested with a dimension "
                     "breakdown. Governed KPI status returns one value per KPI, so "
@@ -3106,14 +3865,23 @@ async def _handle_execute(
             measures_meta,
             dimensions_meta,
             hierarchy_meta=hierarchy_defs,
-            model_slug=catalog or "",
+            model_slug=model_slug,
             subtotal_hierarchies=subtotal_hierarchies,
             constant_measure_names=set(kpi_goal_consts) | set(kpi_status_consts),
         )
     except ValueError as exc:
-        logger.warning("Execute translation failed: %s", exc)
+        # Log the STATEMENT, not only the message. A translation refusal is
+        # almost always a client sending a shape the translator does not handle,
+        # and without the statement the report is undiagnosable: the message
+        # names a dimension but not the expression it appeared in. Bug-9779 was
+        # invisible for exactly this reason -- the refusal was in the log, the
+        # query that caused it was not, and it could not be reproduced by
+        # guessing the shape.
+        logger.warning(
+            "Execute translation failed: %s | stmt=%r", exc, dax_statement[:2000],
+        )
         return _soap_fault(str(exc), "Client")
-    logger.info("[XMLA-EXEC] stmt=%r -> SQL=%r protocol=%s", dax_statement[:200], sql[:200], protocol)
+    logger.info("[XMLA-EXEC] stmt=%r -> SQL=%r protocol=%s", dax_statement[:2000], sql[:600], protocol)
 
     # Bug-5888: run the router call as a task registered under this session's
     # SessionId so a same-session <Cancel> can actually cancel it (see the
@@ -3203,6 +3971,7 @@ async def _handle_execute(
     hidden_lne_time_dim = _flat_lne_hidden_time_dim(
         mdx_dims=flat_axis_dims,
         lne_measures=flat_lne_measures,
+        measures_meta=measures_meta,
         dimensions_meta=dimensions_meta,
         subtotal_hierarchies=subtotal_hierarchies,
     )
@@ -3213,6 +3982,47 @@ async def _handle_execute(
         lne_measures=flat_lne_measures,
         measures_meta=measures_meta,
     )
+
+    # Bug-9766: a detected flat-attribute rollup (subtotal/grand-total over
+    # e.g. account_type) has no defined temporal ordering, so it cannot safely
+    # combine with a LAST_NON_EMPTY/semi-additive measure. The lone flat
+    # attribute path is not classified as an attribute rollup and continues to
+    # use the hidden-time-grain repair above; only the explicit multi-attribute
+    # rollup shape is refused below.
+    #
+    # Bug-9766: flat-attribute rollups still have no temporal hierarchy that
+    # defines LAST_NON_EMPTY, so they remain fail-closed above.
+    #
+    # Bug-9768: compute_multi_lne_subtotals now implements the standard
+    # semi-additive contract for genuine hierarchy rollups: last over the one
+    # temporal hierarchy, additive across omitted non-temporal peers. Only that
+    # metadata shape is safe to enter the multi-grain path. Multiple temporal
+    # hierarchies, mixed/unknown level time metadata, or missing level dimension
+    # names would make the ordering or peer partition ambiguous, so they remain
+    # explicitly refused instead of being guessed.
+    _multi_lne_supported = _supports_multi_hierarchy_lne(
+        subtotal_hierarchies, attribute_rollups,
+    )
+    if (
+        len(subtotal_hierarchies) + len(attribute_rollups) > 1
+        and flat_lne_measures
+        and not _multi_lne_supported
+    ):
+        _rollup_names = sorted(
+            {r.mdx_dim_name for r in subtotal_hierarchies}
+            | {r.mdx_dim_name for r in attribute_rollups}
+        )
+        return _soap_fault(
+            "LAST_NON_EMPTY measure(s) ("
+            + ", ".join(sorted(flat_lne_measures))
+            + ") cannot be combined with a subtotal/grand-total request "
+            "spanning more than one dimension ("
+            + ", ".join(_rollup_names)
+            + "); refusing the query because this rollup shape lacks the "
+            "single temporal hierarchy and non-temporal peer metadata required "
+            "for an exact semi-additive aggregate.",
+            "Client",
+        )
 
     # Bug-6658 (F-002-04): "Show items with no data". SSAS renders every member
     # of an axis level — including members with zero facts — when NON EMPTY is
@@ -3240,12 +4050,18 @@ async def _handle_execute(
         )
 
     subtotal_info = None
-    # Bug-6946: collect names of grain queries that fail so a SOAP <Warning>
-    # can surface the degrade to the client instead of silently omitting
-    # subtotal/grand-total rows.
+    # Bug-9837: every requested subtotal grain is required.  A failed grain
+    # faults the whole Execute instead of returning a plausible partial cube.
     _failed_grain_labels: list[str] = []
-    if subtotal_hierarchies and rows:
-        subtotal_info = subtotal_hierarchies[0] if len(subtotal_hierarchies) == 1 else None
+    # Bug-9766/9768: query generation/merging is the one place hierarchy
+    # rollups and attribute_rollups are deliberately combined -- both produce
+    # the same SubtotalHierarchy shape and share this tested grain machinery.
+    # Multi-rollup LNE has already been admitted only for the supported
+    # time-hierarchy/non-time-peer shape; flat-attribute LNE remains excluded
+    # from that multi-rollup path.
+    all_rollups = subtotal_hierarchies + attribute_rollups
+    if all_rollups and rows:
+        subtotal_info = all_rollups[0] if len(all_rollups) == 1 else None
 
         mdx_dims = _mdx_extract_dimensions(
             col_expr + " " + row_expr,
@@ -3381,13 +4197,26 @@ async def _handle_execute(
             and m.get("name", "") in {measure_canonical.get(ms.lower(), ms) for ms in mdx_measures}
         ]
 
-        if len(subtotal_hierarchies) == 1:
-            hierarchy = subtotal_hierarchies[0]
+        def _measureless_all_grain(sq: _GrainQuery) -> _GrainResult | None:
+            """Return the one structural row for a dimension-only All grain.
+
+            Excel adds row fields before a value field exists.  The outermost
+            grand-total grain then has neither dimensions nor measures, so it
+            correctly has no source SQL to execute.  It is still a required
+            structural tuple in the requested axis tree.  Synthesize that one
+            empty row; an unresolved requested measure remains a hard failure.
+            """
+            if mdx_measures or sq.dim_cols:
+                return None
+            return _GrainResult(query=sq, columns=[], rows=[{}])
+
+        if len(all_rollups) == 1:
+            hierarchy = all_rollups[0]
             subtotal_queries = _build_subtotal_queries(
                 mdx_dims=mdx_dims,
                 mdx_measures=mdx_measures,
                 where_sql_clauses=where_sql,
-                model_slug=catalog or "",
+                model_slug=model_slug,
                 measures_meta=measures_meta,
                 hierarchy=hierarchy,
                 measure_canonical=measure_canonical,
@@ -3396,6 +4225,15 @@ async def _handle_execute(
             subtotal_results: list[_GrainResult] = []
             for sq in subtotal_queries:
                 if not sq.sql:
+                    synthetic = _measureless_all_grain(sq)
+                    if synthetic is not None:
+                        subtotal_results.append(synthetic)
+                        continue
+                    logger.error(
+                        "Required subtotal query produced no SQL (grain=%s)",
+                        sq.level_name,
+                    )
+                    _failed_grain_labels.append(sq.level_name)
                     continue
                 try:
                     sr = await _execute_query(
@@ -3417,6 +4255,12 @@ async def _handle_execute(
                 except Exception as exc:
                     logger.warning("Subtotal query failed (grain=%s): %s", sq.level_name, exc)
                     _failed_grain_labels.append(sq.level_name)
+
+            if _failed_grain_labels:
+                return _soap_fault(
+                    "A required subtotal query failed; no partial result was returned.",
+                    "Server",
+                )
 
             lne_overrides = {}
             if lne_measures:
@@ -3443,6 +4287,30 @@ async def _handle_execute(
                 detail_result, subtotal_results, hierarchy,
                 lne_overrides=lne_overrides,
             )
+            if drilldown_plan is not None:
+                _before = len(rows)
+                rows = _apply_drilldown_member_plan(rows, drilldown_plan)
+                logger.info(
+                    "[XMLA-DRILLDOWN] inner=%s outer=%s members=%s complement=%s "
+                    "rows %d -> %d",
+                    drilldown_plan.inner.hierarchy_name, drilldown_plan.outer_dim,
+                    drilldown_plan.members, drilldown_plan.complement,
+                    _before, len(rows),
+                )
+            for _drill in _member_drills.values():
+                _rollup = next(
+                    (h for h in all_rollups
+                     if h.hierarchy_name.lower() == str(_drill.hier_def.get("name", "")).lower()),
+                    None,
+                )
+                if _rollup is None:
+                    continue
+                _before = len(rows)
+                rows = _apply_hierarchy_drilldown_members(rows, _rollup, _drill)
+                logger.info(
+                    "[XMLA-DRILLDOWN-HIER] hierarchy=%s depth=%d rows %d -> %d",
+                    _rollup.hierarchy_name, _drill.depth, _before, len(rows),
+                )
 
             logger.info(
                 "[XMLA-SUBTOTAL] hierarchy=%s levels=%d subtotal_queries=%d merged_rows=%d",
@@ -3450,18 +4318,40 @@ async def _handle_execute(
                 len(subtotal_results), len(rows),
             )
         else:
-            subtotal_queries = _build_multi_subtotal_queries(
-                mdx_dims=mdx_dims,
-                mdx_measures=mdx_measures,
-                where_sql_clauses=where_sql,
-                model_slug=catalog or "",
-                measures_meta=measures_meta,
-                hierarchies=subtotal_hierarchies,
-                measure_canonical=measure_canonical,
-            )
+            try:
+                subtotal_queries = _build_multi_subtotal_queries(
+                    mdx_dims=mdx_dims,
+                    mdx_measures=mdx_measures,
+                    where_sql_clauses=where_sql,
+                    model_slug=model_slug,
+                    measures_meta=measures_meta,
+                    hierarchies=all_rollups,
+                    measure_canonical=measure_canonical,
+                    # Bug-9845: the client gets the full Cartesian grain set it
+                    # asked for.
+                    max_grain_queries=_subtotal_grain_budget(),
+                )
+            except RollupGrainBudgetExceeded as exc:
+                # Deep-review F4: refuse loudly rather than fan out 2^N queries.
+                logger.warning("Execute refused: %s", exc)
+                return _soap_fault(
+                    f"This PivotTable layout needs {exc.planned} subtotal "
+                    f"queries across {exc.hierarchies} fields, above the "
+                    f"configured limit of {exc.budget}. Remove fields from the "
+                    "axis, or turn off subtotals for some of them, and refresh.",
+                    "Server",
+                )
 
             async def _exec_grain(sq: _GrainQuery) -> _GrainResult | None:
                 if not sq.sql:
+                    synthetic = _measureless_all_grain(sq)
+                    if synthetic is not None:
+                        return synthetic
+                    logger.error(
+                        "Required multi-subtotal query produced no SQL (grain=%s)",
+                        sq.level_name,
+                    )
+                    _failed_grain_labels.append(sq.level_name)
                     return None
                 try:
                     sr = await _execute_query(
@@ -3488,28 +4378,108 @@ async def _handle_execute(
                     _failed_grain_labels.append(sq.level_name)
                     return None
 
-            grain_results = await _gather_bounded(
-                [lambda sq=sq: _exec_grain(sq) for sq in subtotal_queries],
-                _subtotal_grain_concurrency(),
-            )
-            subtotal_results = [r for r in grain_results if r is not None]
+            # Bug-9864: serve the whole lattice in ONE source operation where
+            # the source dialect supports GROUP BY GROUPING SETS. The planned
+            # per-grain queries are still the single source of truth for WHAT is
+            # asked for -- the lattice only changes how many round trips fetch
+            # it, and the split below hands the merge exactly the GrainResults
+            # the fan-out would have produced.
+            #
+            # Every failure mode falls back to the fan-out rather than failing:
+            # a dialect that is not on the allow-list, a shape the router
+            # refuses to render exactly, or a result the markers cannot be
+            # split by. The fallback returns the same numbers, only slower.
+            subtotal_results: list[_GrainResult] = []
+            _lattice_served = False
+            _lattice = None
+            try:
+                _lattice = _build_lattice_query(
+                    subtotal_queries,
+                    mdx_measures=mdx_measures,
+                    measures_meta=measures_meta,
+                    measure_canonical=measure_canonical,
+                    where_sql_clauses=where_sql,
+                    model_slug=model_slug,
+                )
+            except LatticeUnavailable as exc:
+                logger.info("[XMLA-SUBTOTAL-LATTICE] not planned: %s", exc)
+
+            if _lattice is not None:
+                try:
+                    _lr = await _execute_query(
+                        model_id=model_id,
+                        sql=_lattice.sql,
+                        tenant_slug=tenant_slug,
+                        jwt_token=jwt_token,
+                        protocol=_lattice.protocol,
+                        include_hidden=is_technical_view,
+                        persona_id=persona_id,
+                        force_route="source",
+                        grouping_sets=_lattice.grouping_sets,
+                    )
+                    subtotal_results = _split_lattice_results(
+                        _lattice, _lr.get("columns", []), _lr.get("rows", []),
+                    )
+                    _lattice_served = True
+                    logger.info(
+                        "[XMLA-SUBTOTAL-LATTICE] grains=%d served by 1 query "
+                        "(rows=%d)",
+                        len(subtotal_queries), len(_lr.get("rows", [])),
+                    )
+                except GatewayQueryRateLimitExceeded:
+                    # Bug-7745: a rate limit is a policy control and must
+                    # propagate fail-closed. Falling back would spend even more
+                    # of the caller's budget.
+                    raise
+                except QueryByteCeilingExceeded as exc:
+                    # The lattice returns every grain's rows in ONE response, so
+                    # it can cross the per-response byte ceiling on a pivot whose
+                    # individual grain queries each stay well under it. Falling
+                    # back keeps that pivot working exactly as it did before this
+                    # optimisation, rather than turning it into a new fault.
+                    logger.info(
+                        "[XMLA-SUBTOTAL-LATTICE] response over the byte "
+                        "ceiling; falling back to %d grain queries: %s",
+                        len(subtotal_queries), exc,
+                    )
+                    subtotal_results = []
+                except Exception as exc:
+                    # Includes the router's typed refusal for a dialect that is
+                    # not on the grouping-sets allow-list.
+                    logger.info(
+                        "[XMLA-SUBTOTAL-LATTICE] falling back to %d grain "
+                        "queries: %s", len(subtotal_queries), exc,
+                    )
+                    subtotal_results = []
+
+            if not _lattice_served:
+                grain_results = await _gather_bounded(
+                    [lambda sq=sq: _exec_grain(sq) for sq in subtotal_queries],
+                    _subtotal_grain_concurrency(),
+                )
+                if _failed_grain_labels:
+                    return _soap_fault(
+                        "A required subtotal query failed; no partial result was returned.",
+                        "Server",
+                    )
+                subtotal_results = [r for r in grain_results if r is not None]
 
             lne_overrides_multi = {}
             if lne_measures:
                 lne_overrides_multi = _compute_multi_lne_subtotals(
-                    rows, subtotal_hierarchies, lne_measures,
+                    rows, all_rollups, lne_measures,
                     subtotal_queries=subtotal_queries,
                 )
 
             all_hier_dims: set[str] = set()
-            for h in subtotal_hierarchies:
+            for h in all_rollups:
                 for lvl in h.levels:
                     all_hier_dims.add(lvl.dim_name)
             detail_dim_cols = (
                 [c for c in columns if c not in all_hier_dims]
                 + [
                     lvl.dim_name
-                    for h in subtotal_hierarchies
+                    for h in all_rollups
                     for lvl in h.levels
                     if lvl.dim_name in columns
                 ]
@@ -3517,7 +4487,7 @@ async def _handle_execute(
             detail_grain = _GrainQuery(
                 sql=sql, protocol=protocol,
                 grain_ordinal=sum(
-                    h.levels[-1].ordinal for h in subtotal_hierarchies
+                    h.levels[-1].ordinal for h in all_rollups
                 ),
                 level_name="detail", dim_cols=detail_dim_cols,
             )
@@ -3526,14 +4496,41 @@ async def _handle_execute(
             )
 
             columns, rows = _merge_multi_hierarchy_results(
-                detail_result, subtotal_results, subtotal_hierarchies,
+                detail_result, subtotal_results, all_rollups,
                 lne_overrides=lne_overrides_multi,
             )
+            if drilldown_plan is not None:
+                _before = len(rows)
+                rows = _apply_drilldown_member_plan(rows, drilldown_plan)
+                logger.info(
+                    "[XMLA-DRILLDOWN] inner=%s outer=%s members=%s complement=%s "
+                    "rows %d -> %d",
+                    drilldown_plan.inner.hierarchy_name, drilldown_plan.outer_dim,
+                    drilldown_plan.members, drilldown_plan.complement,
+                    _before, len(rows),
+                )
+            for _drill in _member_drills.values():
+                _rollup = next(
+                    (h for h in all_rollups
+                     if h.hierarchy_name.lower() == str(_drill.hier_def.get("name", "")).lower()),
+                    None,
+                )
+                if _rollup is None:
+                    continue
+                _before = len(rows)
+                rows = _apply_hierarchy_drilldown_members(rows, _rollup, _drill)
+                logger.info(
+                    "[XMLA-DRILLDOWN-HIER] hierarchy=%s depth=%d rows %d -> %d",
+                    _rollup.hierarchy_name, _drill.depth, _before, len(rows),
+                )
 
             logger.info(
-                "[XMLA-SUBTOTAL-MULTI] hierarchies=%d subtotal_queries=%d merged_rows=%d",
-                len(subtotal_hierarchies),
-                len(subtotal_results), len(rows),
+                "[XMLA-SUBTOTAL-MULTI] hierarchies=%d subtotal_queries=%d "
+                "source_queries=%d merged_rows=%d",
+                len(all_rollups),
+                len(subtotal_results),
+                1 if _lattice_served else len(subtotal_results),
+                len(rows),
             )
 
     axis_aliases = _extract_axis_hierarchy_dimension_aliases(
@@ -3542,6 +4539,20 @@ async def _handle_execute(
         hierarchy_level_dim_map=hierarchy_level_dim_map,
         hierarchy_default_dim_map=hierarchy_default_dim_map,
     )
+    # Bug-9856: a hierarchy served by the rollup path renders from its LEVEL
+    # columns (``_build_subtotal_row_members``); the flat alias only exists for
+    # the non-rollup ``[H].[H].[Level].Members`` shape. Left in place, the alias
+    # column survives as a stray flat dimension on the rollup response, the
+    # builder takes the Bug-3618 mirror shape and the cell ordinals no longer
+    # index the axis (0,4,8 for three tuples). Drop aliases the rollups own.
+    if all_rollups:
+        _rollup_owned = {
+            lvl.dim_name for h in all_rollups for lvl in h.levels
+        }
+        axis_aliases = {
+            alias: source for alias, source in axis_aliases.items()
+            if source not in _rollup_owned
+        }
     columns, rows, dimensions_meta = _alias_result_dimensions_for_hierarchy_axes(
         columns=columns,
         rows=rows,
@@ -4052,10 +5063,11 @@ async def _handle_execute(
             client_app_name=properties.get("SspropInitAppName", ""),
             subtotal_hierarchy=subtotal_info,
             requery_results=requery_results,
-            subtotal_hierarchies=subtotal_hierarchies if subtotal_hierarchies and len(subtotal_hierarchies) > 1 else None,
+            subtotal_hierarchies=all_rollups if all_rollups and len(all_rollups) > 1 else None,
             hierarchy_defs=hierarchy_defs,
             denom_requery_results=denom_requery_results,
             last_data_update=_last_data_update,
+            requested_rollups=requested_rollups,
         )
     except ValueError as exc:
         logger.warning("Execute response build failed: %s", exc)
@@ -4072,23 +5084,8 @@ async def _handle_execute(
     else:
         logger.debug("xmla execute response: columns=%r rows=%d", columns, len(rows))
 
-    # Bug-6946: surface failed subtotal/grand-total grain queries as a SOAP
-    # <Warning> so the client sees that some aggregation levels are missing,
-    # rather than rendering silently incomplete totals.
-    _all_warnings = [
-        "Subtotal grain query failed for level: " + lbl
-        for lbl in _failed_grain_labels
-    ]
-    _grain_messages_xml = ""
-    if _all_warnings:
-        _grain_msgs = "".join(
-            f'<Warning><Description>{_escape_xml(w)}</Description></Warning>'
-            for w in _all_warnings
-        )
-        _grain_messages_xml = f"<Messages>{_grain_msgs}</Messages>"
-
     return _soap_response(
-        f'<tns:ExecuteResponse>{xml_body}{_grain_messages_xml}</tns:ExecuteResponse>',
+        f'<tns:ExecuteResponse>{xml_body}</tns:ExecuteResponse>',
         session_id=session_id,
     )
 
@@ -4096,6 +5093,98 @@ async def _handle_execute(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Deep-review B4: the physical slug is remembered at the AUTHORITATIVE
+# resolution (whichever catalog spelling matched -- qualified, exact slug,
+# display name, legacy persona, UUID), so the follow-up slug lookup never has
+# to recover it from a second listing, and a client-facing identity can never
+# stand in for it. Bounded: model ids are few per tenant.
+_SLUG_BY_MODEL_ID: dict[str, str] = {}
+_SLUG_CACHE_MAX = 4096
+
+
+def _remember_model_slug(model_id: str, model: dict[str, Any]) -> None:
+    slug = model.get("slug")
+    if model_id and slug:
+        if len(_SLUG_BY_MODEL_ID) >= _SLUG_CACHE_MAX:
+            _SLUG_BY_MODEL_ID.clear()
+        _SLUG_BY_MODEL_ID[str(model_id)] = str(slug)
+
+
+async def _resolve_model_slug(
+    catalog: str,
+    model_id: str,
+    tenant_slug: str,
+    jwt_token: str,
+) -> str:
+    """The model's own slug — the table a source query selects FROM (Bug-9846).
+
+    A catalog name is a published IDENTITY: qualified
+    ``tenant__project__model`` since Bug-9825, optionally persona-suffixed. The
+    model slug is a different thing — the table name. Execute passed the catalog
+    straight through as ``model_slug``, so a client connecting with the qualified
+    name it was advertised produced ``FROM "acme-demo__project1__modely"`` and
+    every query failed with ``Unknown table ... Use the model name 'modely'
+    instead``.
+
+    Excel reaches this the moment it is restarted: a live session reuses the
+    saved connection string (bare slug, works), while a reopen re-picks from the
+    catalog browser, which can only offer the qualified name. That is why a
+    workbook works all session and fails immediately after a restart, and why
+    the Excel harness never saw it — it builds its connection with the bare
+    slug and never browses.
+
+    Resolved from the already-resolved model id against the burst-cached tenant
+    model list, so this is a cache hit on the lookup ``_resolve_model_id`` just
+    made.
+
+    Review F5 (2026-09-04): when the slug cannot be resolved, the catalog name
+    is an acceptable substitute ONLY for a bare legacy catalog, which
+    ``_resolve_model_id`` admits by exact slug match. A qualified
+    ``tenant__project__model`` catalog or a raw model UUID is never a table
+    name, so substituting it would send a client-facing identifier into SQL;
+    that raises ``ModelSlugUnresolvedError`` and Execute faults instead.
+    """
+    if not model_id:
+        return catalog or ""
+    remembered = _SLUG_BY_MODEL_ID.get(str(model_id))
+    if remembered:
+        return remembered
+    models: list[dict[str, Any]] | None = None
+    try:
+        models = await list_all_models_for_tenant(tenant_slug, jwt_token)
+    except Exception as exc:
+        logger.warning(
+            "Model slug lookup failed for catalog '%s': %s", catalog, exc,
+        )
+    for model in models or []:
+        if str(model.get("id", "")) == str(model_id):
+            slug = model.get("slug") or model.get("display_name")
+            if slug:
+                return str(slug)
+            break
+    if _catalog_is_physical_slug_candidate(catalog):
+        return catalog
+    raise ModelSlugUnresolvedError(catalog)
+
+
+class ModelSlugUnresolvedError(Exception):
+    """The physical model slug for a qualified catalog could not be resolved."""
+
+    def __init__(self, catalog: str):
+        super().__init__(f"model slug unresolved for catalog {catalog!r}")
+        self.catalog = catalog
+
+
+def _catalog_is_physical_slug_candidate(catalog: str) -> bool:
+    """True only for a bare legacy catalog, which IS a model slug (Bug-9825)."""
+    if not catalog or CATALOG_PART_SEPARATOR in catalog:
+        return False
+    return not re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        catalog.strip().lower(),
+    )
+
 
 async def _resolve_model_id(
     catalog: str,
@@ -4142,22 +5231,85 @@ async def _resolve_model_id(
         # filters undeployed). If it doesn't appear in the deployed list, refuse.
         for model in models:
             if str(model["id"]).lower() == catalog.lower():
+                _remember_model_slug(catalog, model)
                 return catalog, str(model.get("project_id", "")), None, _dvid(model)
         return None, "", None, None
 
     lc = catalog.lower()
 
-    # Prefer an exact slug/display-name match — this is the business
-    # base catalog for that model.
+    # Bug-9825: the qualified name first — tenant, project, model, and the
+    # persona for a persona view. That combination IS unique, so it names one
+    # model with no ambiguity to resolve. Matched by rebuilding each accessible
+    # model's name rather than by splitting the string, because a slug may
+    # itself contain the separator and splitting would guess wrong.
     for model in models:
-        slug = (model.get("slug") or "").lower()
-        name = (model.get("display_name") or "").lower()
-        if slug == lc or name == lc:
-            return str(model["id"]), str(model.get("project_id", "")), None, _dvid(model)
+        m_slug = model.get("slug") or model.get("display_name") or str(model["id"])
+        mid = str(model["id"])
+        pid = str(model.get("project_id", ""))
+        expected = build_catalog_name(
+            tenant_slug, model.get("project_slug") or "", m_slug,
+        )
+        if expected.lower() == lc:
+            _remember_model_slug(mid, model)
+            return mid, pid, None, _dvid(model)
+        # A persona view of this model. Only look up personas when the
+        # unqualified part matches, so this stays one extra call at most rather
+        # than a fan-out across the tenant.
+        if not lc.startswith(expected.lower() + CATALOG_PART_SEPARATOR):
+            continue
+        try:
+            personas = await get_model_personas(
+                mid, tenant_slug, jwt_token, project_id=pid,
+            )
+        except Exception as exc:
+            logger.warning("Persona lookup failed for model %s: %s", mid, exc)
+            personas = []
+        for persona in personas:
+            pslug = persona.get("slug") or ""
+            if pslug and build_catalog_name(
+                tenant_slug, model.get("project_slug") or "", m_slug, pslug,
+            ).lower() == lc:
+                _remember_model_slug(mid, model)
+                return mid, pid, persona, _dvid(model)
+        # The model half matched but the persona half did not. Serving the
+        # unrestricted base for a request that named a persona would fail open.
+        return None, "", None, None
 
-    # Try <model-slug>_<persona-slug>. Find the longest model slug that
-    # is a prefix of the catalog with an underscore delimiter, then
-    # match the suffix against one of that model's personas.
+    # Legacy unqualified name: an exact slug or display-name match. Bug-9825 —
+    # model slugs are unique only within a PROJECT, so this can match more than
+    # once across two accessible projects. It used to return the first match,
+    # which handed the caller real data from a model it had not asked for with
+    # nothing in the response saying so. Collect every match and refuse rather
+    # than choose.
+    slug_matches = [
+        m for m in models
+        if (m.get("slug") or "").lower() == lc
+        or (m.get("display_name") or "").lower() == lc
+    ]
+    if len(slug_matches) > 1:
+        raise AmbiguousCatalogError(
+            catalog,
+            [
+                f"{m.get('project_slug') or m.get('project_id')}/"
+                f"{m.get('slug') or m.get('id')}"
+                for m in slug_matches
+            ],
+        )
+    if len(slug_matches) == 1:
+        model = slug_matches[0]
+        _remember_model_slug(str(model["id"]), model)
+        return str(model["id"]), str(model.get("project_id", "")), None, _dvid(model)
+
+    # Legacy <model-slug>_<persona-slug>. Find the longest model slug that is a
+    # prefix of the catalog with an underscore delimiter, then match the suffix
+    # against one of that model's personas.
+    #
+    # Bug-9825: the same collision reaches here through the persona suffix, and
+    # the longest-slug ordering hid it — two projects with the same model slug
+    # produce two candidates of EQUAL length, so the winner was list order.
+    # Ambiguity is resolved per (model slug, persona slug) pair, after the
+    # persona lookup, because two models sharing a slug may carry different
+    # personas and only a pair that resolves on both is a real collision.
     candidates = [
         m for m in models
         if (m.get("slug") or "").lower()
@@ -4167,8 +5319,15 @@ async def _resolve_model_id(
         key=lambda m: len((m.get("slug") or "")),
         reverse=True,
     )
+    persona_matches: list[tuple[str, str, dict, Optional[str], dict]] = []
+    longest_slug_len = None
     for model in candidates:
         m_slug = (model.get("slug") or "").lower()
+        # Only compare candidates at the same (longest) slug length against each
+        # other. A shorter slug matching is a genuinely different reading of the
+        # name, and the longest one has always won that contest.
+        if longest_slug_len is not None and len(m_slug) < longest_slug_len:
+            break
         persona_suffix = lc[len(m_slug) + 1:]
         mid = str(model["id"])
         pid = str(model.get("project_id", ""))
@@ -4181,7 +5340,23 @@ async def _resolve_model_id(
             personas = []
         for persona in personas:
             if (persona.get("slug") or "").lower() == persona_suffix:
-                return mid, pid, persona, _dvid(model)
+                longest_slug_len = len(m_slug)
+                persona_matches.append((mid, pid, persona, _dvid(model), model))
+                break
+
+    if len(persona_matches) > 1:
+        raise AmbiguousCatalogError(
+            catalog,
+            [
+                f"{m.get('project_slug') or m.get('project_id')}/"
+                f"{m.get('slug') or m.get('id')}"
+                for *_rest, m in persona_matches
+            ],
+        )
+    if len(persona_matches) == 1:
+        mid, pid, persona, dvid, _model = persona_matches[0]
+        _remember_model_slug(mid, _model)
+        return mid, pid, persona, dvid
 
     return None, "", None, None
 
@@ -4786,28 +5961,31 @@ async def _maybe_resolve_kpi_members(
 
     # Bug-6702 (Codex R2 finding 2): the Discover path trims is_hidden measures
     # BEFORE `_rows_kpis` builds the catalogue (xmla_server `_handle_discover`),
-    # so a KPI whose value resolves to a hidden measure advertises KPI_VALUE=""
-    # for a non-technical catalog. This Execute path received the RAW cached
-    # measure list, so the same KPI's KPIValue()/KPIStatus() still resolved and
-    # ran the hidden backing measure — catalogue and Execute disagreed. Apply the
-    # SAME visibility rule here (a technical-view catalog keeps hidden measures
-    # on both surfaces) so the two surfaces resolve KPIs against the same set:
-    # a hidden-backed KPI now fails loud in Execute exactly where the catalogue
-    # advertises no value member.
+    # so a hidden-backed KPI is withheld from a non-technical catalog. This
+    # Execute path received the RAW cached measure list, so the same KPI's
+    # KPIValue()/KPIStatus() still resolved and ran the hidden backing measure —
+    # catalogue and Execute disagreed. Apply the SAME visibility rule here (a
+    # technical-view catalog keeps hidden measures on both surfaces) so a
+    # hidden-backed KPI fails loud in Execute exactly where the catalogue
+    # withholds it.
     if not is_technical_view:
         measures_meta = [m for m in measures_meta if not m.get("is_hidden")]
 
     kpis = await get_model_kpis(
         model_id, tenant_slug, jwt_token, project_id=project_id,
     )
-    # Bug-7227: filter KPIs BY LINEAGE for a measure-restricted persona (was
-    # Bug-5587, which blanked ALL KPIs so a KPIValue()/KPIStatus() cell for an
-    # ALLOWED KPI faulted). Keep exactly the KPIs whose transitive measure
-    # lineage is inside the allow-list — the SAME set the Discover MDSCHEMA_KPIS
-    # surface advertises — so the catalogue and Execute agree. Fail closed on
-    # unverifiable lineage. `measures_meta` here is the persona-scoped executable
-    # measure set, so a KPI over a non-allowed measure fails lineage resolution
-    # and is withheld.
+    # Bug-7227: filter KPI member functions BY LINEAGE for a
+    # measure-restricted persona (was Bug-5587, which blanked ALL KPIs so a
+    # KPIValue()/KPIStatus() cell for an ALLOWED KPI faulted). The governed
+    # member-function surface intentionally keeps composite KPIs because its
+    # evaluator can execute their expressions. Native MDSCHEMA_KPIS and native
+    # goal/status support members use the stricter
+    # `filter_kpis_for_native_xmla` path above, where KPI_VALUE must be one
+    # addressable measure member. Both paths use the same deployed KPI fetch,
+    # visibility, and persona lineage boundary; only their value capabilities
+    # differ. Fail closed on unverifiable lineage. `measures_meta` here is the
+    # persona-scoped executable measure set, so a KPI over a non-allowed measure
+    # fails lineage resolution and is withheld.
     if persona_included_measure_ids:
         kpis = filter_kpis_for_persona(
             kpis, measures_meta, persona_included_measure_ids,
@@ -4865,12 +6043,12 @@ async def _maybe_resolve_kpi_members(
     # Bug-6702 visibility gate (preserved): `measures_meta` is already trimmed of
     # is_hidden measures on a non-technical view (above). A KPI whose transitive
     # measure lineage references a measure NOT in this trimmed set is hidden-backed
-    # on THIS surface — the Discover catalogue advertises no value member for it, so
-    # the Execute path must fail loud here too rather than resolving the hidden
-    # backing measure through the governed authority (which applies persona scope
-    # but not the gateway's technical-view visibility rule). This keeps the
-    # catalogue and Execute surfaces aligned exactly as before, while still letting
-    # a composite KPI whose lineage measures ARE all visible resolve (G-002-01).
+    # on THIS surface — the Discover catalogue withholds it, so the Execute path
+    # must fail loud here too rather than resolving the hidden backing measure
+    # through the governed authority (which applies persona scope but not the
+    # gateway's technical-view visibility rule). This keeps the catalogue and
+    # Execute surfaces aligned while still letting a composite KPI whose lineage
+    # measures ARE all visible resolve (G-002-01).
     _visible_measure_ids = {str(m.get("id")) for m in measures_meta if m.get("id")}
     _measure_name_to_id = kpi_persona_measure_name_to_id(measures_meta)
     _kpi_by_name: dict[str, dict[str, Any]] = {}
@@ -4891,9 +6069,9 @@ async def _maybe_resolve_kpi_members(
         # Fail closed on unverifiable lineage, and withhold when any lineage
         # measure is trimmed from this surface's executable set. An empty
         # verified lineage (no measure references at all) is also withheld:
-        # the catalogue advertises KPI_VALUE="" for such a KPI, so Execute
-        # must agree rather than proceeding to a governed call the catalogue
-        # does not promise (Opus R1 finding 1 -- alignment).
+        # the catalogue withholds such a KPI, so Execute must agree rather than
+        # proceeding to a governed call the catalogue does not promise (Opus R1
+        # finding 1 -- alignment).
         if not fully_resolved:
             return False
         return bool(lineage_ids) and all(
@@ -5026,6 +6204,13 @@ def _build_trust_info_measures() -> list[dict[str, Any]]:
     pivot, the executor returns a constant string for that measure.
     """
     folder = "Info"
+    # Bug-9847: all three return STRING cells (a timestamp, a connection type
+    # and a person), so they must advertise a string DATA_TYPE. Declaring the
+    # type here keeps the declaration next to the values these measures serve;
+    # `mdschema._measure_data_type` is the single consumer for both the
+    # MDSCHEMA_MEASURES and the DBSCHEMA_COLUMNS rowsets. `xmla_data_type` is
+    # the WIRE type of the cells, deliberately not the `data_type` a real
+    # measure carries (that is its source column's type).
     return [
         {
             "name": "_info_last_refreshed",
@@ -5033,6 +6218,7 @@ def _build_trust_info_measures() -> list[dict[str, Any]]:
             "description": "Most recent aggregate refresh timestamp for this model.",
             "display_folder": folder,
             "default_agg": "min",
+            "xmla_data_type": "string",
             "is_hidden": False,
         },
         {
@@ -5041,6 +6227,7 @@ def _build_trust_info_measures() -> list[dict[str, Any]]:
             "description": "Underlying connection type powering this model.",
             "display_folder": folder,
             "default_agg": "min",
+            "xmla_data_type": "string",
             "is_hidden": False,
         },
         {
@@ -5049,6 +6236,7 @@ def _build_trust_info_measures() -> list[dict[str, Any]]:
             "description": "Modeller responsible for this model.",
             "display_folder": folder,
             "default_agg": "min",
+            "xmla_data_type": "string",
             "is_hidden": False,
         },
     ]
@@ -5429,6 +6617,15 @@ def _dax_to_sql(
         sql += f" LIMIT {parsed.limit}"
 
     return sql, "jdbc"
+
+
+def _subtotal_grain_budget() -> int:
+    """Configured hard cap on rollup grain queries per Execute (review F4)."""
+    try:
+        val = int(system_snapshot_get("gateway.subtotal_grain_max_queries"))
+        return val if val > 0 else 64
+    except (TypeError, ValueError):
+        return 64
 
 
 def _subtotal_grain_concurrency() -> int:
@@ -6706,10 +7903,49 @@ def _lne_measures_for_mdx(
     return lne
 
 
+def _explicit_lne_time_dimension_names(
+    lne_measures: list[str],
+    measures_meta: list[dict[str, Any]],
+    dimensions_meta: list[dict[str, Any]],
+) -> set[str]:
+    """Bug-9769: resolve each LNE measure's OWN ``date_dimension_column_id``
+    to a dimension name, instead of always falling back to a model-wide
+    "finest time dimension" guess. A model with multiple date roles
+    (transaction date, posting date, settlement date, snapshot date --
+    exactly the shape of the investor-demo model, which carries
+    business_date/created_at/posting_ts/settlement_ts/transaction_ts/
+    updated_at) can bind the WRONG date column for a semi-additive measure
+    if the measure's own explicit binding is ignored: "last non-empty"
+    would then be evaluated against a date column that isn't actually the
+    measure's intended period column, which can silently pick the wrong
+    row as "latest". Every dimension name resolvable this way is returned
+    (normally at most one per measure); an unresolvable or absent binding
+    contributes nothing, leaving the caller to fall back to the model-wide
+    heuristic only when no measure has an explicit binding at all.
+    """
+    by_col_id: dict[str, str] = {
+        str(d.get("source_column_id")): str(d.get("name") or "")
+        for d in dimensions_meta
+        if d.get("source_column_id") and d.get("name")
+    }
+    resolved: set[str] = set()
+    for m in measures_meta:
+        if m.get("name") not in lne_measures:
+            continue
+        col_id = m.get("date_dimension_column_id")
+        if not col_id:
+            continue
+        dim_name = by_col_id.get(str(col_id))
+        if dim_name:
+            resolved.add(dim_name)
+    return resolved
+
+
 def _flat_lne_hidden_time_dim(
     *,
     mdx_dims: list[str],
     lne_measures: list[str],
+    measures_meta: list[dict[str, Any]],
     dimensions_meta: list[dict[str, Any]],
     subtotal_hierarchies: list | None,
 ) -> str | None:
@@ -6723,7 +7959,77 @@ def _flat_lne_hidden_time_dim(
     }
     if any(d in time_dim_names for d in mdx_dims):
         return None
+    explicit = _explicit_lne_time_dimension_names(lne_measures, measures_meta, dimensions_meta)
+    if len(explicit) == 1:
+        return next(iter(explicit))
+    # Zero explicit bindings: fall back to the model-wide heuristic (no
+    # measure declared one). More than one DISTINCT explicit binding among
+    # the requested LNE measures means they disagree on which date column
+    # to evaluate against -- silently picking either one would be wrong for
+    # the other measure, so this is intentionally left unresolved here; the
+    # caller's existing "no time dimension available" fail-loud guard
+    # refuses the query rather than guessing.
+    if len(explicit) > 1:
+        return None
     return _finest_time_dimension_name(dimensions_meta)
+
+
+def _supports_multi_hierarchy_lne(
+    hierarchy_rollups: list[Any],
+    attribute_rollups: list[Any],
+) -> bool:
+    """Whether the multi-rollup path has an unambiguous LNE contract.
+
+    Bug-9768: the repaired subtotal engine evaluates one temporal hierarchy
+    over time and adds every omitted non-temporal hierarchy peer. It cannot
+    choose a single ordering axis when more than one hierarchy carries time,
+    and a flat attribute has no temporal metadata at all. Keep those shapes
+    fail-closed at the XMLA boundary instead of allowing a plausible but wrong
+    subtotal or grand total through.
+
+    The check mirrors the exact metadata consumed by
+    ``compute_multi_lne_subtotals``: every level must resolve to a dimension,
+    exactly one hierarchy must have a real ``time_unit`` on every level, and
+    every other hierarchy must explicitly be non-temporal. ``"none"`` is not
+    treated as a time unit; it is an unsupported ambiguous value here because
+    the engine's ordering contract requires an actual temporal grain.
+    """
+    if attribute_rollups or len(hierarchy_rollups) < 2:
+        return False
+
+    def _time_unit(level: Any) -> str:
+        return str(getattr(level, "time_unit", None) or "").strip().lower()
+
+    def _has_dimension(level: Any) -> bool:
+        return bool(str(getattr(level, "dim_name", "") or "").strip())
+
+    def _is_temporal(level: Any) -> bool:
+        return bool(_time_unit(level)) and _time_unit(level) != "none"
+
+    if any(
+        not getattr(hierarchy, "levels", None)
+        or any(not _has_dimension(level) for level in hierarchy.levels)
+        for hierarchy in hierarchy_rollups
+    ):
+        return False
+
+    temporal = [
+        hierarchy for hierarchy in hierarchy_rollups
+        if any(_is_temporal(level) for level in hierarchy.levels)
+    ]
+    if len(temporal) != 1:
+        return False
+
+    temporal_hierarchy = temporal[0]
+    if not all(_is_temporal(level) for level in temporal_hierarchy.levels):
+        return False
+
+    non_temporal = [
+        hierarchy for hierarchy in hierarchy_rollups
+        if hierarchy is not temporal_hierarchy
+        and all(not _time_unit(level) for level in hierarchy.levels)
+    ]
+    return len(non_temporal) == len(hierarchy_rollups) - 1
 
 
 def _unsupported_flat_lne_companion_measures(
@@ -6842,8 +8148,38 @@ def _mdx_to_sql(
         hierarchy_default_dim_map,
     ) = _build_hierarchy_dimension_map(dimensions_meta, hierarchy_meta or [])
 
-    # Strip CELL PROPERTIES clause
+    from src.dax.cube_model import build_cube_dimensions, is_standalone_attribute
+    from src.dax.subtotal_engine import (
+        rewrite_drilldown_level_hierarchy_all,
+        rewrite_hierarchy_all_members_to_first_level,
+    )
+
+    _standalone_attribute_names = {
+        str(d.get("name") or "")
+        for d in build_cube_dimensions(dimensions_meta, hierarchy_meta or [])
+        if d.get("name") and is_standalone_attribute(d)
+    }
     cleaned = re.sub(r"\s+CELL\s+PROPERTIES\s+.*$", "", mdx, flags=re.IGNORECASE).strip()
+    _col_pre = _mdx_axis_expr(cleaned, 0)
+    _row_pre = _mdx_axis_expr(cleaned, 1)
+    _drill_rewritten = rewrite_drilldown_level_hierarchy_all(
+        cleaned,
+        hierarchy_meta or [],
+        hierarchy_level_dim_map,
+        _standalone_attribute_names,
+    )
+    if _drill_rewritten != cleaned:
+        cleaned = _drill_rewritten
+        _col_pre = _mdx_axis_expr(cleaned, 0)
+        _row_pre = _mdx_axis_expr(cleaned, 1)
+    cleaned = rewrite_hierarchy_all_members_to_first_level(
+        cleaned,
+        _col_pre,
+        _row_pre,
+        hierarchy_meta or [],
+        hierarchy_level_dim_map,
+        _standalone_attribute_names,
+    )
 
     # Extract subselect filter members (Excel slicer pattern), supports nesting:
     #   FROM (SELECT {members} ON 0 FROM (SELECT ... FROM [cube]))
@@ -7064,6 +8400,7 @@ def _mdx_to_sql(
     hidden_lne_time_dim = _flat_lne_hidden_time_dim(
         mdx_dims=mdx_dims,
         lne_measures=lne_measures,
+        measures_meta=measures_meta,
         dimensions_meta=dimensions_meta,
         subtotal_hierarchies=subtotal_hierarchies,
     )
@@ -7406,6 +8743,63 @@ _MDX_RESERVED_LOWER: frozenset[str] = frozenset(
         "PROPERTIES",
     )
 )
+
+
+_MDX_BARE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_MDX_BRACKET_TOKEN_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+def _mdx_named_set_reference_candidates(mdx: str) -> list[str]:
+    """Return a conservative superset of saved-set names present in *mdx*.
+
+    These are candidates, not a syntax verdict. Model-service compares them to
+    exact deployed set names before any persona bind probe, and the gateway's
+    existing reference/inlining rules remain authoritative. This removes the
+    open-ended MDX keyword allow-list that let ordinary Excel functions trigger
+    an all-set catalogue scan while keeping malformed or unfamiliar MDX safe.
+    """
+    statement = _strip_leading_mdx_comments(mdx or "")
+    if re.match(r"^(?:EVALUATE|DEFINE)\b", statement, re.IGNORECASE):
+        return []
+    candidates = [
+        *(match.group(1) for match in _MDX_BRACKET_TOKEN_RE.finditer(statement)),
+        *_MDX_BARE_IDENTIFIER_RE.findall(statement),
+    ]
+    by_name: dict[str, str] = {}
+    for candidate in candidates:
+        value = candidate.strip()
+        if value:
+            by_name.setdefault(value.casefold(), value)
+    return [by_name[key] for key in sorted(by_name)]
+
+
+def _mdx_references_named_set(mdx: str, name: str) -> bool:
+    """True when *mdx* references the named set *name*.
+
+    Bug-9877: the two reference forms are exactly the ones
+    ``_inline_named_sets_once`` substitutes, so "would have been inlined" and
+    "is refused because it does not bind for this persona" cover the same
+    surface. Without this, a set withheld from a persona was simply not
+    inlined and the axis rendered EMPTY — the deceptive-empty failure Bug-7254
+    already rejected on this path, and here it hid a governance decision.
+    """
+    if not mdx or not name:
+        return False
+    pattern_bracket = re.compile(
+        r'(?<![.&])(\[' + re.escape(name) + r'\])(?!\s*\.)', re.IGNORECASE,
+    )
+    for m in pattern_bracket.finditer(mdx):
+        prefix = mdx[:m.start()].rstrip()
+        if prefix.upper().endswith("FROM"):
+            continue  # the cube name, not a set reference
+        return True
+    if name.strip().lower() not in _MDX_RESERVED_LOWER:
+        pattern_bare = re.compile(
+            r'(?<![.\[\w])' + re.escape(name) + r'(?![.\]\w])', re.IGNORECASE,
+        )
+        if pattern_bare.search(mdx):
+            return True
+    return False
 
 
 def _inline_named_sets(
@@ -8169,7 +9563,7 @@ def _mdx_extract_dimensions(
     # Do not match prefixes of explicit-level references such as
     # [Dim].[Hierarchy].[Level].Members.
     for m in re.finditer(
-        r'\[([^\]]+)\]\.\[([^\]]+)\](?!\s*\.\s*(?:\[|&\[))(?:\.(?:Members|MEMBERS|AllMembers))?',
+        r'(?<!\.)\[([^\]]+)\]\.\[([^\]]+)\](?!\s*\.\s*(?:\[|&\[))(?:\.(?:Members|MEMBERS|AllMembers))?',
         expr,
     ):
         _add(m.group(1), m.group(2), None)
@@ -8303,8 +9697,6 @@ def _mdx_extract_where_filters(
         return resolved if resolved in dim_names else None
 
     def _add(target: str, member: str) -> None:
-        if member.lower() in {"all", "(all)"}:
-            return
         filters.setdefault(target, [])
         if member not in filters[target]:
             filters[target].append(member)
@@ -8349,7 +9741,7 @@ def _mdx_extract_where_filters(
         ancestor_dims = dims_ordered[level_idx - n_ancestors:level_idx]
         for a_dim, a_key in zip(ancestor_dims, keys[:-1]):
             if a_dim in dim_names and a_dim not in range_targets:
-                _add(a_dim, a_key.strip().strip("()"))
+                _add(a_dim, a_key)
 
     # Range expressions (Timeline slicers), single or path-qualified keys:
     # [Dim].[Hier].[Level].&[Start]:[Dim].[Hier].[Level].&[End]
@@ -8365,8 +9757,8 @@ def _mdx_extract_where_filters(
         end_keys = parse_member_keys(m.group(8))
         if not start_keys or not end_keys:
             continue
-        start_key = start_keys[-1].strip().strip("()")
-        end_key = end_keys[-1].strip().strip("()")
+        start_key = start_keys[-1]
+        end_key = end_keys[-1]
         target = _resolve_target(m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
         if target:
             filters.setdefault(target, [])
@@ -8395,7 +9787,7 @@ def _mdx_extract_where_filters(
         keys = parse_member_keys(m.group(4))
         if not keys:
             continue
-        member = keys[-1].strip().strip("()")
+        member = keys[-1]
         target = _resolve_target(m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
         if target and target not in range_seen:
             _add(target, member)
@@ -8413,7 +9805,7 @@ def _mdx_extract_where_filters(
         keys = parse_member_keys(m.group(3))
         if not keys:
             continue
-        member = keys[-1].strip().strip("()")
+        member = keys[-1]
         dim_part = m.group(1).strip()
         hier_part = m.group(2).strip()
         if len(keys) > 1:
@@ -8426,7 +9818,7 @@ def _mdx_extract_where_filters(
                     _add(target, member)
                     for a_dim, a_key in zip(dims_ordered[: len(keys) - 1], keys[:-1]):
                         if a_dim in dim_names and a_dim not in range_seen:
-                            _add(a_dim, a_key.strip().strip("()"))
+                            _add(a_dim, a_key)
                 continue
         target = _resolve_target(dim_part, hier_part, None)
         if target and target not in range_seen:
@@ -8438,7 +9830,10 @@ def _mdx_extract_where_filters(
         + _expansion_guard,
         where_expr,
     ):
-        member = m.group(3).strip().strip('()')
+        _hier, _level, grammar, key_path = parse_member_uname(m.group(0))
+        if grammar in {"invalid", "all", "measure"} or not key_path:
+            continue
+        member = key_path[-1]
         target = _resolve_target(m.group(1).strip(), m.group(2).strip(), None)
         if target:
             _add(target, member)
@@ -8470,9 +9865,25 @@ def _mdx_extract_axis_member_filters(
 
     Returns ``dim_name -> [member, ...]`` (same shape as the WHERE extractor),
     ready to merge into ``where_filters`` and feed ``_build_where_sql_clauses``.
+
+    Bug-9779b: a DRILL TARGET is masked out first. ``DrilldownMember(set,
+    targets, [hier])`` names, in its second argument, which members change drill
+    state -- NOT which rows the axis contains. Treating a target as a member
+    filter INVERTS a collapse: Excel's collapse of CREDIT produced
+    ``WHERE account_type = 'CREDIT'``, so the response hid the SIBLINGS and kept
+    the children, the exact opposite of what was asked. The axis audit already
+    treats these spans as non-filters; masking here is what makes the extractor
+    agree, so there is ONE definition of "not a filter" rather than two that
+    disagree.
+
+    Masked with spaces of identical length so every span this function's callers
+    computed against ``axis_expr`` stays valid.
     """
+    masked = axis_expr
+    for start, end in _drill_target_spans(axis_expr):
+        masked = masked[:start] + (" " * (end - start)) + masked[end:]
     return _mdx_extract_where_filters(
-        axis_expr,
+        masked,
         dim_names,
         hierarchy_level_dim_map=hierarchy_level_dim_map,
         hierarchy_default_dim_map=hierarchy_default_dim_map,
@@ -8486,9 +9897,72 @@ def _is_all_member_ref(text: str) -> bool:
     An All member imposes no restriction — the extractors deliberately produce
     no filter for it, so the audits must not flag it.
     """
+    # A real source key named ``All`` is emitted in the key grammar
+    # ``.[&All]`` (Bug-9789), which must remain a filterable data member.  The
+    # old suffix regex saw only the bracket token and widened that query as if
+    # it were the synthetic rollup member.  Use the shared parser whenever the
+    # complete hierarchy grammar is present; retain the two-part compatibility
+    # form for legacy inbound references that cannot be parsed there.
+    _hier, _level, grammar, _keys = parse_member_uname(text)
+    if grammar != "invalid":
+        return grammar == "all"
+    if re.search(r'\.\s*&\s*\[', text.strip()):
+        return False
     return bool(
         re.search(r'\[\s*\(?\s*all\s*\)?\s*\]\s*$', text.strip(), re.IGNORECASE)
     )
+
+
+def _drill_target_spans(expr: str) -> list[tuple[int, int]]:
+    """Spans of the DRILL-TARGET argument of each drill call in *expr*.
+
+    ``DrilldownMember(set, targets, [hier])`` and its Drillup/Toggle siblings
+    take, as their SECOND argument, the members to expand or collapse. Those
+    references say WHICH members change drill state -- they do not restrict
+    which rows the axis contains, so they can never be "applied as a filter".
+
+    Exempting them is safe in the direction that matters to the axis audit: a
+    drill target is drawn from the set in the FIRST argument, which is itself
+    audited in full, so a target can only narrow or deepen a set that was
+    already checked -- it can never widen the query beyond it.
+
+    Deliberately parsed with real bracket balancing rather than a regex. The
+    argument is a nested set expression (Excel sends ``{-{[d].[h].[l].&[k]}}``),
+    and a regex that stopped at the first comma or brace would exempt the wrong
+    span -- which, in a fail-closed audit, means exempting a member that SHOULD
+    have been filtered. Unbalanced or truncated input yields NO span, so a
+    statement this cannot parse stays fully audited.
+    """
+    spans: list[tuple[int, int]] = []
+    for m in re.finditer(
+        r'\b(?:DrilldownMember|DrillupMember|ToggleDrillState)\s*\(',
+        expr, re.IGNORECASE,
+    ):
+        i = m.end()
+        depth = 1
+        arg_index = 0
+        arg_start = i
+        while i < len(expr) and depth > 0:
+            ch = expr[i]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch == "," and depth == 1:
+                if arg_index == 1:
+                    spans.append((arg_start, i))
+                    break
+                arg_index += 1
+                arg_start = i + 1
+            i += 1
+        else:
+            continue
+        # Second argument closed by the call's own ")" rather than a comma.
+        if depth == 0 and arg_index == 1 and (not spans or spans[-1][0] != arg_start):
+            spans.append((arg_start, i))
+    return spans
 
 
 def _iter_member_references(
@@ -8568,12 +10042,45 @@ def _iter_member_references(
         yield (m.span(), m.group(1), m.group(2), None,
                f"[{m.group(1)}].[{m.group(2)}].[{m.group(3)}]")
     # Single-bracket attribute form: [Dim].&[k] / [Dim].[Member]
-    for m in re.finditer(r'(?<![\].])\[([^\]]+)\]\.(?:&?\[[^\]]*\])', expr):
+    for m in re.finditer(r'(?<![\].])\[([^\]]+)\]\.(?:&?(\[[^\]]*\]))', expr):
         if _overlaps(m.span()):
             continue
         if _expansion_follows(m.end()):
             continue
         if _is_all_member_ref(m.group(0)):
+            continue
+        # Bug-9779: `[X].[X]` is the SELF-QUALIFIED HIERARCHY form, not a member.
+        # `_normalize_wire_mdx` rewrites the wire name `[Dimensions].[X]` into
+        # exactly this shape before anything here runs, so in a normalised
+        # statement a repeated name denotes a hierarchy by construction -- a real
+        # member is `[X].[X].[value]` or `[X].&[key]`, both of which are matched
+        # by the earlier patterns and are unaffected by this.
+        #
+        # It reaches this pattern as the HIERARCHY ARGUMENT of a set function:
+        # Excel's collapse sends `DrilldownMember(CrossJoin(...), {...},
+        # [channel_name].[channel_name])`, whose third argument names the
+        # hierarchy to drill. That argument restricts nothing, so it can never
+        # be "applied as a filter", and the audit refused a query that was never
+        # unsafe -- the user saw an error on every collapse.
+        #
+        # Gated to the AXIS path only. `_iter_member_references` is shared with
+        # the WHERE audit, and Bug-1060 exists because an axis exemption leaked
+        # into that path; a bare hierarchy in WHERE denotes its default member,
+        # which is a separate question with separate evidence, so it keeps the
+        # strict behaviour until something demonstrates otherwise.
+        # The repeated name is NOT sufficient on its own: `[X].[X].CurrentMember`
+        # is the same hierarchy form followed by a member NAVIGATION, and that
+        # whole expression does denote a member -- exempting it would let an
+        # untranslated `.CurrentMember` through unfiltered (caught by
+        # test_translated_filter_does_not_exempt_other_currentmember_same_dim_bug8925).
+        # A bare hierarchy ARGUMENT is never followed by a dot; it is closed by
+        # `)`, `,`, `}` or the end of the expression. So require both.
+        if (
+            exclude_level_expansions
+            and m.group(2) is not None
+            and m.group(1).strip().lower() == m.group(2)[1:-1].strip().lower()
+            and not re.match(r'\s*\.', expr[m.end():])
+        ):
             continue
         yield m.span(), m.group(1), None, None, f"[{m.group(1)}]"
 
@@ -8718,6 +10225,12 @@ def _assert_axis_member_references_applied(
                 "run the query rather than exempt an unverified member reference."
             )
         exempt_spans.append((start, end))
+
+    # Bug-9779: drill-target arguments are exempt for the reason given in
+    # _drill_target_spans -- they change drill state, they do not filter rows.
+    # Added to the SAME exempt-span list the translated label filters use, so
+    # there is exactly one exemption mechanism to reason about.
+    exempt_spans.extend(_drill_target_spans(axis_text))
 
     def _within_translated_context(span: tuple[int, int]) -> bool:
         start, end = span
@@ -8877,6 +10390,28 @@ _TMSCHEMA_DMV_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bug-9766: Excel issues ``REFRESH CUBE [<cube>]`` as a DDL statement — not a
+# SELECT — whenever it refreshes an OLAP PivotTable connection. It is not
+# part of the MDX SELECT grammar, so the structured parser (the admission
+# authority ahead of MDX->SQL translation) reports ``has_error`` for it and
+# the Execute is refused as a SOAP fault. Since this gateway holds no
+# persistent server-side cube cache to invalidate (every query is answered
+# live against the source), REFRESH CUBE has nothing to do here beyond
+# acknowledging success — matching the empty-handshake/Cancel precedent
+# above. Left unhandled, EVERY Excel-initiated Refresh silently faults at
+# this step: the visible grid keeps its last-good data (a plain refresh
+# looks like it "worked"), but Excel's own member/schema caches are never
+# actually refreshed, and a metadata-refreshing action fails outright with
+# a generic "query did not run" error.
+_REFRESH_CUBE_RE = re.compile(r"^\s*REFRESH\s+CUBE\b", re.IGNORECASE)
+
+
+def _is_refresh_cube_statement(statement: str | None) -> bool:
+    """True when the Execute statement is a ``REFRESH CUBE [...]`` DDL command."""
+    if not statement:
+        return False
+    return bool(_REFRESH_CUBE_RE.match(_strip_leading_mdx_comments(statement)))
+
 
 def _is_tmschema_dmv(statement: str | None) -> bool:
     """True when the Execute statement is a ``$SYSTEM.TMSCHEMA_*`` DMV query."""
@@ -9003,19 +10538,55 @@ def _parse_restrictions(method_el: ET.Element) -> dict[str, list[str]]:
     return result
 
 
-def _soap_fault(message: str, fault_code: str = "Server", status_code: int = 200) -> Response:
+# The XMLA fault detail SSAS emits. MSOLAP (and therefore Excel's error
+# dialog) reads the message from ``Error/@Description`` in this namespace; a
+# bare SOAP ``faultstring`` is ignored and Excel shows its generic "The query
+# did not run" instead (owner's KPI review, 2026-09-04). One generic code is
+# used because the client only displays the description.
+# SSAS fault codes. The faultcode is ``XMLAnalysisError.<hex>`` unqualified,
+# as SSAS emits it; with a plain SOAP ``Client``/``Server`` code MSOLAP treated
+# the fault as a transport failure ("we could not get data from the external
+# source") even with the detail present. Client faults use the general query
+# error (0xc10e0002), server faults the internal error (0xc1010000).
+_XMLA_FAULT_CODES = {
+    "Client": ("XMLAnalysisError.0xc10e0002", "3238985730"),
+    "Server": ("XMLAnalysisError.0xc1010000", "3238658048"),
+}
+XMLA_CLIENT_FAULT_CODE = _XMLA_FAULT_CODES["Client"][0]
+XMLA_SERVER_FAULT_CODE = _XMLA_FAULT_CODES["Server"][0]
+
+
+def _soap_fault(
+    message: str,
+    fault_code: str = "Server",
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    text = _escape_xml(message)
+    code, error_code = _XMLA_FAULT_CODES.get(fault_code, _XMLA_FAULT_CODES["Server"])
+    # The Fault subtree carries the SOAP namespace as its default namespace,
+    # exactly as the SSAS capture does; the Error element inherits it.
     envelope = (
         "<?xml version='1.0' encoding='UTF-8'?>"
         '<soap11env:Envelope xmlns:soap11env="http://schemas.xmlsoap.org/soap/envelope/">'
         "<soap11env:Body>"
-        "<soap11env:Fault>"
-        f"<faultcode>soap11env:{fault_code}</faultcode>"
-        f"<faultstring>{_escape_xml(message)}</faultstring>"
+        '<soap11env:Fault xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+        f"<faultcode>{code}</faultcode>"
+        f"<faultstring>{text}</faultstring>"
+        "<detail>"
+        f'<Error ErrorCode="{error_code}" Description="{text}" '
+        'Source="Tessallite XMLA Gateway" HelpFile=""/>'
+        "</detail>"
         "</soap11env:Fault>"
         "</soap11env:Body>"
         "</soap11env:Envelope>"
     )
-    return Response(content=envelope, media_type=_CONTENT_TYPE, status_code=status_code)
+    return Response(
+        content=envelope,
+        media_type=_CONTENT_TYPE,
+        status_code=status_code,
+        headers=headers,
+    )
 
 
 def _escape_xml(text: str) -> str:

@@ -38,12 +38,14 @@ import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import BoltIcon from "@mui/icons-material/Bolt";
 import ViewCompactIcon from "@mui/icons-material/ViewCompact";
 import { modelTablesApi, tableAttributesApi } from "../../api/client";
+import { canPerform } from "../../auth/explorerPrivileges";
 import { useSources } from "../../api/hooks";
 import type { ModelTable, TableAttribute } from "../../api/types";
 import { useBuilderStore } from "../../store/builderStore";
 import { font, nodeHeader, nodeHeaderFallback } from "../../theme/tokens";
 import TableEditDialog from "../Panels/TableEditDialog";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
+import { MIN_TABLE_HEIGHT, MIN_TABLE_WIDTH } from "./layout/tablePresentation";
 
 /**
  * Name sets (lower-cased) that drive fact-table column segmentation (A1).
@@ -51,6 +53,14 @@ import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
  * here; dim tables do not receive segmentation (they get the hierarchy
  * grouping overlay in A3 instead).
  */
+/**
+ * One colour for "locked", used by a position-locked card and by a locked
+ * relationship alike, so the canvas says the same thing the same way. Chosen to
+ * sit apart from the selection gold and from every table-type header colour.
+ */
+const LOCKED_ACCENT = "#C2185B";
+const LOCKED_ACCENT_SOFT = "rgba(194,24,91,0.28)";
+
 export interface SegmentationRefs {
   measureCols: Set<string>;
   dimCols: Set<string>;
@@ -99,6 +109,25 @@ export interface ERDNodeData {
    * real control; this stops the UI contradicting itself.
    */
   readOnly?: boolean;
+  /**
+   * A locked relationship docks to this card, so its position and size are
+   * frozen (R06). Resizing is withdrawn here; the move refusal lives in the
+   * canvas' change handler, where it can also explain itself.
+   */
+  lockedByRoute?: boolean;
+  /**
+   * This card is an endpoint of the currently selected relationship (R09).
+   * Selecting a join has to light up the whole relationship — the connector and
+   * both tables it connects — or the user has to trace the line by eye to see
+   * what it actually joins.
+   */
+  joinHighlighted?: boolean;
+  /**
+   * Held in place against automatic arrangement (R06). Shown on the card so a
+   * user can see why Arrange left this table where it was, without opening the
+   * layout panel.
+   */
+  pinned?: boolean;
 }
 
 type SegmentKey = "measures" | "dimensions" | "keys" | "levels" | "unused";
@@ -536,6 +565,9 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
     overlay,
     dimmed,
     readOnly,
+    lockedByRoute,
+    joinHighlighted,
+    pinned,
   } = data;
   const updateNodeInternals = useUpdateNodeInternals();
   const isResized = useStore(
@@ -588,10 +620,13 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
 
   const PAGE_SIZE = 50;
 
+  // Bug-9896: raw source-table preview is modeller-and-above.
+  const canPreviewData = canPerform("table.previewData");
+
   const previewQuery = useQuery({
     queryKey: ["tablePreview", projectId, modelId, table.id, dataPage],
     queryFn: () => modelTablesApi.preview(projectId, modelId, table.id, dataPage, PAGE_SIZE),
-    enabled: dataOpen,
+    enabled: dataOpen && canPreviewData,
     staleTime: 30 * 1000,
   });
 
@@ -623,9 +658,9 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
   return (
     <>
       <NodeResizer
-        minWidth={200}
-        minHeight={150}
-        isVisible={!readOnly}
+        minWidth={MIN_TABLE_WIDTH}
+        minHeight={MIN_TABLE_HEIGHT}
+        isVisible={!readOnly && !lockedByRoute}
         lineStyle={{ borderColor: "transparent" }}
         handleStyle={{
           width: 12,
@@ -635,7 +670,7 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
           border: "none",
         }}
         onResizeEnd={(_e, params) => {
-          if (readOnly) return;
+          if (readOnly || lockedByRoute) return;
           window.dispatchEvent(
             new CustomEvent("node-resize-end", {
               detail: { id, w: params.width, h: params.height },
@@ -650,21 +685,56 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
           display: "flex",
           flexDirection: "column",
           background: "#ffffff",
-          border: `1px solid ${h.border}`,
+          // Locked reads as locked at a glance, in the same colour a locked
+          // relationship uses, so one colour means one idea across the canvas.
+          border: pinned
+            ? `1px solid ${LOCKED_ACCENT}`
+            : joinHighlighted
+              ? "1px solid #D4AF37"
+              : `1px solid ${h.border}`,
           borderRadius: 2,
           fontSize: 10,
           fontFamily: font.sans,
-          boxShadow: "0 1px 2px rgba(0,0,0,0.06)",
+          boxShadow: joinHighlighted
+            ? "0 0 0 2px rgba(212,175,55,0.35), 0 1px 2px rgba(0,0,0,0.06)"
+            : pinned
+              ? `0 0 0 2px ${LOCKED_ACCENT_SOFT}, 0 1px 2px rgba(0,0,0,0.06)`
+              : "0 1px 2px rgba(0,0,0,0.06)",
           overflow: "hidden",
           position: "relative",
           ...(dimmed
             ? { opacity: 0.35, filter: "grayscale(100%)" }
             : {}),
         }}
-        aria-label={dimmed ? t("erdNode.excludedByPersona", { label: label ?? "" }) : (label ?? "")}
+        aria-label={
+          dimmed
+            ? t("erdNode.excludedByPersona", { label: label ?? "" })
+            : joinHighlighted
+              ? t("erdNode.joinEndpoint", { label: label ?? "" })
+              : pinned
+                ? t("erdNode.pinnedTable", { label: label ?? "" })
+                : (label ?? "")
+        }
+        data-join-highlighted={joinHighlighted ? "true" : undefined}
+        data-pinned={pinned ? "true" : undefined}
         data-testid={`node-${table.physical_name ?? id}`}
       >
         <PerimeterHandles connecting={isConnectingMode} />
+
+        {/* Position-locked indicator: the same padlock a locked relationship
+            draws, in the same colour, top-right and clear of the resize
+            handles. One glyph and one colour for one idea. */}
+        {pinned && (
+          <svg
+            width={12} height={12} viewBox="0 0 12 12" aria-hidden="true"
+            style={{ position: "absolute", top: 3, right: 3, pointerEvents: "none" }}
+          >
+            <rect x={2.5} y={5.5} width={7} height={5.2} rx={1} fill="#ffffff"
+                  stroke={LOCKED_ACCENT} strokeWidth={1.2} />
+            <path d="M4.2 5.5 L4.2 3.9 A 1.8 1.8 0 0 1 7.8 3.9 L7.8 5.5"
+                  fill="none" stroke={LOCKED_ACCENT} strokeWidth={1.2} />
+          </svg>
+        )}
 
         <div
           style={{
@@ -719,11 +789,15 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
               tFn={t}
             />
           )}
-          <Tooltip title={t("erdNode.viewData")}>
-            <IconButton size="small" aria-label={t("erdNode.viewTableData")} onClick={openDataDialog} sx={{ p: 0.25 }}>
-              <TableRowsIcon fontSize="inherit" />
-            </IconButton>
-          </Tooltip>
+          {/* Bug-9896: the raw source preview is a modelling surface
+              (modeller+); a viewer must not be offered a dead button. */}
+          {canPreviewData && (
+            <Tooltip title={t("erdNode.viewData")}>
+              <IconButton size="small" aria-label={t("erdNode.viewTableData")} onClick={openDataDialog} sx={{ p: 0.25 }}>
+                <TableRowsIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+          )}
           {!readOnly && (
             <Tooltip title={t("erdNode.classify")}>
               <IconButton

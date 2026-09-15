@@ -17,6 +17,8 @@
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/deploy-local-docker-ps.png" alt="Terminal — `docker compose ps` showing all services healthy."></figure>
 <h2>What this covers</h2>
 <p>Detailed operations reference for a local Docker Compose deployment. For Community Edition, start from the signed release bundle and <code>install.sh</code>; this page explains what to do after the bundle is installed, how to manage the Compose stack, and how <code>.env</code> is used. A source checkout is a developer workflow, not the normal install path.</p>
+<h2>Development stack and licences</h2>
+<p>The source-checkout development stack (<code>tessallite/infra/docker-compose.yml</code>) defaults <code>TESSALLITE_DEV_UNLIMITED</code> to <code>true</code>, so creating models does not require a licence. This setting is passed into model-service. Community and other licensed deployments retain licence enforcement. New model errors show the server explanation, including missing activation, a model limit, or a duplicate name; a generic message is used when no explanation is available.</p>
 <h2>Requirements</h2>
 <ul><li>Docker Desktop 24 or later with Compose v2.</li><li>Minimum 2 CPUs and 4 GB RAM for a development deployment. 4 CPUs and 8 GB RAM recommended for sustained use.</li><li>Ports 3000, 8001, 8080, and 5433 free on the host. If you use the developer Excel add-in path, port 3443 must also be free for HTTPS.</li><li>A signed Community licence at <code>./license.json</code> when licence enforcement is enabled.</li></ul>
 <h2>Starting and stopping</h2>

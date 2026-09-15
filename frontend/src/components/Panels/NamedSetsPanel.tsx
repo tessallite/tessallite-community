@@ -77,6 +77,7 @@ import EntityImpactSummary from "./EntityImpactSummary";
 import TemplateGalleryDialog from "./TemplateGalleryDialog";
 import NamedQueryEditor, { namedQueryToPayload } from "./NamedQueryEditor";
 import type { NamedSetTemplate } from "./templates";
+import { LIST_TYPE_LABELS, CERT_COLORS } from "./namedSetPresentation";
 
 type DialogMode = "create" | "edit";
 type DialogTab = "basics" | "rule" | "scope" | "preview" | "history";
@@ -166,14 +167,6 @@ const MDX_LIST_TYPE_OPTIONS: ListType[] = [
   "advanced_mdx",
 ];
 
-const LIST_TYPE_LABELS: Record<string, string> = {
-  fixed: "namedSets.labelFixed",
-  dynamic_top_n: "namedSets.labelDynamic",
-  filtered: "namedSets.labelFiltered",
-  advanced_mdx: "namedSets.labelMdx",
-  sql_fixed: "namedSets.labelSqlFixed",
-};
-
 /** Returns the kind for a given list_type. */
 function listTypeToKind(listType: string | null): ListKind {
   return listType === "sql_fixed" ? "tessallite" : "mdx";
@@ -186,12 +179,6 @@ function pathBadgeKey(listType: string | null): string {
     : "namedSets.pathBadgeXmla";
 }
 
-const CERT_COLORS: Record<string, "success" | "warning" | "default" | "info"> = {
-  certified: "success",
-  shared: "info",
-  draft: "default",
-  deprecated: "warning",
-};
 
 const FILTER_OPERATORS = [
   { value: ">", label: ">" },
@@ -359,6 +346,7 @@ export default function NamedSetsPanel() {
   const needsSaveOrDeploy = useModelNeedsSaveOrDeploy();
   const [refreshLoading, setRefreshLoading] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshRequiresDeploy, setRefreshRequiresDeploy] = useState(false);
   // Bug-7942: track the initial edit form state to detect dirty (unsaved) changes.
   const editFormSnapshotRef = useRef<string>("");
 
@@ -737,6 +725,7 @@ export default function NamedSetsPanel() {
     setCopyFeedback(false);
     setRefreshLoading(false);
     setRefreshError(null);
+    setRefreshRequiresDeploy(false);
   }
 
   function handleSave() {
@@ -834,8 +823,10 @@ export default function NamedSetsPanel() {
     if (!editId) return;
     setRefreshLoading(true);
     setRefreshError(null);
+    setRefreshRequiresDeploy(false);
     try {
       const updated = await namedSetsApi.refresh(projectId, modelId, editId);
+      setRefreshRequiresDeploy(updated.deploy_required);
       const bd = updated.builder_definition;
       setForm((prev) => ({
         ...prev,
@@ -1677,6 +1668,7 @@ export default function NamedSetsPanel() {
                     }));
                     setTessMemberError(null);
                     setRefreshError(null);
+                    setRefreshRequiresDeploy(false);
                   }}
                   data-testid="tess-definition-type"
                 >
@@ -1994,6 +1986,17 @@ export default function NamedSetsPanel() {
                 {/* --- Refresh button + status (dynamic types only, edit mode) --- */}
                 {isDynamicTess && (
                   <Box mt={2}>
+                    {dialogMode === "edit" && (
+                      <Alert
+                        severity={refreshRequiresDeploy ? "success" : "info"}
+                        sx={{ mb: 1 }}
+                        data-testid="tess-refresh-deploy-notice"
+                      >
+                        {t(refreshRequiresDeploy
+                          ? "namedSets.refreshDeployRequired"
+                          : "namedSets.refreshDraftHint")}
+                      </Alert>
+                    )}
                     {dialogMode === "edit" && editId && (
                       <Box display="flex" alignItems="center" gap={2}>
                         <Tooltip

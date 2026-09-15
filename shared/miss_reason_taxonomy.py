@@ -134,6 +134,7 @@ _REASON_CLASS: dict[str, str] = {
     "version_mismatch": REPAIR,
     # --- INELIGIBLE: an aggregate cannot serve this query as written ---
     "passthrough": INELIGIBLE,
+    "query_only_measure": INELIGIBLE,
     "multi_table": INELIGIBLE,
     "unresolvable_where": INELIGIBLE,
     "unresolvable_order": INELIGIBLE,

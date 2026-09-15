@@ -48,3 +48,21 @@ def test_health_returns_200_when_metadata_db_is_up(monkeypatch) -> None:
         resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+def test_readiness_returns_503_when_metadata_db_is_down(monkeypatch) -> None:
+    with _client(monkeypatch, db_ok=False) as client:
+        resp = client.get("/readiness")
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "status": "degraded",
+        "service": "query-router",
+        "detail": "metadata database unreachable",
+    }
+
+
+def test_readiness_returns_200_when_metadata_db_is_up(monkeypatch) -> None:
+    with _client(monkeypatch, db_ok=True) as client:
+        resp = client.get("/readiness")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "service": "query-router"}

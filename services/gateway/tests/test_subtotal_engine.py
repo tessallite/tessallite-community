@@ -1,5 +1,7 @@
 """Tests for the subtotal engine — detection, query generation, and result merging."""
 
+from decimal import Decimal
+
 import pytest
 from src.dax.subtotal_engine import (
     SubtotalHierarchy,
@@ -10,6 +12,7 @@ from src.dax.subtotal_engine import (
     SUBTOTAL_GRAIN_KEY,
     SUBTOTAL_GRAIN_PREFIX,
     detect_subtotal_hierarchies,
+    detect_flat_attribute_rollups,
     build_subtotal_queries,
     build_multi_subtotal_queries,
     compute_last_non_empty_subtotals,
@@ -132,6 +135,67 @@ class TestDetectSubtotalHierarchies:
         assert len(result) == 1
         assert result[0].hierarchy_name == "Calendar"
 
+    def test_explicit_all_qualifier_still_subtotal(self):
+        """Bug-9766: real Excel PivotTable subtotal requests use the
+        EXPLICIT form [Dim].[Hier].[(All)].Members, not the bare two-part
+        [Dim].[Hier].Members form the earlier tests use. Before the fix,
+        the level-scoped exclusion (Bug-6892, see
+        test_two_part_level_scoped_members_not_subtotal below) treated the
+        literal `(All)` bracket exactly like a real level name (e.g.
+        [Year]) and excluded it too — so no real Excel subtotal request
+        ever triggered detection, subtotal_hierarchies came back empty,
+        and every subtotal/grand-total row rendered with a blank value."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = "{[Business Date].[Calendar].[(All)].Members}"
+        result = detect_subtotal_hierarchies(
+            col_expr, row_expr,
+            _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        assert len(result) == 1
+        assert result[0].hierarchy_name == "Calendar"
+
+    def test_explicit_all_qualifier_crossjoin_multi_hierarchy(self):
+        """The real failing shape: multiple hierarchies CrossJoin'd, each
+        with its own explicit [(All)].Members qualifier — the exact MDX
+        Excel sends for a multi-dimension PivotTable with subtotals on."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = (
+            "CrossJoin("
+            "Hierarchize(AddCalculatedMembers({[Business Date].[Calendar].[(All)].Members})), "
+            "Hierarchize(AddCalculatedMembers({[Business Date].[Calendar].[(All)].Members}))"
+            ")"
+        )
+        result = detect_subtotal_hierarchies(
+            col_expr, row_expr,
+            _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        # Same hierarchy referenced twice in one axis still dedupes to one entry.
+        assert len(result) == 1
+
+    def test_explicit_all_qualifier_children_not_members_ignored(self):
+        """[(All)].Children is a real level-population query (the top data
+        level's members only), not a subtotal request — must not trigger."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = "{[Business Date].[Calendar].[(All)].Children}"
+        result = detect_subtotal_hierarchies(
+            col_expr, row_expr,
+            _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        assert result == []
+
+    def test_explicit_real_level_qualifier_still_excluded(self):
+        """Bug-6892 regression: a genuine level name in the qualifier
+        position ([Month], not [(All)]) must still be excluded — the fix
+        must not widen the exclusion's carve-out beyond the literal
+        `(All)` bracket."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = "{[Business Date].[Calendar].[Month].Members}"
+        result = detect_subtotal_hierarchies(
+            col_expr, row_expr,
+            _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        assert result == []
+
     def test_ignores_when_no_members(self):
         col_expr = "{[Measures].[amount]}"
         row_expr = "[Business Date].[Calendar].[2024]"
@@ -149,6 +213,186 @@ class TestDetectSubtotalHierarchies:
             _make_hierarchy_meta(), _make_level_dim_map(),
         )
         assert len(result) == 1
+
+
+# ---- Flat-attribute rollup detection tests (Bug-9766 remaining scope) ----
+
+class TestDetectFlatAttributeRollups:
+    """detect_flat_attribute_rollups is deliberately SEPARATE from
+    detect_subtotal_hierarchies -- see both functions' docstrings for why
+    (folding flat attributes into subtotal_hierarchies silently disabled
+    LAST_NON_EMPTY safety guards in xmla_server.py that have nothing to do
+    with a flat, non-time attribute).
+
+    A LONE flat attribute on an axis never triggers detection here -- see
+    test_lone_flat_attribute_never_detected below and the function's own
+    docstring for why: Excel sends the identical MDX shape for "just show
+    this field" and "show this field with a rollup", and the existing
+    flat-pivot LAST_NON_EMPTY path already handles the lone-dimension case
+    correctly on its own. Every positive-detection test below therefore
+    uses a CrossJoin of at least two dimensions on the same axis, matching
+    the real, DEBUG-log-captured Excel MDX for the reported bug.
+    """
+
+    def test_explicit_all_qualifier_detects_flat_attribute(self):
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = (
+            "CrossJoin("
+            "Hierarchize(AddCalculatedMembers({[account_type].[account_type].[(All)].Members})), "
+            "Hierarchize(AddCalculatedMembers({[aml_flag].[aml_flag].[(All)].Members}))"
+            ")"
+        )
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type", "aml_flag", "active_flag"},
+        )
+        assert {h.mdx_dim_name for h in result} == {"account_type", "aml_flag"}
+        account_type_result = next(h for h in result if h.mdx_dim_name == "account_type")
+        assert len(account_type_result.levels) == 1
+        assert account_type_result.levels[0].dim_name == "account_type"
+        assert account_type_result.levels[0].ordinal == 0
+
+    def test_plain_members_form_also_detects(self):
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = "CrossJoin({[account_type].[account_type].Members}, {[aml_flag].[aml_flag].Members})"
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type", "aml_flag"},
+        )
+        assert {h.mdx_dim_name for h in result} == {"account_type", "aml_flag"}
+
+    def test_lone_flat_attribute_never_detected(self):
+        """The far more common shape than a multi-dimension rollup: a
+        SINGLE flat attribute alone on its axis, no CrossJoin. Excel sends
+        this exact MDX shape for an ordinary single-field PivotTable with
+        no subtotal desired -- it must NOT be treated as a rollup request,
+        or a plain flat-pivot LAST_NON_EMPTY query (already correctly
+        handled by _flat_lne_hidden_time_dim) would be wrongly refused as
+        a fabricated subtotal-plus-LNE conflict. This is not hypothetical:
+        it broke test_lne_control_base_measure_on_the_axis_is_already_
+        correct and three siblings during development of this fix."""
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = "{[account_type].[account_type].[(All)].Members}"
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type"},
+        )
+        assert result == []
+
+    def test_crossjoin_of_multiple_flat_attributes_all_detected(self):
+        """The exact real Excel shape reproduced live on the investor demo:
+        three flat attribute dimensions CrossJoin'd on Rows, each with its
+        own explicit [(All)].Members qualifier."""
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = (
+            "CrossJoin(CrossJoin("
+            "Hierarchize(AddCalculatedMembers({[account_type].[account_type].[(All)].Members})), "
+            "Hierarchize(AddCalculatedMembers({[aml_flag].[aml_flag].[(All)].Members}))"
+            "), "
+            "Hierarchize(AddCalculatedMembers({[active_flag].[active_flag].[(All)].Members}))"
+            ")"
+        )
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type", "aml_flag", "active_flag"},
+        )
+        assert {h.mdx_dim_name for h in result} == {"account_type", "aml_flag", "active_flag"}
+        assert all(len(h.levels) == 1 for h in result)
+
+    def test_name_not_in_standalone_attribute_set_not_detected(self):
+        """A dimension not present in standalone_attribute_names (e.g. a
+        hierarchy-level backing column already excluded from the catalogue
+        by Bug-6890's dedup, or simply an unknown name) must not be
+        misdetected as an independently rollup-able attribute, even when
+        CrossJoin'd with a genuinely detectable one."""
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = (
+            "CrossJoin("
+            "{[business_date_calendar_year].[business_date_calendar_year].[(All)].Members}, "
+            "{[account_type].[account_type].[(All)].Members}"
+            ")"
+        )
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type"},
+        )
+        assert [h.mdx_dim_name for h in result] == ["account_type"]
+
+    def test_mismatched_dim_and_hier_parts_not_detected(self):
+        """A standalone attribute's canonical unique name is always
+        [name].[name] -- a mismatched pair cannot be this dimension in its
+        self-qualified form, even if both names happen to be known."""
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = (
+            "CrossJoin("
+            "{[account_type].[something_else].Members}, "
+            "{[aml_flag].[aml_flag].Members}"
+            ")"
+        )
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type", "something_else", "aml_flag"},
+        )
+        assert [h.mdx_dim_name for h in result] == ["aml_flag"]
+
+    def test_level_scoped_form_not_detected(self):
+        """The level-scoped form doesn't even match the shared regex (its
+        trailing bracket isn't the special-cased (All) qualifier), so it
+        contributes no match at all to this axis -- covered here alongside
+        two OTHER genuinely CrossJoin'd attributes so the axis still meets
+        the 2+-distinct-dimensions threshold and the exclusion is isolated
+        to the level-scoped form specifically, not just "too few matches"."""
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = (
+            "CrossJoin(CrossJoin("
+            "{[account_type].[account_type].[SomeLevel].Members}, "
+            "{[aml_flag].[aml_flag].Members}"
+            "), "
+            "{[active_flag].[active_flag].Members}"
+            ")"
+        )
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type", "aml_flag", "active_flag"},
+        )
+        assert sorted(h.mdx_dim_name for h in result) == ["active_flag", "aml_flag"]
+
+    def test_empty_standalone_attribute_set_detects_nothing(self):
+        col_expr = "{[Measures].[base_amount]}"
+        row_expr = (
+            "CrossJoin("
+            "{[account_type].[account_type].[(All)].Members}, "
+            "{[aml_flag].[aml_flag].Members}"
+            ")"
+        )
+        result = detect_flat_attribute_rollups(col_expr, row_expr, set())
+        assert result == []
+
+    def test_no_duplicate_detection(self):
+        col_expr = ""
+        row_expr = (
+            "[account_type].[account_type].MEMBERS, "
+            "[account_type].[account_type].MEMBERS, "
+            "[aml_flag].[aml_flag].MEMBERS"
+        )
+        result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type", "aml_flag"},
+        )
+        assert sorted(h.mdx_dim_name for h in result) == ["account_type", "aml_flag"]
+
+    def test_hierarchy_and_attribute_detectors_are_independent(self):
+        """Real hierarchies never appear in detect_flat_attribute_rollups's
+        results, and a flat attribute never appears in
+        detect_subtotal_hierarchies's -- confirming the two functions stay
+        cleanly partitioned on the same MDX."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = (
+            "CrossJoin("
+            "Hierarchize(AddCalculatedMembers({[Business Date].[Calendar].[(All)].Members})), "
+            "Hierarchize(AddCalculatedMembers({[account_type].[account_type].[(All)].Members}))"
+            ")"
+        )
+        hierarchy_result = detect_subtotal_hierarchies(
+            col_expr, row_expr, _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        attribute_result = detect_flat_attribute_rollups(
+            col_expr, row_expr, {"account_type"},
+        )
+        assert [h.hierarchy_name for h in hierarchy_result] == ["Calendar"]
+        assert [h.mdx_dim_name for h in attribute_result] == ["account_type"]
 
 
 # ---- Query generation tests ----
@@ -758,6 +1002,53 @@ def _multi_detail_rows():
 
 class TestBuildMultiSubtotalQueries:
 
+    def test_bug_9244_three_flat_row_fields_generate_the_full_lattice(self):
+        """Three flat row fields plan the full 2^3 - 1 lattice (Bug-9845); the
+        nested-prefix subset the retired calculated-total profile needed
+        (Bug-9244) is gone with it (Bug-9874). The nested-prefix grains are
+        still present, in the engine's canonical order."""
+        names = ["account_type", "refund_flag", "source_system"]
+        hierarchies = [
+            SubtotalHierarchy(
+                hierarchy_name=name,
+                mdx_dim_name=name,
+                mdx_hier_name=name,
+                levels=[SubtotalLevel(name=name, ordinal=0, dim_name=name)],
+                axis=1,
+                is_flat_attribute_rollup=True,
+            )
+            for name in names
+        ]
+
+        queries = build_multi_subtotal_queries(
+            mdx_dims=names,
+            mdx_measures=["average_base_amount"],
+            where_sql_clauses=[],
+            model_slug="modely",
+            measures_meta=[{
+                "name": "average_base_amount",
+                "default_agg": "avg",
+            }],
+            hierarchies=hierarchies,
+            measure_canonical={"average_base_amount": "average_base_amount"},
+        )
+
+        grains = [query.grain_per_hierarchy for query in queries]
+        assert len(grains) == 7
+        assert len({tuple(sorted(g.items())) for g in grains}) == 7
+        for nested in (
+            {"account_type": 0, "refund_flag": 0, "source_system": -1},
+            {"account_type": 0, "refund_flag": -1, "source_system": -1},
+            {"account_type": -1, "refund_flag": -1, "source_system": -1},
+        ):
+            assert nested in grains
+        assert {"account_type": 0, "refund_flag": 0, "source_system": 0} not in grains
+        by_grain = {tuple(sorted(q.grain_per_hierarchy.items())): q for q in queries}
+        assert by_grain[tuple(sorted(
+            {"account_type": -1, "refund_flag": -1, "source_system": -1}.items()
+        ))].dim_cols == []
+        assert all("AVG(" in query.sql for query in queries)
+
     def test_two_hierarchies_produce_correct_query_count(self):
         """Calendar 4 options (detail,Month,Year,All) × Region 3 (detail,Country,All) = 12 - 1 = 11."""
         queries = build_multi_subtotal_queries(
@@ -962,7 +1253,7 @@ class TestComputeMultiLneSubtotals:
         )
         assert len(result) == len(queries)
 
-    def test_lne_grand_total_takes_last_overall(self):
+    def test_lne_grand_total_adds_each_peer_at_its_last_non_empty_period(self):
         hierarchies = _two_hierarchies()
         detail_rows = _multi_detail_rows()
         queries = build_multi_subtotal_queries(
@@ -980,7 +1271,112 @@ class TestComputeMultiLneSubtotals:
         gt_q = next(q for q in queries if q.level_name == "Grand Total")
         gt_key = tuple(gt_q.dim_cols)
         gt_overrides = result[gt_key]
-        assert gt_overrides[()]["balance"] == 1200
+        # Bug-9768: LAST_NON_EMPTY is last over time, but additive across the
+        # non-time peers.  NYC contributes 1200 and Berlin contributes 600.
+        assert gt_overrides[()]["balance"] == 1800
+
+    def test_bug_9768_last_over_time_then_adds_non_time_peers(self):
+        """Each peer contributes its own latest non-empty value exactly.
+
+        NYC and Boston both have values at the latest date. Chicago's latest
+        row is empty, so its earlier value must still contribute to the
+        subtotal and grand total. The old implementation returned NYC's first
+        latest row instead of 30.10 + 20.20 + 7.07.
+        """
+        detail_rows = [
+            {"cal_year": "2024", "cal_month": "2024-02", "cal_day": "2024-02-15",
+             "country": "US", "city": "NYC", "balance": Decimal("30.10")},
+            {"cal_year": "2024", "cal_month": "2024-02", "cal_day": "2024-02-15",
+             "country": "US", "city": "Boston", "balance": Decimal("20.20")},
+            {"cal_year": "2024", "cal_month": "2024-01", "cal_day": "2024-01-15",
+             "country": "US", "city": "Chicago", "balance": Decimal("7.07")},
+            {"cal_year": "2024", "cal_month": "2024-02", "cal_day": "2024-02-15",
+             "country": "US", "city": "Chicago", "balance": None},
+        ]
+        queries = build_multi_subtotal_queries(
+            mdx_dims=["cal_year", "cal_month", "cal_day", "country", "city"],
+            mdx_measures=["balance"],
+            where_sql_clauses=[],
+            model_slug="m",
+            measures_meta=[{"name": "balance", "default_agg": "last_non_empty"}],
+            hierarchies=_two_hierarchies(),
+            measure_canonical={"balance": "balance"},
+        )
+
+        result = compute_multi_lne_subtotals(
+            detail_rows, _two_hierarchies(), ["balance"], queries,
+        )
+
+        country_q = next(
+            q for q in queries
+            if q.grain_per_hierarchy == {"Calendar": -1, "Region": 0}
+        )
+        year_q = next(
+            q for q in queries
+            if q.grain_per_hierarchy == {"Calendar": 0, "Region": -1}
+        )
+        grand_q = next(q for q in queries if q.level_name == "Grand Total")
+        expected = Decimal("57.37")
+        assert result[tuple(country_q.dim_cols)][("US",)]["balance"] == expected
+        assert result[tuple(year_q.dim_cols)][("2024",)]["balance"] == expected
+        assert result[tuple(grand_q.dim_cols)][()]["balance"] == expected
+
+    def test_bug_9768_leaf_rows_remain_leaf_values(self):
+        """Peer addition belongs to rollup rows; leaf detail is untouched."""
+        detail_rows = _multi_detail_rows()
+        queries = build_multi_subtotal_queries(
+            mdx_dims=["cal_year", "cal_month", "cal_day", "country", "city"],
+            mdx_measures=["balance"],
+            where_sql_clauses=[],
+            model_slug="m",
+            measures_meta=[{"name": "balance", "default_agg": "last_non_empty"}],
+            hierarchies=_two_hierarchies(),
+            measure_canonical={"balance": "balance"},
+        )
+        overrides = compute_multi_lne_subtotals(
+            detail_rows, _two_hierarchies(), ["balance"], queries,
+        )
+        detail_query = GrainQuery(
+            sql="", protocol="jdbc", grain_ordinal=3, level_name="detail",
+            dim_cols=["cal_year", "cal_month", "cal_day", "country", "city"],
+            grain_per_hierarchy={"Calendar": 2, "Region": 1},
+        )
+        detail = GrainResult(
+            query=detail_query,
+            columns=[*detail_query.dim_cols, "balance"],
+            rows=detail_rows,
+        )
+        country_q = next(
+            q for q in queries
+            if q.grain_per_hierarchy == {"Calendar": -1, "Region": 0}
+        )
+        grand_q = next(q for q in queries if q.level_name == "Grand Total")
+        subtotal_results = [
+            GrainResult(
+                query=country_q,
+                columns=["country", "balance"],
+                rows=[{"country": "US", "balance": None}],
+            ),
+            GrainResult(
+                query=grand_q,
+                columns=["balance"],
+                rows=[{"balance": None}],
+            ),
+        ]
+
+        _, merged = merge_multi_hierarchy_results(
+            detail, subtotal_results, _two_hierarchies(), overrides,
+        )
+        leaves = [row for row in merged if row[SUBTOTAL_LEVEL_KEY] == "detail"]
+        leaf_values = {
+            (row["city"], row["cal_day"]): row["balance"]
+            for row in leaves
+        }
+        detail_values = {
+            (row["city"], row["cal_day"]): row["balance"]
+            for row in detail_rows
+        }
+        assert leaf_values == detail_values
 
     def test_lne_year_region_detail_partitioned_by_country(self):
         """Calendar=Year, Region=detail: LNE partitioned by (cal_year, country, city)."""

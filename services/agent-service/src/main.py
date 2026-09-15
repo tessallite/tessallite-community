@@ -13,15 +13,17 @@ This file mirrors the layout of model-service / query-router / scheduler.
 """
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from shared.config.bootstrap import refresh_system_snapshot
 from shared.config.settings import get_settings
 from shared.metrics import PrometheusMiddleware, metrics_response
+from shared.service_readiness import probe_metadata_database
 from src.webhooks.dispatcher import close_client as _close_webhook_client
 from src.webhooks.dispatcher import init_client as _init_webhook_client
 from src.api import (
@@ -97,9 +99,33 @@ app.include_router(maintenance.router, prefix=PREFIX)
 app.include_router(agent_log.router, prefix=PREFIX)
 
 
+async def _metadata_db_ready() -> tuple[bool, str]:
+    return await probe_metadata_database()
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "service": "agent-service"}
+
+
+@app.get("/liveness")
+async def liveness() -> dict:
+    return {"status": "ok", "service": "agent-service"}
+
+
+@app.get("/readiness")
+async def readiness(response: Response) -> dict:
+    """Return 503 when agent-service's direct metadata dependency is unavailable."""
+    body: dict = {"status": "ok", "service": "agent-service"}
+    ready, detail = await _metadata_db_ready()
+    if not ready:
+        body["status"] = "degraded"
+        body["detail"] = "metadata database unreachable"
+        response.status_code = 503
+        logging.getLogger(__name__).error(
+            "agent-service /readiness DEGRADED — metadata DB unavailable: %s", detail
+        )
+    return body
 
 
 @app.get("/metrics", include_in_schema=False)

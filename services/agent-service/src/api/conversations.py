@@ -1468,6 +1468,9 @@ async def send_message(
                         if isinstance(current_user, CurrentEmbedUser)
                         else None
                     ),
+                    # Bug-9897: the judge's rebuilt prompt must be grounded on
+                    # the same executor-resolved surface the planner saw.
+                    jwt_token=jwt_token,
                 )
                 system_prompt = bundle.system
                 # R2 (F2) — carry the section breakdown + retrieved glossary
@@ -1936,6 +1939,8 @@ async def _run_turn_into_publisher(
                         # Bug-6575 — keep the streaming judge's system prompt on
                         # the same embed model-scope as the planner.
                         embed_model_ids=embed_model_ids,
+                        # Bug-9897: same executor-resolved grounding surface.
+                        jwt_token=jwt_token,
                     )
                     system_prompt = bundle.system
                     # R2 (F2) — section breakdown + retrieved cards for the

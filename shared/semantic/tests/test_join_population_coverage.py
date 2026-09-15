@@ -112,8 +112,8 @@ def test_bug_l3_ch_001_star_consumers_require_population_closure():
     substitute_path = "services/query-router/src/rewrite/source_sql.py"
     source = (root / substitute_path).read_text(encoding="utf-8")
     substitute_mutation = source.replace(
-        "population_from_clause = await _population_star_from_clause(",
-        "population_from_clause = await removed_population_star_from_clause(",
+        "population_result = await _population_star_from_clause(",
+        "population_result = await removed_population_star_from_clause(",
         1,
     )
     assert substitute_mutation != source

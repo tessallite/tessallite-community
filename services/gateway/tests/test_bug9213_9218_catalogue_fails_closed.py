@@ -64,10 +64,12 @@ async def test_tenant_listing_failure_raises_instead_of_an_empty_catalogue(
 async def test_connection_setup_reports_a_service_fault_not_an_empty_catalogue(
     monkeypatch,
 ):
-    """The user-visible half: startup must FAIL, not hand over a blank catalogue.
+    """The user-visible half: report the fault, never serve a blank catalogue.
 
     Asserted on the emitted protocol bytes — a FATAL ErrorResponse carrying
-    SQLSTATE 08006 — not on an internal call.
+    SQLSTATE 08006 after ReadyForQuery releases the client's connection timer.
+    The server returns before entering its query loop, so no query can observe
+    an empty catalogue (Bug-9913).
     """
     server = PGWireServer()
     server._tenant_slug = "acme"
@@ -110,15 +112,15 @@ async def test_connection_setup_reports_a_service_fault_not_an_empty_catalogue(
     # than the per-IP admission governor.
     await server._run(_NullReader(), _W())
 
-    assert written[:1] == b"E", "expected an ErrorResponse, got %r" % bytes(written[:1])
     payload = bytes(written)
     assert b"08006" in payload, "expected SQLSTATE 08006 (connection failure)"
     assert b"FATAL" in payload
     assert b"Unknown model" not in payload, (
         "a metadata fault must not be reported as a missing model"
     )
-    # And no ReadyForQuery: the connection never came up with a blank catalogue.
-    assert b"Z" not in payload[-6:], "startup completed despite the fault"
+    assert payload.find(b"Z") < payload.find(b"08006"), (
+        "the full metadata fan-out still ran under the client connection timer"
+    )
 
 
 # ---------------------------------------------------------------------------

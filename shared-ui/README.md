@@ -17,15 +17,22 @@ Zustand, and other dependencies.
 ### Local development
 
 tsc follows path aliases into shared-ui source and needs to resolve third-party
-types from the consumer's `node_modules`. Create a symlink one directory above
-shared-ui to simulate npm workspace hoisting:
+types from the consumer's `node_modules`. This requires a symlink one directory
+above shared-ui to simulate npm workspace hoisting:
 
 ```bash
 # From tessallite/ (parent of shared-ui, frontend, excel-plugin):
 ln -sfn frontend/node_modules node_modules
 ```
 
-This lets `npx tsc --noEmit` in any consumer resolve shared-ui's imports.
+**`tessallite/frontend`** creates this automatically: its `postinstall` script
+(`frontend/scripts/link-shared-ui.js`) runs the equivalent of the command above
+after every `npm install`/`npm ci`, so a fresh checkout's frontend build does
+not silently hit `TS2307` (Bug-8815). Other consumers (excel-plugin,
+conversational-client) still need the manual step above, or rely on their own
+Dockerfile/CI symlink or separate `npm ci` step — see each consumer's build
+config for the mechanism it uses.
+
 Without the symlink, tsc errors like "Cannot find module 'react'" appear for
 shared-ui files even though the consumer builds fine with Vite (Vite uses
 `resolve.alias` and doesn't follow tsc's module resolution).

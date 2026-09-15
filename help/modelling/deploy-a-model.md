@@ -74,6 +74,11 @@ When you deploy, Tessallite takes a **snapshot** of the model's shape — its me
 
 Pinning is what makes your draft edits safe. After a model is deployed you can keep working in the Builder: rename a measure, change a formula from `SUM(amount)` to `SUM(amount) - SUM(discount)`, un-hide a column, add a hierarchy level. **None of those edits reach Excel, Power BI, or the query router until you Save and Deploy again.** BI tools keep seeing the deployed version exactly as it was, so a report never changes underneath the person reading it just because someone happened to be editing the model.
 
+**Named List refresh also stays in the draft.** Refresh computes and stores new
+members, but queries continue using the deployed membership. The list editor
+explains this before refresh and, after success, tells you to **Save and Deploy**
+the model to use the refreshed members in queries.
+
 Three things are deliberately **not** frozen, because they are safety controls that must take effect immediately:
 
 - **Row security and personas** — if you tighten who can see which rows, the new restriction applies on the very next query. A security rule never waits for a redeploy.

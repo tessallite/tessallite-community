@@ -121,6 +121,50 @@ When **no rule matches**, ordinary callers receive a deny-all predicate and see 
 
 ---
 
+## An empty result is a valid answer, not an error
+
+Row security is a filter condition on every governed query. It is not a
+gatekeeper that runs before the query and refuses it; it is part of the query
+that runs. So when a caller's rules match no rows, the query succeeds and
+returns nothing — exactly as `WHERE region_code = 'FR'` returns nothing in a
+dataset that holds no French rows.
+
+That is deliberate, and it is why no error and no special signal is sent to the
+client. The filter is inside the query, so every consumer sees an ordinary
+empty result: Excel shows an empty PivotTable, Power BI shows an empty visual,
+a JDBC tool shows zero rows, and a total taken over no rows shows 0. A tool that
+asked a legitimate question got a legitimate answer for the audience it asked
+as. Tessallite does not distinguish "you are not allowed to see these rows"
+from "there are no such rows", because from the query's point of view they are
+the same condition, and answering differently would leak the existence of rows
+the caller may not see.
+
+The practical consequence is that an empty result is not self-explaining. When a
+user reports that a report went empty, or that a figure they expect is showing
+0, check these in order:
+
+1. **Which rules compiled for that person.** Open **Simulate as user** with
+   their email address and their exact JWT roles. A deny-all compiled string
+   (`0 = 1`) means no rule matched, and an ordinary caller with no matching rule
+   is denied every row.
+2. **Whether their role string is spelled as the rule expects.** Roles are plain
+   strings from the token. A typo in `applies_to_roles`, or a role the identity
+   provider spells differently, matches nothing and reads as an empty report.
+3. **Whether their mapping row exists.** A `user_mapping` rule with no row for
+   that user allows nothing.
+4. **Whether the rule is narrower than intended.** Wildcards and mapping rules
+   intersect; only named grants union. Two rules that each look permissive can
+   combine into a filter that matches no rows.
+5. **Whether the data really has rows for their scope.** Run the Simulate probe
+   query as a tenant administrator (`SELECT <security_column>, COUNT(*) FROM
+   <model> GROUP BY <security_column>`). If the caller's allowed value is absent
+   from that breakdown, the rule is right and the data is empty.
+
+Steps 1 to 4 are policy problems and are fixed in the rule. Step 5 is a data
+problem and is not.
+
+---
+
 ## Preview compiled policy
 
 The Row Security panel has a button labeled **Simulate as user**. It opens a dialog where you enter a candidate email address and a list of roles, then click **Preview**. Tessallite compiles every enabled rule against that hypothetical person and shows the resulting filter — one compiled string, the same predicate the Query Router would inject. There is no per-rule fire / not-fire tree: unmatched named grants simply do not appear in that string.
@@ -132,6 +176,27 @@ Optionally fill **Probe query** (the panel suggests `SELECT <security_column>, C
 *Figure 3 — Preview compiled policy. Confirming a rule's effect before sending a JWT to a user's tool is the single highest-value habit in row-security authoring. Full description: [row-security-simulate-drawer.txt](../assets/screencaps/row-security-simulate-drawer.txt).*
 
 The compiled string is a policy check. The probe table is the row proof. Review both after every rule change — named grants OR, so two rules that look like they tighten can instead widen a multi-role caller.
+
+---
+
+## Everything built from the model inherits this filter
+
+Row security does not just change what a plain query returns. It changes the model itself, for that caller. Think of it as a smaller model, built just for them.
+
+Everything else comes from that smaller model too. This includes a named set, a saved Named Query, and a KPI. It also includes a summary table, a subtotal, a preview, and an export. It even includes an answer from the assistant. None of them can reach around it.
+
+Set the rule once, here. It reaches every one of those automatically. There is no second list of "who can see what" to keep in step with this one.
+
+What that means in practice:
+
+- **Named sets and Named Lists.** Say a set ranks members by a measure you cannot see. You will not be offered that set at all. If a set or list cannot be built from your smaller model, it will not appear in the picker. It is not greyed out. It is simply not there.
+- **Named Queries.** A Named Query keeps a stored copy of its answer. Tessallite uses that stored copy only when your row security can still be applied to it. Say the stored copy is missing the column your rule filters on. Then Tessallite runs the question live instead. It runs straight from the model as you see it, with the same filter. It never reads the stored copy unfiltered.
+- **KPIs, aggregates, and other summary tables.** A summary table answers you only when your row security can still be applied to it. When it cannot, Tessallite computes the answer live instead. It will never hand you a number that was built for a wider audience.
+- **Subtotals and grand totals.** A subtotal is a total taken over your filtered model. It is never a total taken over the unfiltered source with a filter added afterward.
+- **Previews and exports.** A table preview, a drill-through, and a CSV or Excel export all read through the same filtered model. None of them reads the source table directly and applies the filter afterward.
+- **The assistant.** The conversational agent is grounded on your model too. It is never told about a row, a measure, or a slice you could not query yourself. So it cannot describe, summarise, or chart something you are not allowed to see.
+
+This is why one rule is enough. A derived answer can only reach what your own queries reach. It is always built on top of those queries.
 
 ---
 
@@ -184,6 +249,7 @@ To reseed the demo tenant (including its row-security rules), run `bash scripts/
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Rule saves but no filtering happens | Role in `applies_to_roles` does not match the JWT's `role` claim | Check the JWT; keep role strings canonical |
+| A user reports an empty report, or a total showing 0, with no error | Their compiled filter matches no rows. This is a valid empty result, not a failure, so no client sees an error | Work through the checks in "An empty result is a valid answer, not an error": compiled string, role spelling, mapping row, rule combination, then the data itself |
 | Query errors with "column does not exist" for the security column | A scanned scope does not expose the security dimension column the rule references | Ensure the fact table exposes the column (the filter fails closed rather than returning unfiltered rows) |
 | Query rejected with `row_security_unsupported_shape` | The query shape cannot be safely constrained by the active rules | Rewrite it as a plain SELECT, or a UNION of plain SELECTs, over the model |
 | Simulate compiled string is deny-all (`0 = 1`) for the target user | User's roles do not include any `applies_to_roles` from a named grant, and no wildcard matches | Add the role to the user's JWT claim, or the role name to the rule |

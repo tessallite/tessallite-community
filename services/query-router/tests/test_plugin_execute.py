@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from result_fakes import ScalarResult
 from fastapi import HTTPException
 from jose import jwt
 
@@ -117,7 +118,7 @@ def _fake_db(personas: list | None = None):
             self._rows = rows
 
         def scalars(self):
-            return self
+            return ScalarResult(self._rows)
 
         def all(self):
             return self._rows
@@ -126,6 +127,9 @@ def _fake_db(personas: list | None = None):
             return self._rows[0] if self._rows else None
 
     db = AsyncMock()
+    # AsyncSession.add is synchronous; model it as such so failure logging
+    # tests do not create un-awaited mock coroutines.
+    db.add = MagicMock()
     db.get = AsyncMock(side_effect=lambda cls, key: persona_map.get(str(key)))
 
     def _execute(stmt):
@@ -1529,3 +1533,251 @@ async def test_embed_and_tenant_sessions_receive_identical_route_detail(plugin_c
         assert "acme_aggregates" in route["reason"], label
     # The permanently-false flag went with the control it reported on.
     assert "reason_redacted" not in responses["embed"]
+
+
+# ---------------------------------------------------------------------------
+# Bug-9876 / Bug-9910: measure columns leave the boundary as JSON NUMBERS
+# ---------------------------------------------------------------------------
+
+
+def _ep_bound_measures(*names_and_aggs, dim_specs=None):
+    """A bound query whose ``resolved_measures`` are the given (name, agg) pairs.
+
+    ``resolved_measures`` is the SAME authority ``_build_annotation`` uses to
+    name the measure columns, so a test that binds through it proves the
+    annotation and the coerced columns cannot describe different sets.
+    """
+    bound = _ep_bound(dim_specs=dim_specs)
+    bound.resolved_measures = [
+        types.SimpleNamespace(
+            id=uuid.uuid4(), name=name, display_name=name.replace("_", " "),
+            default_agg=agg, format=None,
+        )
+        for (name, agg) in names_and_aggs
+    ]
+    return bound
+
+
+async def _run_plugin_rows(plugin_client, bound, rows, *, measures, dimensions=None):
+    db = AsyncMock()
+    _stub_dim_types(db, bound, {d.name: "string" for d in bound.resolved_dimensions})
+    pipeline = _PipelineMocks(rows=rows, columns=list(rows[0].keys()) if rows else [])
+    with (
+        patch("src.api.plugin.get_tenant_db", _async_gen(db)),
+        patch("src.api.plugin.resolve_execution_persona", AsyncMock(return_value=None)),
+        patch("src.api.plugin.bind_query_to_model", AsyncMock(return_value=bound)),
+        patch("src.api.plugin.route_query", AsyncMock(return_value=MagicMock())),
+        pipeline.applied(),
+    ):
+        resp = await plugin_client.post(
+            "/api/v1/plugin/execute",
+            json={
+                "project_id": _EP_PROJECT_ID,
+                "model_id": _EP_MODEL_ID,
+                "measures": list(measures),
+                "dimensions": list(dimensions or []),
+            },
+            headers=_ep_auth(),
+        )
+    return resp
+
+
+class TestPluginMeasureValuesAreNumbers:
+    """Bug-9876 / Bug-9910.
+
+    The executor hands the endpoint ``Decimal`` values and pydantic's JSON mode
+    renders a ``Decimal`` as a STRING. The add-in then writes TEXT into the cell
+    and a PivotTable over it COUNTS instead of summing, with no error anywhere.
+    Measured live on the local stack (``modely``, admin):
+    ``base_amount -> "180442041.28"``, ``transaction_count -> "1.0E+5"`` — the
+    same defect renders one measure as plain decimal text and the next in
+    scientific notation, because ``str(Decimal)`` follows the exponent.
+
+    The wire type is asserted on the RAW body text, not on ``resp.json()``:
+    ``json.loads`` would turn a JSON number back into a Python float and hide a
+    quoted string just as effectively as the client-side parse does.
+    """
+
+    @staticmethod
+    def _raw_measure_token(body_text: str, measure: str) -> str:
+        """The exact JSON token the wire carries for ``measure`` in row 0."""
+        import re
+        m = re.search(rf'"{measure}"\s*:\s*("?[^,}}]*"?)', body_text)
+        assert m, f"{measure!r} not present in the response body: {body_text}"
+        return m.group(1)
+
+    @pytest.mark.asyncio
+    async def test_decimal_measure_reaches_the_wire_as_a_number(self, plugin_client):
+        from decimal import Decimal
+        bound = _ep_bound_measures(("base_amount", "sum"))
+        resp = await _run_plugin_rows(
+            plugin_client, bound,
+            [{"region": "US", "base_amount": Decimal("180442041.28")}],
+            measures=["base_amount"], dimensions=["region"],
+        )
+        assert resp.status_code == 200, resp.text
+        token = self._raw_measure_token(resp.text, "base_amount")
+        assert not token.startswith('"'), (
+            "base_amount left the boundary as TEXT "
+            f"({token}); Excel stores a numeric string as text and a PivotTable "
+            "over it counts instead of summing"
+        )
+        assert resp.json()["data"][0]["base_amount"] == pytest.approx(180442041.28)
+
+    @pytest.mark.asyncio
+    async def test_scientific_notation_decimal_reaches_the_wire_as_a_number(
+        self, plugin_client,
+    ):
+        """Bug-9910: a count-shaped SUM over a NUMERIC aggregate column comes back
+        as ``Decimal('1.0E+5')``, whose text form is ``"1.0E+5"``. That is the
+        exact wire value ``transaction_count`` carries on ``modely`` while
+        ``base_amount`` carries plain decimal text, and it is the only difference
+        between the two measures at this boundary."""
+        from decimal import Decimal
+        bound = _ep_bound_measures(("transaction_count", "sum"))
+        resp = await _run_plugin_rows(
+            plugin_client, bound,
+            [{"region": "US", "transaction_count": Decimal("1.0E+5")}],
+            measures=["transaction_count"], dimensions=["region"],
+        )
+        assert resp.status_code == 200, resp.text
+        token = self._raw_measure_token(resp.text, "transaction_count")
+        assert not token.startswith('"'), (
+            f"transaction_count left the boundary as TEXT ({token})"
+        )
+        assert "E" not in token and "e" not in token, (
+            f"transaction_count left the boundary in scientific notation ({token})"
+        )
+        assert resp.json()["data"][0]["transaction_count"] == 100000
+
+    @pytest.mark.asyncio
+    async def test_dimension_columns_keep_their_type(self, plugin_client):
+        """Only the measure columns are coerced. A dimension that happens to be
+        numeric text stays exactly what the source returned — the add-in's
+        member-key fan-out compares dimension values as strings."""
+        from decimal import Decimal
+        bound = _ep_bound_measures(
+            ("base_amount", "sum"),
+            dim_specs=[("region", "Region", uuid.uuid4()),
+                       ("store_code", "Store code", uuid.uuid4())],
+        )
+        resp = await _run_plugin_rows(
+            plugin_client, bound,
+            [{"region": "US", "store_code": "0042", "base_amount": Decimal("1.5")}],
+            measures=["base_amount"], dimensions=["region", "store_code"],
+        )
+        assert resp.status_code == 200, resp.text
+        assert self._raw_measure_token(resp.text, "store_code") == '"0042"'
+        assert resp.json()["data"][0]["store_code"] == "0042"
+
+    @pytest.mark.asyncio
+    async def test_null_measure_stays_null(self, plugin_client):
+        bound = _ep_bound_measures(("base_amount", "sum"))
+        resp = await _run_plugin_rows(
+            plugin_client, bound,
+            [{"region": "US", "base_amount": None}],
+            measures=["base_amount"], dimensions=["region"],
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"][0]["base_amount"] is None
+
+    @pytest.mark.asyncio
+    async def test_integer_measure_is_untouched(self, plugin_client):
+        """``count_distinct`` already arrives as a Python ``int`` (measured live:
+        ``unique_customers -> 99993``). It must stay an exact integer, not be
+        widened to a float."""
+        bound = _ep_bound_measures(("unique_customers", "count_distinct"))
+        resp = await _run_plugin_rows(
+            plugin_client, bound,
+            [{"region": "US", "unique_customers": 99993}],
+            measures=["unique_customers"], dimensions=["region"],
+        )
+        assert resp.status_code == 200, resp.text
+        assert self._raw_measure_token(resp.text, "unique_customers") == "99993"
+
+    @pytest.mark.asyncio
+    async def test_every_annotated_measure_column_is_numeric(self, plugin_client):
+        """The annotation names the measure columns; every one of them must be a
+        number on the wire. Binding the assertion to ``annotation.measures``
+        rather than to a hand-written list is what stops the two from drifting."""
+        from decimal import Decimal
+        bound = _ep_bound_measures(
+            ("base_amount", "sum"),
+            ("transaction_count", "sum"),
+            ("avg_base_amount", "avg"),
+        )
+        resp = await _run_plugin_rows(
+            plugin_client, bound,
+            [{
+                "region": "US",
+                "base_amount": Decimal("180442041.28"),
+                "transaction_count": Decimal("1.0E+5"),
+                "avg_base_amount": Decimal("1804.4204128000000000"),
+            }],
+            measures=["base_amount", "transaction_count", "avg_base_amount"],
+            dimensions=["region"],
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        annotated = list(body["annotation"]["measures"])
+        assert annotated, "the annotation named no measures"
+        for name in annotated:
+            token = self._raw_measure_token(resp.text, name)
+            assert not token.startswith('"'), f"{name} is TEXT on the wire ({token})"
+            assert isinstance(body["data"][0][name], (int, float)), name
+
+
+class TestCoerceMeasureValues:
+    """Unit coverage for the boundary helper the endpoint above delegates to."""
+
+    def test_non_finite_decimal_becomes_null_not_an_unparseable_body(self):
+        """JSON has no ``NaN``/``Infinity`` literal. Emitting the bare token
+        produces a body ``JSON.parse`` rejects, which reaches the user as an
+        unexplained add-in failure instead of an empty cell."""
+        from decimal import Decimal
+        from src.api.measure_values import coerce_measure_values
+        rows = coerce_measure_values(
+            [{"m": Decimal("NaN")}, {"m": Decimal("Infinity")}], ["m"],
+        )
+        assert rows == [{"m": None}, {"m": None}]
+
+    def test_non_finite_float_becomes_null(self):
+        from src.api.measure_values import coerce_measure_values
+        assert coerce_measure_values(
+            [{"m": float("inf")}, {"m": float("nan")}], ["m"],
+        ) == [{"m": None}, {"m": None}]
+
+    def test_a_large_integral_decimal_keeps_every_digit(self):
+        """An integral Decimal is emitted as a Python ``int``, which JSON carries
+        exactly at any magnitude — narrowing it to a float first would lose
+        digits beyond 2**53."""
+        from decimal import Decimal
+        from src.api.measure_values import coerce_measure_values
+        big = Decimal("123456789012345678901")
+        assert coerce_measure_values([{"m": big}], ["m"]) == [{"m": int(big)}]
+
+    def test_boolean_measure_is_not_collapsed_to_a_number(self):
+        from src.api.measure_values import coerce_measure_values
+        assert coerce_measure_values([{"m": True}], ["m"]) == [{"m": True}]
+
+    def test_a_genuinely_textual_measure_value_is_left_alone(self):
+        """Only ``Decimal`` is converted. A string is never parsed, so the
+        producer never has to guess whether text that looks numeric is a number
+        — which is the guess this whole defect class comes from."""
+        from src.api.measure_values import coerce_measure_values
+        assert coerce_measure_values([{"m": "1.0E+5"}], ["m"]) == [{"m": "1.0E+5"}]
+
+    def test_unlisted_columns_and_missing_columns_are_untouched(self):
+        from decimal import Decimal
+        from src.api.measure_values import coerce_measure_values
+        rows = coerce_measure_values(
+            [{"region": Decimal("5.0"), "m": Decimal("2.5")}], ["m", "absent"],
+        )
+        assert rows == [{"region": Decimal("5.0"), "m": 2.5}]
+
+    def test_the_input_rows_are_not_mutated(self):
+        from decimal import Decimal
+        from src.api.measure_values import coerce_measure_values
+        original = [{"m": Decimal("2.5")}]
+        coerce_measure_values(original, ["m"])
+        assert original == [{"m": Decimal("2.5")}]

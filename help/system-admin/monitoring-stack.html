@@ -12,11 +12,11 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Monitoring Stack</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-05-23</span></div>
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-09-10</span></div>
     <h1>Monitoring Stack (Prometheus &amp; Grafana)</h1>
 
 <h2>What this covers</h2>
-<p>How to deploy, configure, and extend the optional Prometheus + Grafana monitoring stack that provides real-time observability into every Tessallite service. This page explains the architecture, what data is collected, how the dashboard is organised, and how to add your own metrics and panels.</p>
+<p>How to deploy, configure, and extend the optional Prometheus + Grafana monitoring stack that provides real-time observability into every Tessallite service. This page explains the architecture, what data is collected, how the dashboard is organised, and how to add your own metrics and panels. It also explains the separate host collector for raw runtime logs.</p>
 
 <h2>Overview</h2>
 <p>Tessallite ships with an optional monitoring stack that runs as a completely separate Docker Compose project. It is not required to run the platform and can be started or stopped independently without affecting any Tessallite service.</p>
@@ -25,7 +25,7 @@
 <thead><tr><th>Container</th><th>Image</th><th>Purpose</th></tr></thead>
 <tbody>
 <tr><td><strong>prometheus</strong></td><td><code>prom/prometheus:v2.51.0</code></td><td>Scrapes <code>/metrics</code> from every service every 15 seconds, stores time-series data for up to 15 days</td></tr>
-<tr><td><strong>grafana</strong></td><td><code>grafana/grafana:10.4.0</code></td><td>Visualises metrics through a pre-built dashboard with 21 panels across three sections</td></tr>
+<tr><td><strong>grafana</strong></td><td><code>grafana/grafana:10.4.0</code></td><td>Visualises metrics through a pre-built dashboard with 24 panels across three sections and three raw-log panels</td></tr>
 <tr><td><strong>nginx-exporter</strong></td><td><code>nginx/nginx-prometheus-exporter:1.1</code></td><td>Translates the frontend's nginx <code>stub_status</code> into Prometheus-format metrics</td></tr>
 </tbody>
 </table>
@@ -107,8 +107,16 @@ bash teardown.sh --keep-data  # stop but preserve volumes</code></pre>
 </tbody>
 </table>
 
+<h3>Raw runtime logs</h3>
+<p>The optional host collector reads Docker output for the selected Compose project and sends bounded, redacted batches through the existing system-admin API. It covers stdout and stderr for the eight configured services:</p>
+<p><code>model-service</code>, <code>query-router</code>, <code>gateway</code>, <code>scheduler</code>, <code>optimizer</code>, <code>agent-service</code>, <code>frontend</code> (nginx), and <code>postgres</code>.</p>
+<p>This is a Docker Compose host process. It includes container startup and subprocess output, does not collect browser developer-console messages, and does not claim a Kubernetes collector. It uses the existing system-admin login and does not add an application Docker-socket mount or a new credential scheme. See the <a href="../../../deploy/system-logs/README.md">raw runtime log collector runbook</a> for protected environment, Linux systemd and Windows Scheduled Task setup.</p>
+<p>The standard Helm chart keeps <code>systemLogs.enabled=false</code> because it does not provide a Kubernetes collector; Docker Compose keeps the host collector enabled.</p>
+<p>Raw records are stored in <code>tess_system.system_logs</code> and are visible only to system administrators. The UI provides server-side message/logger/instance search, service/severity/time filters, stable <strong>Load older</strong> paging, live five-second polling with pause, row details and a confirmed expired-record purge.</p>
+<p>The raw-log metrics have bounded labels and expose accepted events by service and level, write failures, truncated reads, collector heartbeat age, enablement, latest error timestamp and purged rows. The scheduler independently measures relation bytes and estimated rows every 60 seconds and after each hourly purge; the storage panel and alert use that scheduler target. A stale or missing measurement is shown as no current value. No message, user identity or event UUID is a metric label.</p>
+
 <h2>Dashboard sections</h2>
-<p>The Grafana dashboard is organised into three collapsible sections with four filter variables at the top: <strong>Service</strong>, <strong>Tenant</strong>, <strong>Project</strong>, and <strong>Model</strong>.</p>
+<p>The Grafana dashboard is organised into three collapsible sections with four filter variables at the top: <strong>Service</strong>, <strong>Tenant</strong>, <strong>Project</strong>, and <strong>Model</strong>. Three raw runtime-log panels sit alongside those sections.</p>
 
 <h3>Service Health (7 panels)</h3>
 <p>Live service status tiles, uptime over time, scrape duration, per-service request rate, error rate (5xx), and latency percentiles (p95 and p50).</p>
@@ -118,6 +126,16 @@ bash teardown.sh --keep-data  # stop but preserve volumes</code></pre>
 
 <h3>Model Health and Usage (7 panels)</h3>
 <p>Per-model query throughput, latency p95, protocol distribution (SQL vs DAX), route distribution, query errors by type, bytes processed, and rows returned.</p>
+
+<h3>Raw runtime logs</h3>
+<table>
+<thead><tr><th>Panel</th><th>What it shows</th></tr></thead>
+<tbody>
+<tr><td>Runtime logs by service and level</td><td>Accepted raw-log event rate grouped by bounded service and severity labels</td></tr>
+<tr><td>Runtime log storage</td><td>Current PostgreSQL relation size for <code>tess_system.system_logs</code> from the scheduler observer; no value when stale or missing</td></tr>
+<tr><td>Seconds since log collector reported</td><td>Age of the collector heartbeat</td></tr>
+</tbody>
+</table>
 
 <h2>Adding custom metrics</h2>
 <p>All Tessallite metrics are defined in <code>tessallite/shared/metrics.py</code> using the Python <code>prometheus-client</code> library.</p>
@@ -146,6 +164,11 @@ bash teardown.sh --keep-data  # stop but preserve volumes</code></pre>
 
 <h2>Data retention</h2>
 <p>Prometheus retains time-series data for <strong>15 days</strong> by default. To change this, edit the <code>--storage.tsdb.retention.time</code> argument in <code>monitoring/docker-compose.yml</code> and restart.</p>
+
+<h2>Raw runtime log retention</h2>
+<p><code>SYSTEM_LOG_RETENTION_DAYS</code> is the application <code>.env</code> setting. It defaults to 30 days; <code>0</code> disables expiry. The scheduler runs the shared purge hourly in 5,000-row batches, up to 100,000 rows per run. <strong>System Admin → System logs → Purge expired</strong> uses the same cutoff, removes only rows older than it, shows the cutoff and asks for confirmation. Deleting rows lets PostgreSQL reuse space; it does not promise an immediate reduction in database file size.</p>
+<p>Only <code>tess_system.system_logs</code> is covered. <code>tess_system.system_audit_events</code>, tenant <code>audit_events</code> and tenant <code>query_logs</code> have separate meanings and are not removed by this operation.</p>
+<p>The raw-log alert rules cover a recent error, storage above 512 MiB for ten minutes, a stale or missing scheduler storage measurement (even when collection is disabled), a missing collector heartbeat and truncated or failed collection. They are Prometheus rules only; this repository has no Alertmanager route or contact point, so a firing rule does not prove external notification delivery.</p>
 
 <h2>Frequently asked questions</h2>
 <p><strong>Do I need the monitoring stack to run Tessallite?</strong><br>No. It is entirely optional. Tessallite operates normally without it.</p>

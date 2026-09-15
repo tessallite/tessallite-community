@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from shared.auth.roles import PROJECT_MODELER_ROLE
 from shared.config.resolver import get_setting
 from shared.config.settings import get_settings
 from shared.db.models import (
@@ -1877,10 +1878,107 @@ def _build_gap_count_sql(
     return transpile_preview_sql(connector, canonical)
 
 
+# Bug-9900: minimum project role for the calendar coverage probe. The probe is
+# a raw MIN/MAX read of the PHYSICAL source tables through the query-router
+# ``/introspect/batch`` route, which applies no persona, no column-level
+# security and no row-level security. Like the table preview (Bug-9896, audit
+# row A38, decision 4.4c) it is therefore a MODELLING surface, not a data
+# surface, and is gated at modeller-or-above. ``forbid_embed_user`` stays: an
+# embed token is never a modeller.
+COVERAGE_MIN_ROLE = PROJECT_MODELER_ROLE
+
+
+async def _resolve_model_bound_fact(
+    db,
+    *,
+    model_id: UUID,
+    source_id: UUID,
+    fact_table: str,
+    fact_date_column: str,
+) -> tuple[ModelTable, str]:
+    """Resolve ``fact_table``/``fact_date_column`` to a table and column that
+    are part of THIS model, on THIS source.
+
+    Bug-9900: the two names arrive as free-form query parameters. Before this
+    guard they were passed straight to :func:`qualify_physical_name` and
+    interpolated into ``SELECT MIN(col), MAX(col) FROM <table>``, so any caller
+    could aim the probe at any table and column the source connection could
+    reach — including tables outside the model. Role alone does not fix that: a
+    modeller must not be able to read arbitrary source tables either. The probe
+    is therefore restricted to the model's own bound objects, and the SQL is
+    built from the STORED ``physical_name`` / ``column_name``, never from the
+    request string.
+
+    Raises 422 when the name is not part of the model.
+    """
+    name = (fact_table or "").strip()
+    column = (fact_date_column or "").strip()
+    if not name or not column:
+        raise HTTPException(
+            status_code=422,
+            detail="fact_table and fact_date_column are required.",
+        )
+
+    tables = (
+        await db.execute(
+            select(ModelTable).where(
+                ModelTable.model_id == model_id,
+                ModelTable.source_id == source_id,
+            )
+        )
+    ).scalars().all()
+
+    def _leaf(value: str) -> str:
+        return value.split(".")[-1].strip('"`[]').lower()
+
+    wanted = name.lower()
+    wanted_leaf = _leaf(name)
+    table = next(
+        (t for t in tables if (t.physical_name or "").lower() == wanted),
+        None,
+    )
+    if table is None:
+        table = next(
+            (t for t in tables if _leaf(t.physical_name or "") == wanted_leaf),
+            None,
+        )
+    if table is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"fact_table {fact_table!r} is not a table of this model on "
+                "this source. Coverage can only be checked against tables the "
+                "model already contains."
+            ),
+        )
+
+    columns = (
+        await db.execute(
+            select(ModelColumn.column_name).where(
+                ModelColumn.model_table_id == table.id
+            )
+        )
+    ).scalars().all()
+    match = next(
+        (c for c in columns if (c or "").lower() == column.lower()), None,
+    )
+    if match is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"fact_date_column {fact_date_column!r} is not a column of "
+                f"{table.physical_name!r} in this model. Coverage can only be "
+                "checked against columns the model already contains."
+            ),
+        )
+    return table, match
+
+
 @router.get(
     "/{calendar_id}/coverage",
     response_model=CalendarCoverageResponse,
-    dependencies=[require_role("viewer")],
+    # Bug-9900 (rule-4 wave 0b): modelling surface, not a data surface.
+    dependencies=[require_role(COVERAGE_MIN_ROLE)],
 )
 async def check_calendar_coverage(
     request: Request,
@@ -1901,6 +1999,12 @@ async def check_calendar_coverage(
     it returns ``covered=False`` with a human-readable ``warning`` when fact
     rows fall outside the calendar range so the UI can alert before those rows
     silently drop to NULL period values in a LEFT JOIN.
+
+    Bug-9900: ``/introspect/batch`` applies NO persona, NO CLS and NO RLS, so
+    this route is gated at modeller-or-above (``COVERAGE_MIN_ROLE``), and
+    ``fact_table`` / ``fact_date_column`` are resolved against the model's own
+    tables and columns — a name that is not part of the model is refused (422)
+    rather than probed. Do NOT lower either guard.
     """
     from shared.schemas.connection_type import normalize_connection_type
 
@@ -1920,13 +2024,26 @@ async def check_calendar_coverage(
                 ),
             )
 
+        # Bug-9900: resolve the fact table and date column against the model's
+        # own definition. The SQL below is built from the STORED physical
+        # name and column name, never from the request strings.
+        fact_model_table, fact_column = await _resolve_model_bound_fact(
+            db,
+            model_id=model_id,
+            source_id=source_id,
+            fact_table=fact_table,
+            fact_date_column=fact_date_column,
+        )
+
         connector = normalize_connection_type((connection.connection_type or "").lower())
         cal_qualified = cal.table_name  # already source-qualified at bind time
-        fact_qualified = qualify_physical_name(fact_table, connection, source)
+        fact_qualified = qualify_physical_name(
+            fact_model_table.physical_name, connection, source,
+        )
 
         queries = [
             ("cal", _build_minmax_sql(connector, table_name=cal_qualified, date_col=cal.date_column)),
-            ("fact", _build_minmax_sql(connector, table_name=fact_qualified, date_col=fact_date_column)),
+            ("fact", _build_minmax_sql(connector, table_name=fact_qualified, date_col=fact_column)),
         ]
         results = await _introspect_batch_via_router(str(model_id), queries, bearer)
 

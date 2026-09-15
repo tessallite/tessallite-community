@@ -277,3 +277,118 @@ async def test_telemetry_success_still_logged():
         )
 
     mock_log_miss.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["hierarchy_preview", "maintenance"])
+async def test_maintenance_success_is_kept_in_query_log_but_not_workload(client_kind):
+    """Maintenance-origin source success remains observable without creating
+    automatic aggregate demand."""
+    from src.api.routes import record_query_success
+
+    bound = _make_bound()
+    decision = SimpleNamespace(
+        route_type="source", reason="no_aggregate", aggregate_id=None,
+        pocket_id=None, rewritten_query="SELECT ...",
+        aggregate_skipped_reasons=None,
+    )
+    mock_log_miss = AsyncMock()
+    with patch("src.api.routes.log_query", AsyncMock()) as query_history, \
+         patch("src.api.routes.log_query_miss", mock_log_miss), \
+         patch("src.api.routes.audit", AsyncMock()):
+        await record_query_success(
+            AsyncMock(), bound=bound, decision=decision, elapsed_ms=10,
+            rows_returned=1, bytes_processed=10, user_identity="system",
+            tenant_id="tenant", client_kind=client_kind,
+        )
+    mock_log_miss.assert_not_called()
+
+    query_history.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", [None, "kpi", "plugin"])
+async def test_user_and_scheduled_report_success_remain_workload_eligible(client_kind):
+    from src.api.routes import record_query_success
+
+    bound = _make_bound()
+    decision = SimpleNamespace(
+        route_type="source", reason="no_aggregate", aggregate_id=None,
+        pocket_id=None, rewritten_query="SELECT ...",
+        aggregate_skipped_reasons=None,
+    )
+    mock_log_miss = AsyncMock()
+    with patch("src.api.routes.log_query", AsyncMock()), \
+         patch("src.api.routes.log_query_miss", mock_log_miss), \
+         patch("src.api.routes.audit", AsyncMock()):
+        await record_query_success(
+            AsyncMock(), bound=bound, decision=decision, elapsed_ms=10,
+            rows_returned=1, bytes_processed=10, user_identity="app",
+            tenant_id="tenant", client_kind=client_kind,
+        )
+    mock_log_miss.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", ["binding_error", "execution_error"])
+async def test_invalid_or_failed_query_is_error_history_without_demand(error_type):
+    """Binding and source failures remain visible in QueryLog but cannot
+    enter the successful-demand miss-log path."""
+    from src.logging.query_logger import log_query_failure
+
+    class _FailureDB:
+        def __init__(self):
+            self.rows = []
+
+        def add(self, row):
+            self.rows.append(row)
+
+        async def commit(self):
+            return None
+
+    db = _FailureDB()
+    row = await log_query_failure(
+        db, bound_query=None, decision=None, execution_ms=4,
+        user_identity="app", error_type=error_type,
+        error_detail="request failed", raw_query_override="SELECT bad FROM model",
+        protocol_override="jdbc",
+    )
+    assert row.status == "error"
+    assert row in db.rows
+    assert not any(type(item).__name__ == "QueryMissLog" for item in db.rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_only", [True, False])
+async def test_query_local_operands_are_not_buildable_model_measures(query_only):
+    from shared.miss_reason_taxonomy import classify_reason, INELIGIBLE
+    bound = _make_bound(measures=["event_type"])
+    bound.resolved_measures[0].is_query_only = query_only
+    db = _UpsertFakeDB()
+    await log_query_miss(db, bound, "no_aggregate")
+    values = db.executed_stmts[0].compile().params
+    assert values["model_id"] == bound.model.id
+    assert values["requested_measures"] == ["event_type"]
+    reason = values["miss_reason"]
+    assert reason == ("aggregate_skip:query_only_measure" if query_only else "no_aggregate")
+    assert (classify_reason(reason) == INELIGIBLE) is query_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind,credited", [(None, True), ("hierarchy_preview", False), ("maintenance", False)])
+async def test_bug10013_pocket_usage_counts_only_report_demand(client_kind, credited):
+    from src.logging.query_logger import log_query
+    from shared.db.models import QueryLog
+    bound = _make_bound()
+    decision = SimpleNamespace(route_type="pocket", pocket_id=str(uuid.uuid4()),
+        aggregate_id=None, reason="match", rewritten_query="SELECT region FROM pocket")
+    db = AsyncMock()
+    db.add = MagicMock()
+    with patch("src.logging.query_logger._source_baseline_ms", AsyncMock(return_value=100)):
+        await log_query(db, bound, decision, execution_ms=10, rows_returned=1,
+            bytes_processed=10, client_kind=client_kind)
+    assert any(isinstance(call.args[0], QueryLog) for call in db.add.call_args_list)
+    assert db.execute.await_count == int(credited)
+    if credited:
+        params = db.execute.call_args.args[0].compile().params
+        assert 90 in params.values()

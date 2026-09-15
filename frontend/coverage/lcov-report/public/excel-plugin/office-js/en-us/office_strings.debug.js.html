@@ -1,0 +1,739 @@
+
+<!doctype html>
+<html lang="en">
+
+<head>
+    <title>Code coverage report for public/excel-plugin/office-js/en-us/office_strings.debug.js</title>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="../../../../prettify.css" />
+    <link rel="stylesheet" href="../../../../base.css" />
+    <link rel="shortcut icon" type="image/x-icon" href="../../../../favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style type='text/css'>
+        .coverage-summary .sorter {
+            background-image: url(../../../../sort-arrow-sprite.png);
+        }
+    </style>
+</head>
+    
+<body>
+<div class='wrapper'>
+    <div class='pad1'>
+        <h1><a href="../../../../index.html">All files</a> / <a href="index.html">public/excel-plugin/office-js/en-us</a> office_strings.debug.js</h1>
+        <div class='clearfix'>
+            
+            <div class='fl pad1y space-right2'>
+                <span class="strong">0% </span>
+                <span class="quiet">Statements</span>
+                <span class='fraction'>0/217</span>
+            </div>
+        
+            
+            <div class='fl pad1y space-right2'>
+                <span class="strong">0% </span>
+                <span class="quiet">Branches</span>
+                <span class='fraction'>0/1</span>
+            </div>
+        
+            
+            <div class='fl pad1y space-right2'>
+                <span class="strong">0% </span>
+                <span class="quiet">Functions</span>
+                <span class='fraction'>0/1</span>
+            </div>
+        
+            
+            <div class='fl pad1y space-right2'>
+                <span class="strong">0% </span>
+                <span class="quiet">Lines</span>
+                <span class='fraction'>0/217</span>
+            </div>
+        
+            
+        </div>
+        <p class="quiet">
+            Press <em>n</em> or <em>j</em> to go to the next uncovered block, <em>b</em>, <em>p</em> or <em>k</em> for the previous block.
+        </p>
+        <template id="filterTemplate">
+            <div class="quiet">
+                Filter:
+                <input type="search" id="fileSearch">
+            </div>
+        </template>
+    </div>
+    <div class='status-line low'></div>
+    <pre><table class="coverage">
+<tr><td class="line-count quiet"><a name='L1'></a><a href='#L1'>1</a>
+<a name='L2'></a><a href='#L2'>2</a>
+<a name='L3'></a><a href='#L3'>3</a>
+<a name='L4'></a><a href='#L4'>4</a>
+<a name='L5'></a><a href='#L5'>5</a>
+<a name='L6'></a><a href='#L6'>6</a>
+<a name='L7'></a><a href='#L7'>7</a>
+<a name='L8'></a><a href='#L8'>8</a>
+<a name='L9'></a><a href='#L9'>9</a>
+<a name='L10'></a><a href='#L10'>10</a>
+<a name='L11'></a><a href='#L11'>11</a>
+<a name='L12'></a><a href='#L12'>12</a>
+<a name='L13'></a><a href='#L13'>13</a>
+<a name='L14'></a><a href='#L14'>14</a>
+<a name='L15'></a><a href='#L15'>15</a>
+<a name='L16'></a><a href='#L16'>16</a>
+<a name='L17'></a><a href='#L17'>17</a>
+<a name='L18'></a><a href='#L18'>18</a>
+<a name='L19'></a><a href='#L19'>19</a>
+<a name='L20'></a><a href='#L20'>20</a>
+<a name='L21'></a><a href='#L21'>21</a>
+<a name='L22'></a><a href='#L22'>22</a>
+<a name='L23'></a><a href='#L23'>23</a>
+<a name='L24'></a><a href='#L24'>24</a>
+<a name='L25'></a><a href='#L25'>25</a>
+<a name='L26'></a><a href='#L26'>26</a>
+<a name='L27'></a><a href='#L27'>27</a>
+<a name='L28'></a><a href='#L28'>28</a>
+<a name='L29'></a><a href='#L29'>29</a>
+<a name='L30'></a><a href='#L30'>30</a>
+<a name='L31'></a><a href='#L31'>31</a>
+<a name='L32'></a><a href='#L32'>32</a>
+<a name='L33'></a><a href='#L33'>33</a>
+<a name='L34'></a><a href='#L34'>34</a>
+<a name='L35'></a><a href='#L35'>35</a>
+<a name='L36'></a><a href='#L36'>36</a>
+<a name='L37'></a><a href='#L37'>37</a>
+<a name='L38'></a><a href='#L38'>38</a>
+<a name='L39'></a><a href='#L39'>39</a>
+<a name='L40'></a><a href='#L40'>40</a>
+<a name='L41'></a><a href='#L41'>41</a>
+<a name='L42'></a><a href='#L42'>42</a>
+<a name='L43'></a><a href='#L43'>43</a>
+<a name='L44'></a><a href='#L44'>44</a>
+<a name='L45'></a><a href='#L45'>45</a>
+<a name='L46'></a><a href='#L46'>46</a>
+<a name='L47'></a><a href='#L47'>47</a>
+<a name='L48'></a><a href='#L48'>48</a>
+<a name='L49'></a><a href='#L49'>49</a>
+<a name='L50'></a><a href='#L50'>50</a>
+<a name='L51'></a><a href='#L51'>51</a>
+<a name='L52'></a><a href='#L52'>52</a>
+<a name='L53'></a><a href='#L53'>53</a>
+<a name='L54'></a><a href='#L54'>54</a>
+<a name='L55'></a><a href='#L55'>55</a>
+<a name='L56'></a><a href='#L56'>56</a>
+<a name='L57'></a><a href='#L57'>57</a>
+<a name='L58'></a><a href='#L58'>58</a>
+<a name='L59'></a><a href='#L59'>59</a>
+<a name='L60'></a><a href='#L60'>60</a>
+<a name='L61'></a><a href='#L61'>61</a>
+<a name='L62'></a><a href='#L62'>62</a>
+<a name='L63'></a><a href='#L63'>63</a>
+<a name='L64'></a><a href='#L64'>64</a>
+<a name='L65'></a><a href='#L65'>65</a>
+<a name='L66'></a><a href='#L66'>66</a>
+<a name='L67'></a><a href='#L67'>67</a>
+<a name='L68'></a><a href='#L68'>68</a>
+<a name='L69'></a><a href='#L69'>69</a>
+<a name='L70'></a><a href='#L70'>70</a>
+<a name='L71'></a><a href='#L71'>71</a>
+<a name='L72'></a><a href='#L72'>72</a>
+<a name='L73'></a><a href='#L73'>73</a>
+<a name='L74'></a><a href='#L74'>74</a>
+<a name='L75'></a><a href='#L75'>75</a>
+<a name='L76'></a><a href='#L76'>76</a>
+<a name='L77'></a><a href='#L77'>77</a>
+<a name='L78'></a><a href='#L78'>78</a>
+<a name='L79'></a><a href='#L79'>79</a>
+<a name='L80'></a><a href='#L80'>80</a>
+<a name='L81'></a><a href='#L81'>81</a>
+<a name='L82'></a><a href='#L82'>82</a>
+<a name='L83'></a><a href='#L83'>83</a>
+<a name='L84'></a><a href='#L84'>84</a>
+<a name='L85'></a><a href='#L85'>85</a>
+<a name='L86'></a><a href='#L86'>86</a>
+<a name='L87'></a><a href='#L87'>87</a>
+<a name='L88'></a><a href='#L88'>88</a>
+<a name='L89'></a><a href='#L89'>89</a>
+<a name='L90'></a><a href='#L90'>90</a>
+<a name='L91'></a><a href='#L91'>91</a>
+<a name='L92'></a><a href='#L92'>92</a>
+<a name='L93'></a><a href='#L93'>93</a>
+<a name='L94'></a><a href='#L94'>94</a>
+<a name='L95'></a><a href='#L95'>95</a>
+<a name='L96'></a><a href='#L96'>96</a>
+<a name='L97'></a><a href='#L97'>97</a>
+<a name='L98'></a><a href='#L98'>98</a>
+<a name='L99'></a><a href='#L99'>99</a>
+<a name='L100'></a><a href='#L100'>100</a>
+<a name='L101'></a><a href='#L101'>101</a>
+<a name='L102'></a><a href='#L102'>102</a>
+<a name='L103'></a><a href='#L103'>103</a>
+<a name='L104'></a><a href='#L104'>104</a>
+<a name='L105'></a><a href='#L105'>105</a>
+<a name='L106'></a><a href='#L106'>106</a>
+<a name='L107'></a><a href='#L107'>107</a>
+<a name='L108'></a><a href='#L108'>108</a>
+<a name='L109'></a><a href='#L109'>109</a>
+<a name='L110'></a><a href='#L110'>110</a>
+<a name='L111'></a><a href='#L111'>111</a>
+<a name='L112'></a><a href='#L112'>112</a>
+<a name='L113'></a><a href='#L113'>113</a>
+<a name='L114'></a><a href='#L114'>114</a>
+<a name='L115'></a><a href='#L115'>115</a>
+<a name='L116'></a><a href='#L116'>116</a>
+<a name='L117'></a><a href='#L117'>117</a>
+<a name='L118'></a><a href='#L118'>118</a>
+<a name='L119'></a><a href='#L119'>119</a>
+<a name='L120'></a><a href='#L120'>120</a>
+<a name='L121'></a><a href='#L121'>121</a>
+<a name='L122'></a><a href='#L122'>122</a>
+<a name='L123'></a><a href='#L123'>123</a>
+<a name='L124'></a><a href='#L124'>124</a>
+<a name='L125'></a><a href='#L125'>125</a>
+<a name='L126'></a><a href='#L126'>126</a>
+<a name='L127'></a><a href='#L127'>127</a>
+<a name='L128'></a><a href='#L128'>128</a>
+<a name='L129'></a><a href='#L129'>129</a>
+<a name='L130'></a><a href='#L130'>130</a>
+<a name='L131'></a><a href='#L131'>131</a>
+<a name='L132'></a><a href='#L132'>132</a>
+<a name='L133'></a><a href='#L133'>133</a>
+<a name='L134'></a><a href='#L134'>134</a>
+<a name='L135'></a><a href='#L135'>135</a>
+<a name='L136'></a><a href='#L136'>136</a>
+<a name='L137'></a><a href='#L137'>137</a>
+<a name='L138'></a><a href='#L138'>138</a>
+<a name='L139'></a><a href='#L139'>139</a>
+<a name='L140'></a><a href='#L140'>140</a>
+<a name='L141'></a><a href='#L141'>141</a>
+<a name='L142'></a><a href='#L142'>142</a>
+<a name='L143'></a><a href='#L143'>143</a>
+<a name='L144'></a><a href='#L144'>144</a>
+<a name='L145'></a><a href='#L145'>145</a>
+<a name='L146'></a><a href='#L146'>146</a>
+<a name='L147'></a><a href='#L147'>147</a>
+<a name='L148'></a><a href='#L148'>148</a>
+<a name='L149'></a><a href='#L149'>149</a>
+<a name='L150'></a><a href='#L150'>150</a>
+<a name='L151'></a><a href='#L151'>151</a>
+<a name='L152'></a><a href='#L152'>152</a>
+<a name='L153'></a><a href='#L153'>153</a>
+<a name='L154'></a><a href='#L154'>154</a>
+<a name='L155'></a><a href='#L155'>155</a>
+<a name='L156'></a><a href='#L156'>156</a>
+<a name='L157'></a><a href='#L157'>157</a>
+<a name='L158'></a><a href='#L158'>158</a>
+<a name='L159'></a><a href='#L159'>159</a>
+<a name='L160'></a><a href='#L160'>160</a>
+<a name='L161'></a><a href='#L161'>161</a>
+<a name='L162'></a><a href='#L162'>162</a>
+<a name='L163'></a><a href='#L163'>163</a>
+<a name='L164'></a><a href='#L164'>164</a>
+<a name='L165'></a><a href='#L165'>165</a>
+<a name='L166'></a><a href='#L166'>166</a>
+<a name='L167'></a><a href='#L167'>167</a>
+<a name='L168'></a><a href='#L168'>168</a>
+<a name='L169'></a><a href='#L169'>169</a>
+<a name='L170'></a><a href='#L170'>170</a>
+<a name='L171'></a><a href='#L171'>171</a>
+<a name='L172'></a><a href='#L172'>172</a>
+<a name='L173'></a><a href='#L173'>173</a>
+<a name='L174'></a><a href='#L174'>174</a>
+<a name='L175'></a><a href='#L175'>175</a>
+<a name='L176'></a><a href='#L176'>176</a>
+<a name='L177'></a><a href='#L177'>177</a>
+<a name='L178'></a><a href='#L178'>178</a>
+<a name='L179'></a><a href='#L179'>179</a>
+<a name='L180'></a><a href='#L180'>180</a>
+<a name='L181'></a><a href='#L181'>181</a>
+<a name='L182'></a><a href='#L182'>182</a>
+<a name='L183'></a><a href='#L183'>183</a>
+<a name='L184'></a><a href='#L184'>184</a>
+<a name='L185'></a><a href='#L185'>185</a>
+<a name='L186'></a><a href='#L186'>186</a>
+<a name='L187'></a><a href='#L187'>187</a>
+<a name='L188'></a><a href='#L188'>188</a>
+<a name='L189'></a><a href='#L189'>189</a>
+<a name='L190'></a><a href='#L190'>190</a>
+<a name='L191'></a><a href='#L191'>191</a>
+<a name='L192'></a><a href='#L192'>192</a>
+<a name='L193'></a><a href='#L193'>193</a>
+<a name='L194'></a><a href='#L194'>194</a>
+<a name='L195'></a><a href='#L195'>195</a>
+<a name='L196'></a><a href='#L196'>196</a>
+<a name='L197'></a><a href='#L197'>197</a>
+<a name='L198'></a><a href='#L198'>198</a>
+<a name='L199'></a><a href='#L199'>199</a>
+<a name='L200'></a><a href='#L200'>200</a>
+<a name='L201'></a><a href='#L201'>201</a>
+<a name='L202'></a><a href='#L202'>202</a>
+<a name='L203'></a><a href='#L203'>203</a>
+<a name='L204'></a><a href='#L204'>204</a>
+<a name='L205'></a><a href='#L205'>205</a>
+<a name='L206'></a><a href='#L206'>206</a>
+<a name='L207'></a><a href='#L207'>207</a>
+<a name='L208'></a><a href='#L208'>208</a>
+<a name='L209'></a><a href='#L209'>209</a>
+<a name='L210'></a><a href='#L210'>210</a>
+<a name='L211'></a><a href='#L211'>211</a>
+<a name='L212'></a><a href='#L212'>212</a>
+<a name='L213'></a><a href='#L213'>213</a>
+<a name='L214'></a><a href='#L214'>214</a>
+<a name='L215'></a><a href='#L215'>215</a>
+<a name='L216'></a><a href='#L216'>216</a>
+<a name='L217'></a><a href='#L217'>217</a>
+<a name='L218'></a><a href='#L218'>218</a>
+<a name='L219'></a><a href='#L219'>219</a></td><td class="line-coverage quiet"><span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-neutral">&nbsp;</span>
+<span class="cline-any cline-neutral">&nbsp;</span></td><td class="text"><pre class="prettyprint lang-js"><span class="cstat-no" title="statement not covered" >if (window.Type &amp;&amp; window.Type.registerNamespace) {<span class="fstat-no" title="function not covered" ><span class="branch-0 cbranch-no" title="branch not covered" ></span></span></span>
+<span class="cstat-no" title="statement not covered" >Type.registerNamespace('Strings');} else {</span>
+<span class="cstat-no" title="statement not covered" >if(typeof(window['Strings']) == 'undefined') {</span>
+<span class="cstat-no" title="statement not covered" >window['Strings'] = new Object(); window['Strings']. __namespace = true;</span>
+<span class="cstat-no" title="statement not covered" >}</span>
+<span class="cstat-no" title="statement not covered" ></span>
+<span class="cstat-no" title="statement not covered" >}</span>
+<span class="cstat-no" title="statement not covered" ></span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM=function Strings_OfficeOM() {</span>
+<span class="cstat-no" title="statement not covered" >}</span>
+<span class="cstat-no" title="statement not covered" >if (Strings.OfficeOM.registerClass) Strings.OfficeOM.registerClass('Strings.OfficeOM');</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_APICallFailed='API Call Failed';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_APINotSupported='API Not Supported';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ActivityLimitReached='Activity limit has been reached.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_AddBindingFromPromptDefaultText='Please make a selection.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_AddinIsAlreadyRequestingToken='Add-in is already requesting an access token.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_AddinIsAlreadyRequestingTokenMessage='The operation failed because this add-in is already requesting an access token.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ApiNotFoundDetails='The method or property {0} is part of the {1} requirement set, which is not available in your version of {2}.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_AppNameNotExist='Add-in Name for {0} doesn\'t exist.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_AppNotExistInitializeNotCalled='Application {0} does not exist. Microsoft.Office.WebExtension.initialize(reason) is not called.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_AttemptingToSetReadOnlyProperty='Attempting to set read-only property \'{0}\'.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_BadSelectorString='The string passed into the selector is improperly formatted or unsupported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_BindingCreationError='Binding Creation Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_BindingNotExist='The specified binding does not exist.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_BindingToMultipleSelection='Noncontiguous selections are not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_BrowserAPINotSupported='This browser does not support the requested API.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CallbackNotAFunction='Callback must be of type function, was of type {0}.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CancelButton='Cancel';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CannotApplyPropertyThroughSetMethod='Changes to property \'{0}\' cannot be applied through an \"object.set\" method.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CannotNavigateTo='The object is located in a place where navigation is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CannotRegisterEvent='The event handler cannot be registered.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CannotWriteToSelection='Cannot write to the current selection.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CellDataAmountBeyondLimits='Note: The number of cells in a table is suggested to be below 20,000 cells.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CellFormatAmountBeyondLimits='Note: The formatting sets set by a Formatting API call is suggested to be below 100.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CloseFileBeforeRetrieve='Call closeAsync on the current File before retrieving another.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CoercionTypeNotMatchBinding='The specified coercion type is not compatible with this binding type.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CoercionTypeNotSupported='The specified coercion type is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ColIndexOutOfRange='The column index value is out of the allowed range. Use a value (0 or higher) that\'s less than the number of columns.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConfirmCancelMessage='Sorry, we can\'t continue.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConfirmDialog='The domain {0} is acting as Microsoft Office and can run Office add-ins, which may access your personal data. If you trust the domain to run as Office and access your data, click OK to continue.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConfirmDialogApiTrustsParent='You are about to send and receive potentially sensitive information from {0}. Only click OK if you trust the following website recieving the sensitive information: {1}.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConfirmDialogConsent='By clicking OK, you will allow {0} access to your content and personal information. ';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConfirmDialogConsentTitle='One moment ...';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConfirmRefreshMessage='To continue, remove the add-in and add it again, or refresh the page.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConnectionFailureWithDetails='The request failed with status code of {0}, error code {1} and the following error message: {2}';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ConnectionFailureWithStatus='The request failed with status code of {0}.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ContinueButton='Continue';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomFunctionDefinitionMissing='A property with this name that represents the function\'s definition must exist on Excel.Script.CustomFunctions.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomFunctionImplementationMissing='The property with this name on Excel.Script.CustomFunctions that represents the function\'s definition must contain a \'call\' property that implements the function.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomFunctionNameCannotSplit='The function name must contain a non-empty namespace and a non-empty short name.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomFunctionNameContainsBadChars='The function name may only contain letters, digits, underscores, and periods.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomXmlError='Custom XML Error.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomXmlExceedQuotaMessage='XPath limits selection to 1024 items.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomXmlExceedQuotaName='Selection Limit Reached';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomXmlNodeNotFound='The specified node was not found.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomXmlOutOfDateMessage='The data is out of date. Retrieve the object again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_CustomXmlOutOfDateName='Data Not Current';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataNotMatchBindingSize='The supplied data object does not match the size of the current selection.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataNotMatchBindingType='The specified data object is not compatible with the binding type.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataNotMatchCoercionType='The type of the specified data object is not compatible with the current selection.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataNotMatchSelection='The supplied data object is not compatible with the shape or dimensions of the current selection.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataReadError='Data Read Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataStale='Data Not Current';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataWriteError='Data Write Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DataWriteReminder='Data Write Reminder';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogAddressNotTrusted='The domain of the URL is not included in the AppDomains element in the manifest, and is not subdomain of source location.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogAlreadyOpened='The operation failed because this add-in already has an active dialog.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogInvalidScheme='The URL scheme is not supported. Use HTTPS instead.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogNavigateError='Dialog Navigation Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogOK='OK';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogParentIsMinimized='The operation failed because parent window is minimized.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DialogRequireHTTPS='The HTTP protocol is not supported. Use HTTPS instead';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DisplayDialogError='Display Dialog Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DocumentIsInactive='The operation failed because the document containing this add-in is inactive.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_DocumentReadOnly='The requested operation is not allowed on the current document mode.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ElementMissing='We couldn\'t format the table cell because some parameter values are missing. Double-check the parameters and try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_EventHandlerAdditionFailed='Failed to add the event handler.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_EventHandlerNotExist='The specified event handler was not found for this binding.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_EventHandlerRemovalFailed='Failed to remove the event handler.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_EventRegistrationError='Event Registration Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_FileTypeNotSupported='The specified file type is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_FormatValueOutOfRange='The value is out of the allowed range.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_FormattingReminder='Formatting Reminder';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_FunctionCallFailed='Function {0} call failed, error code: {1}.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_GetDataIsTooLarge='The requested data set is too large.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_GetDataParametersConflict='The specified parameters conflict.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_GetSelectionNotSupported='The current selection is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_HostError='Host Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ImplicitGetAuthContextMissing='The function to get authentication context is missing';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ImplicitNotLoaded='The module is not loaded before acquire a token';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InValidOptionalArgument='invalid optional argument';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_IndexOutOfRange='Index out of range.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InitializeNotReady='Office.js has not been fully loaded yet. Please try again later or make sure to add your initialization code on the Office.initialize function.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InternalError='Internal Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InternalErrorDescription='An internal error has occurred.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidAPICall='Invalid API Call';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidApiArgumentsMessage='Invalid input arguments.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidApiCallInContext='Invalid API call in the current context.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidArgument='The argument \'{0}\' doesn\'t work for this situation, is missing, or isn\'t in the right format.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidArgumentGeneric='The argument(s) passed into the function don\'t work for this situation, are missing, or aren\'t in the right format.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidBinding='Invalid Binding';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidBindingError='Invalid Binding Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidBindingOperation='Invalid Binding Operation';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidCellsValue='One or more of the cells parameters have values that aren\'t allowed. Double-check the values and try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidCoercion='Invalid Coercion Type';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidColumnsForBinding='The specified columns are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidDataFormat='The format of the specified data object is invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidDataObject='Invalid Data Object';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidFormat='Invalid Format Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidFormatValue='One or more of the format parameters have values that aren\'t allowed. Double-check the values and try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidGetColumns='The specified columns are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidGetRowColumnCounts='The specified rowCount or columnCount values are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidGetRows='The specified rows are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidGetStartRowColumn='The specified startRow or startColumn values are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidGrant='Preauthorization missing.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidGrantMessage='Missing grant for this add-in.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidNamedItemForBindingType='The specified binding type is not compatible with the supplied named item.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidNode='Invalid Node';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidObjectPath='The object path \'{0}\' isn\'t working for what you\'re trying to do. If you\'re using the object across multiple \"context.sync\" calls and outside the sequential execution of a \".run\" batch, please use the \"context.trackedObjects.add()\" and \"context.trackedObjects.remove()\" methods to manage the object\'s lifetime.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidOperationInCellEditMode='Excel is in cell-editing mode. Please exit the edit mode by pressing ENTER or TAB or selecting another cell, and then try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidOrTimedOutSession='Invalid Or Timed Out Session';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidOrTimedOutSessionMessage='Your Office session has expired or is invalid. To continue, refresh the page.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidParameters='Function {0} has invalid parameters.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidReadForBlankRow='The specified row is blank.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidRequestContext='Cannot use the object across different request contexts.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidResourceUrl='Invalid application resource Url provided.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidResourceUrlMessage='Invalid resource Url specified in the manifest.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidSSOAddinMessage='The identity API is not supported for this add-in.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidSelectionForBindingType='A binding cannot be created with the current selection and the specified binding type.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidSetColumns='The specified columns are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidSetRows='The specified rows are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidSetStartRowColumn='The specified startRow or startColumn values are invalid.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidTableOptionValue='One or more of the tableOptions parameters have values that aren\'t allowed. Double-check the values and try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_InvalidValue='Invalid Value';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_MemoryLimit='Memory Limit Exceeded';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_MissingParameter='Missing Parameter';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_MissingRequiredArguments='missing some required arguments';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ModalDialogOpeng='The operation failed because this add-in already has an active modal dialog.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_MultipleNamedItemFound='Multiple objects with the same name were found.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NamedItemNotFound='The named item does not exist.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NavOutOfBound='The operation failed because the index is out of range.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NetworkProblem='Network Problem';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NetworkProblemRetrieveFile='A network problem has prevented retrieval of the file.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NewWindowCrossZone='The security settings in your browser prevent us from creating a dialog box. Try a different browser, or {0} so that \'{1}\' and the domain shown in your address bar are in the same security zone.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NewWindowCrossZoneConfigureBrowserLink='configure your browser';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NewWindowCrossZoneErrorString='Browser restrictions prevented us from creating the dialog box. The domain of dialog box and the domain of the add-in host are not in the same security zone.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NoCapability='You don\'t have sufficient permissions for this action.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NoHttpsWAC='This Office session is not using a secure connection. We recommend that you take extra precautions.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NonUniformPartialGetNotSupported='Coordinate parameters cannot be used with coercion type Table when the table contains merged cells.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NonUniformPartialSetNotSupported='Coordinate parameters cannot be used with coercion type Table when the table contains merged cells.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NotImplemented='Function {0} is not implemented.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NotSupported='Function {0} is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NotSupportedBindingType='The specified binding type {0} is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NotSupportedEventType='The specified event type {0} is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_NotTrustedWAC='This add-in has been disabled to help keep you safe. To continue using the add-in, validate that this item is hosted in a trusted domain or open it in the Office desktop app.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OKButton='OK';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OperationCancelledError='Operation Cancelled';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OperationCancelledErrorMessage='The operation was cancelled by the user.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OperationNotSupported='The operation is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OperationNotSupportedOnMatrixData='Selected content needs to be in table format. Format the data as a table and try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OperationNotSupportedOnThisBindingType='Operation is not supported on this binding type.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OsfControlTypeNotSupported='OsfControl type not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OutOfRange='Out of Range';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_OverwriteWorksheetData='The set operation failed because the supplied data object will overwrite or shift data.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_PermissionDenied='Permission Denied';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_PropertyDoesNotExist='Property \'{0}\' does not exist on the object.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_PropertyNotLoaded='The property \'{0}\' is not available. Before reading the property\'s value, call the load method on the containing object and call \"context.sync()\" on the associated request context.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ReadSettingsError='Read Settings Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_RedundantCallbackSpecification='Callback cannot be specified both in argument list and in optional object.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_RequestPayloadSizeLimitExceededMessage='The request payload size has exceeded the limit. Please refer to the documentation: \"https://docs.microsoft.com/office/dev/add-ins/concepts/resource-limits-and-performance-optimization#excel-add-ins\".';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_RequestTimeout='The call took too long to execute.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_RequestTokenUnavailable='This API has been throttled to slow the call frequency.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ResponsePayloadSizeLimitExceededMessage='The response payload size has exceeded the limit. Please refer to the documentation: \"https://docs.microsoft.com/office/dev/add-ins/concepts/resource-limits-and-performance-optimization#excel-add-ins\".';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_RowIndexOutOfRange='The row index value is out of the allowed range. Use a value (0 or higher) that\'s less than the number of rows.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_RunMustReturnPromise='The batch function passed to the \".run\" method didn\'t return a promise. The function must return a promise, so that any automatically-tracked objects can be released at the completion of the batch operation. Typically, you return a promise by returning the response from \"context.sync()\".';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOClientError='Error occurred in the authentication request from Office.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOClientErrorMessage='An unexpected error occurred in the client.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOConnectionLostError='A connection was lost during the sign in process.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOConnectionLostErrorMessage='A connection was lost during the sign in process, and the user may not be signed in. This was likely due to the user\'s browser configuration settings, such as security zones.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOServerError='Error occurred in the authentication provider.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOServerErrorMessage='An unexpected error occurred on the server.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOUnsupportedPlatform='API is not supported in this platform.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOUserConsentNotSupportedByCurrentAddinCategory='This add-in does not support user consent.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SSOUserConsentNotSupportedByCurrentAddinCategoryMessage='The operation failed because this add-in does not support user consent in this category';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SaveSettingsError='Save Settings Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SelectionCannotBound='Cannot bind to the current selection.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SelectionNotSupportCoercionType='The current selection is not compatible with the specified coercion type.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SetDataIsTooLarge='The specified data object is too large.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SetDataParametersConflict='The specified parameters conflict.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SettingNameNotExist='The specified setting name does not exist.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SettingsAreStale='Settings could not be saved because they are not current.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SettingsCannotSave='The settings could not be saved.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SettingsStaleError='Settings Stale Error';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ShowWindowDialogNotification='{0} wants to display a new window.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ShowWindowDialogNotificationAllow='Allow';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ShowWindowDialogNotificationIgnore='Ignore';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ShuttingDown='Operation failed because the data is not current on the server.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SliceSizeNotSupported='The specified slice size is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_SpecifiedIdNotExist='The specified ID does not exist.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_Timeout='The operation has timed out.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_TooManyArguments='too many arguments';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_TooManyIncompleteRequests='Wait until the previous call completes.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_TooManyOptionalFunction='multiple optional functions in parameter list';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_TooManyOptionalObjects='multiple optional objects in parameter list';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UnknownBindingType='The binding type is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UnsupportedDataObject='The supplied data object type is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UnsupportedEnumeration='Unsupported Enumeration';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UnsupportedEnumerationMessage='The enumeration isn\'t supported in the current host application.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UnsupportedUserIdentity='User identity type is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UnsupportedUserIdentityMessage='The identity type of the user is not supported.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UserAborted='User aborted the consent request.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UserAbortedMessage='The user did not consent the add-in permissions.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UserClickIgnore='The user chose to ignore the dialog box.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_UserNotSignedIn='No user is signed into Office.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_ValueNotLoaded='The value of the result object has not been loaded yet. Before reading the value property, call \"context.sync()\" on the associated request context.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_WorkbookHiddenMessage='The JavaScript API request failed because the workbook was hidden. Please unhide the workbook and try again.';</span>
+<span class="cstat-no" title="statement not covered" >Strings.OfficeOM.L_WriteNotSupportedWhenModalDialogOpen='Write operation is not supported for Office when a modal dialog is open.';</span>
+&nbsp;
+&nbsp;</pre></td></tr></table></pre>
+
+                <div class='push'></div><!-- for sticky footer -->
+            </div><!-- /wrapper -->
+            <div class='footer quiet pad2 space-top1 center small'>
+                Code coverage generated by
+                <a href="https://istanbul.js.org/" target="_blank" rel="noopener noreferrer">istanbul</a>
+                at 2026-08-29T23:22:32.240Z
+            </div>
+        <script src="../../../../prettify.js"></script>
+        <script>
+            window.onload = function () {
+                prettyPrint();
+            };
+        </script>
+        <script src="../../../../sorter.js"></script>
+        <script src="../../../../block-navigation.js"></script>
+    </body>
+</html>
+    

@@ -145,7 +145,7 @@ describe("SchemaDriftSection", () => {
       expect(screen.getByText("customer_id")).toBeInTheDocument();
     });
 
-    const button = screen.getByRole("button");
+    const button = screen.getByRole("button", { name: /Acknowledge —/i });
     fireEvent.click(button);
 
     await waitFor(() => {
@@ -161,4 +161,29 @@ describe("SchemaDriftSection", () => {
       expect(screen.getByText(/Could not load schema drift events/i)).toBeInTheDocument();
     });
   });
+});
+
+it("selects all unacknowledged changes and acknowledges only those", async () => {
+  const second = { ...removedEvent, id: "evt-second" };
+  driftListMock.mockResolvedValue({ items: [removedEvent, addedEventAcked, second], total: 3 });
+  driftAckMock.mockResolvedValue({});
+  renderSection();
+  fireEvent.click(await screen.findByRole("checkbox", { name: "Select all unacknowledged" }));
+  fireEvent.click(screen.getByRole("button", { name: "Acknowledge selected (2)" }));
+  await waitFor(() => expect(driftAckMock).toHaveBeenCalledTimes(2));
+  expect(driftAckMock).toHaveBeenCalledWith("evt-removed");
+  expect(driftAckMock).toHaveBeenCalledWith("evt-second");
+});
+
+it("keeps failed acknowledgements selected for retry and continues the batch", async () => {
+  driftListMock.mockResolvedValue({
+    items: [removedEvent, { ...removedEvent, id: "evt-second" }], total: 2,
+  });
+  driftAckMock.mockRejectedValueOnce(new Error("unavailable")).mockResolvedValue({});
+  renderSection();
+  fireEvent.click(await screen.findByRole("checkbox", { name: "Select all unacknowledged" }));
+  fireEvent.click(screen.getByRole("button", { name: "Acknowledge selected (2)" }));
+  expect(await screen.findByText(/1 changes could not be acknowledged/)).toBeInTheDocument();
+  expect(driftAckMock).toHaveBeenCalledWith("evt-second");
+  expect(screen.getByRole("button", { name: "Acknowledge selected (1)" })).toBeEnabled();
 });

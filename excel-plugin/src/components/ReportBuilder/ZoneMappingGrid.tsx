@@ -16,14 +16,18 @@ import {
   TextField,
   IconButton,
   Tooltip,
+  Menu,
 } from '@mui/material';
 import {
   DeleteSweepOutlined,
+  AccountTreeOutlined,
+  FunctionsOutlined,
   GridViewOutlined,
   InsertChartOutlined,
+  ManageSearchOutlined,
   PivotTableChartOutlined,
+  RefreshOutlined,
   TableChartOutlined,
-  TuneOutlined,
 } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import type { Zone } from '../../types/tessallite';
@@ -64,6 +68,11 @@ export interface ZoneItem {
   memberKeys?: string[];
 }
 
+interface ZoneChipCompatibility {
+  disabled: boolean;
+  messages: string[];
+}
+
 interface ZoneMappingGridProps {
   items: ZoneItem[];
   // Bug-6358: remove is zone-qualified. The same field id can sit in two zones
@@ -82,48 +91,79 @@ interface ZoneMappingGridProps {
     compatibleDimensionNames?: string[];
   } | null;
   insertDisabledReason?: string | null;
+  /** Optional compact toolbar actions owned by ReportBuilder. */
+  onRefreshValues?: () => void;
+  onRefreshSheetData?: () => void;
+  refreshSheetDataLoading?: boolean;
+  onOpenCubeWizard?: () => void;
+  onOpenConnectionWizard?: () => void;
+  onOpenTrace?: () => void;
+  hasLastQuery?: boolean;
+  insertMode?: 'live' | 'static';
+  onInsertModeChange?: (mode: 'live' | 'static') => void;
+  compatibilityByDimensionId?: Record<string, ZoneChipCompatibility>;
 }
 
 function ChipList({
   items,
   onRemove,
   onChipClick,
+  compatibilityByDimensionId,
 }: {
   items: ZoneItem[];
   onRemove: (id: string, zone: Zone) => void;
   onChipClick?: (item: ZoneItem) => void;
+  compatibilityByDimensionId?: Record<string, ZoneChipCompatibility>;
 }) {
   if (items.length === 0) {
     return (
-      <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-        {strings.zone.empty}
+      <Typography sx={{ fontSize: 11, color: '#9a9a9a' }}>
+        —
       </Typography>
     );
   }
 
   return (
-    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, minWidth: 0 }}>
-      {items.map(item => (
-        <Chip
-          key={`${item.zone}:${item.id}`}
-          label={item.operator ? `${item.name} ${item.operator} ${(item.values || []).join(', ') || '...'}` : item.name}
-          size="small"
-          onDelete={() => onRemove(item.id, item.zone)}
-          onClick={() => onChipClick?.(item)}
-          sx={{
-            maxWidth: '100%',
-            fontSize: 11,
-            fontWeight: 600,
-            height: 24,
-            bgcolor: tokens.colorPrimaryBg,
-            color: tokens.colorPrimary,
-            borderRadius: 1,
-            '& .MuiChip-deleteIcon': { fontSize: 14, color: tokens.colorPrimary },
-            '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' },
-            cursor: onChipClick ? 'pointer' : 'default',
-          }}
-        />
-      ))}
+    <Box sx={{ display: 'flex', flexWrap: 'nowrap', gap: 0.5, minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin' }}>
+      {items.map(item => {
+        const compatibility = compatibilityByDimensionId?.[item.bindDimension || item.id];
+        const incompatible = Boolean(compatibility?.disabled);
+        const isFilter = item.zone === 'filters';
+        const chip = (
+          <Chip
+            label={item.operator ? `${item.name} ${item.operator} ${(item.values || []).join(', ') || '...'}` : item.name}
+            size="small"
+            onDelete={() => onRemove(item.id, item.zone)}
+            onClick={() => onChipClick?.(item)}
+            sx={{
+              maxWidth: '100%',
+              fontSize: 11,
+              fontWeight: 600,
+              height: 18,
+              bgcolor: incompatible ? tokens.colorRedBg : isFilter ? tokens.colorPrimaryBg : tokens.colorWhite,
+              color: incompatible ? tokens.colorRed : isFilter ? tokens.colorPrimary : tokens.colorTextSecondary,
+              borderRadius: 0.5,
+              border: incompatible
+                ? `1px solid ${tokens.colorRed}`
+                : isFilter
+                  ? `1px dashed ${tokens.colorPrimary}`
+                  : `1px solid ${tokens.colorBorder}`,
+              flexShrink: 0,
+              whiteSpace: 'nowrap',
+              '& .MuiChip-deleteIcon': { fontSize: 14, color: incompatible ? tokens.colorRed : isFilter ? tokens.colorPrimary : tokens.colorTextSecondary },
+              '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' },
+              cursor: onChipClick ? 'pointer' : 'default',
+            }}
+          />
+        );
+        return incompatible ? (
+          <Tooltip key={`${item.zone}:${item.id}`} title={compatibility?.messages[0] || strings.reportBuilder.incompatibleFields}>
+            <span style={{ display: 'inline-flex', flexShrink: 0, minWidth: 0 }}>{chip}</span>
+          </Tooltip>
+        ) : (
+          <span key={`${item.zone}:${item.id}`} style={{ display: 'inline-flex', flexShrink: 0, minWidth: 0 }}>{chip}</span>
+        );
+      })}
     </Box>
   );
 }
@@ -139,6 +179,16 @@ export default function ZoneMappingGrid({
   onUpdateFilter,
   compatibilityWarning,
   insertDisabledReason,
+  onRefreshValues,
+  onRefreshSheetData,
+  refreshSheetDataLoading = false,
+  onOpenCubeWizard,
+  onOpenConnectionWizard,
+  onOpenTrace,
+  hasLastQuery = false,
+  insertMode,
+  onInsertModeChange,
+  compatibilityByDimensionId,
 }: ZoneMappingGridProps) {
   const filters = items.filter(i => i.zone === 'filters');
   const columns = items.filter(i => i.zone === 'columns');
@@ -153,6 +203,7 @@ export default function ZoneMappingGrid({
   const [editValues, setEditValues] = useState('');
   const [editError, setEditError] = useState<string | null>(null);
   const [editNotice, setEditNotice] = useState<string | null>(null);
+  const [refreshMenuAnchor, setRefreshMenuAnchor] = useState<HTMLElement | null>(null);
 
   const isScalarOperator = editOperator === 'gt' || editOperator === 'lt';
   // Label the scalar input by the dimension's type so the analyst knows what to
@@ -255,146 +306,165 @@ export default function ZoneMappingGrid({
     { label: strings.zone.filtersLabel, hint: strings.zone.filtersHint, zoneItems: filters, editable: true },
   ];
 
+  const toolbarButton = (
+    label: string,
+    icon: React.ReactNode,
+    onClick: (() => void) | undefined,
+    options: { contained?: boolean; disabled?: boolean; disabledReason?: string } = {},
+  ) => (
+    <Tooltip key={label} title={options.disabledReason || label}>
+      <span>
+        <IconButton
+          size="small"
+          aria-label={label}
+          title={label}
+          onClick={onClick}
+          disabled={options.disabled || !onClick}
+          sx={{
+            width: 26,
+            height: 24,
+            flexShrink: 0,
+            borderRadius: 0.5,
+            color: options.contained ? tokens.colorWhite : tokens.colorTextSecondary,
+            bgcolor: options.contained ? tokens.colorPrimary : 'transparent',
+            border: options.contained ? 'none' : `1px solid ${tokens.colorBorder}`,
+            '&:hover': {
+              bgcolor: options.contained ? tokens.colorPrimaryDark : tokens.colorPrimaryBg,
+              color: options.contained ? tokens.colorWhite : tokens.colorPrimary,
+            },
+            '&.Mui-disabled': { color: '#b0b0b0', borderColor: tokens.colorBorderLight },
+          }}
+        >
+          {icon}
+        </IconButton>
+      </span>
+    </Tooltip>
+  );
+
   return (
     <Box sx={{ borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: tokens.colorWhite }}>
-      <Box sx={{ p: 1.25 }}>
-        <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.75, gap: 0.75 }}>
-          <Box sx={{ minWidth: 0, flex: 1 }}>
-            <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, lineHeight: 1.2 }}>
-              {strings.zone.buildReport}
-            </Typography>
-            <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, lineHeight: 1.2 }}>
-              {strings.zone.buildReportHint}
-            </Typography>
-          </Box>
-          {hasItems && (
-            <Tooltip title={strings.zone.clearLayout}>
-              <IconButton size="small" onClick={onClear} aria-label={strings.zone.clearLayoutAria} sx={{ color: tokens.colorTextSecondary }}>
-                <DeleteSweepOutlined sx={{ fontSize: 18 }} />
-              </IconButton>
-            </Tooltip>
-          )}
-          <Button
-            size="small"
-            variant="text"
-            startIcon={<GridViewOutlined sx={{ fontSize: 16 }} />}
-            onClick={onOpenTemplates}
-            sx={{ fontSize: 11, minWidth: 'auto', textTransform: 'none', color: tokens.colorPrimary, px: 0.75 }}
+      <Box sx={{ px: 1.25, pt: 0.75, pb: 0.5, display: 'grid', gap: 0.375 }}>
+        {zoneRows.map(zone => (
+          <Box
+            key={zone.label}
+            sx={{
+              height: 26,
+              minHeight: 26,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 1,
+              px: 1,
+              border: `1px solid ${tokens.colorBorderLight}`,
+              borderRadius: 0.5,
+              bgcolor: tokens.colorSubtleFill,
+            }}
           >
-            {strings.zone.templates}
-          </Button>
-        </Box>
-
-        <Box sx={{ display: 'grid', gap: 0.5 }}>
-          {zoneRows.map(zone => (
-            <Box
-              key={zone.label}
-              sx={{
-                display: 'grid',
-                gridTemplateColumns: '70px minmax(0, 1fr)',
-                alignItems: 'start',
-                gap: 0.75,
-                minHeight: 32,
-                px: 0.75,
-                py: 0.6,
-                border: `1px solid ${tokens.colorBorderLight}`,
-                borderRadius: 1,
-                bgcolor: zone.zoneItems.length > 0 ? tokens.colorWhite : tokens.colorSubtleFill,
-              }}
-            >
-              <Box>
-                <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', lineHeight: 1.2 }}>
-                  {zone.label}
-                </Typography>
-                {zone.zoneItems.length === 0 && (
-                  <Typography sx={{ fontSize: 10, color: tokens.colorMuted, lineHeight: 1.2 }}>
-                    {zone.hint}
-                  </Typography>
-                )}
-              </Box>
+            <Tooltip title={zone.hint} placement="left">
+              <Typography sx={{ width: 56, flexShrink: 0, fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', letterSpacing: '0.03em', lineHeight: 1 }}>
+                {zone.label}
+              </Typography>
+            </Tooltip>
+            <Box sx={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', overflow: 'hidden' }}>
               <ChipList
                 items={zone.zoneItems}
                 onRemove={onRemove}
                 onChipClick={zone.editable ? handleOpenFilterEdit : undefined}
+                compatibilityByDimensionId={compatibilityByDimensionId}
               />
             </Box>
-          ))}
-        </Box>
-
-        {compatibilityWarning && (
-          <Alert severity="warning" sx={{ mt: 0.75, py: 0.5, '& .MuiAlert-message': { minWidth: 0 } }}>
-            <Typography sx={{ fontSize: 11, fontWeight: 700, lineHeight: 1.25 }}>
-              {compatibilityWarning.title}
-            </Typography>
-            {compatibilityWarning.messages.slice(0, 3).map(message => (
-              <Typography key={message} sx={{ fontSize: 10.5, lineHeight: 1.3 }}>
-                {message}
-              </Typography>
-            ))}
-            {compatibilityWarning.compatibleDimensionNames && compatibilityWarning.compatibleDimensionNames.length > 0 && (
-              <Typography sx={{ fontSize: 10.5, lineHeight: 1.3 }}>
-                {strings.zone.compatibleDimensions} {compatibilityWarning.compatibleDimensionNames.join(', ')}
-              </Typography>
+            {zone.zoneItems === values && hasItems && (
+              <Tooltip title={strings.zone.clearLayout}>
+                <IconButton
+                  size="small"
+                  onClick={onClear}
+                  aria-label={strings.zone.clearLayoutAria}
+                  sx={{ width: 22, height: 22, p: 0, color: tokens.colorTextSecondary, flexShrink: 0, '&:hover': { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary } }}
+                >
+                  <DeleteSweepOutlined sx={{ fontSize: 15 }} />
+                </IconButton>
+              </Tooltip>
             )}
-          </Alert>
-        )}
-
-        {filters.length > 0 && (
-          <Box sx={{ mt: 0.5, display: 'flex', alignItems: 'center', gap: 0.5, color: tokens.colorTextSecondary }}>
-            <TuneOutlined sx={{ fontSize: 13 }} />
-            <Typography sx={{ fontSize: 10 }}>
-              {strings.zone.filterChipHint}
-            </Typography>
           </Box>
-        )}
+        ))}
+      </Box>
 
-        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 0.5, mt: 1 }}>
-          <Button
-            size="small"
-            variant="contained"
-            startIcon={<TableChartOutlined sx={{ fontSize: 16 }} />}
-            onClick={onInsertTable}
-            disabled={!canInsert || insertBlocked}
-            title={insertDisabledReason ?? undefined}
-            sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-          >
-            {strings.zone.tableButton}
-          </Button>
-          <Button
-            size="small"
-            variant="outlined"
-            startIcon={<InsertChartOutlined sx={{ fontSize: 16 }} />}
-            onClick={onInsertChart}
-            disabled={!canInsert || !onInsertChart || insertBlocked}
-            title={insertDisabledReason ?? undefined}
-            sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-          >
-            {strings.zone.chartButton}
-          </Button>
-          <Button
-            size="small"
-            variant="outlined"
-            startIcon={<PivotTableChartOutlined sx={{ fontSize: 16 }} />}
-            onClick={onInsertLocalPivot}
-            disabled={!canInsert || !onInsertLocalPivot || insertBlocked}
-            title={insertDisabledReason ?? undefined}
-            sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-          >
-            {strings.zone.pivotButton}
-          </Button>
-        </Box>
-
-        {!canInsert && (
-          <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, mt: 0.5 }}>
-            {strings.zone.addMeasureHint}
-          </Typography>
+      <Box sx={{ px: 1.25, height: 30, display: 'flex', alignItems: 'center', gap: 0.25, borderTop: `1px solid ${tokens.colorBorderLight}`, borderBottom: `1px solid ${tokens.colorBorderLight}`, overflow: 'hidden' }}>
+        {toolbarButton(strings.zone.tableButton, <TableChartOutlined sx={{ fontSize: 15 }} />, onInsertTable, { contained: canInsert && !insertBlocked, disabled: !canInsert || insertBlocked, disabledReason: insertDisabledReason || (!canInsert ? strings.zone.addMeasureHint : undefined) })}
+        {toolbarButton(strings.zone.chartButton, <InsertChartOutlined sx={{ fontSize: 15 }} />, onInsertChart, { disabled: !canInsert || !onInsertChart || insertBlocked, disabledReason: insertDisabledReason || (!canInsert ? strings.zone.addMeasureHint : undefined) })}
+        {toolbarButton(strings.zone.pivotButton, <PivotTableChartOutlined sx={{ fontSize: 15 }} />, onInsertLocalPivot, { disabled: !canInsert || !onInsertLocalPivot || insertBlocked, disabledReason: insertDisabledReason || (!canInsert ? strings.zone.addMeasureHint : undefined) })}
+        {toolbarButton(strings.zone.templates, <GridViewOutlined sx={{ fontSize: 15 }} />, onOpenTemplates)}
+        <Box sx={{ width: '1px', height: 18, flexShrink: 0, bgcolor: tokens.colorBorderLight, mx: 0.25 }} />
+        {onOpenCubeWizard && toolbarButton(strings.reportBuilder.cubeButton, <FunctionsOutlined sx={{ fontSize: 15 }} />, onOpenCubeWizard)}
+        {onOpenConnectionWizard && toolbarButton(strings.reportBuilder.connectButton, <AccountTreeOutlined sx={{ fontSize: 15 }} />, onOpenConnectionWizard)}
+        {toolbarButton(strings.reportBuilder.traceButton, <ManageSearchOutlined sx={{ fontSize: 15 }} />, onOpenTrace, { disabled: !hasLastQuery })}
+        {onRefreshValues && (
+          <Tooltip title={strings.reportBuilder.refreshValues}>
+            <span>
+              <IconButton
+                size="small"
+                aria-label={strings.reportBuilder.refreshValues}
+                title={strings.reportBuilder.refreshValues}
+                onClick={(event) => setRefreshMenuAnchor(event.currentTarget)}
+                sx={{
+                  width: 26, height: 24, borderRadius: 0.5, color: tokens.colorTextSecondary,
+                  border: `1px solid ${tokens.colorBorder}`,
+                  '&:hover': { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary },
+                  '&.Mui-disabled': { color: '#b0b0b0', borderColor: tokens.colorBorderLight },
+                }}
+              >
+                <RefreshOutlined sx={{ fontSize: 15 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
         )}
-        {canInsert && insertDisabledReason && (
-          <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, mt: 0.5 }}>
-            {insertDisabledReason}
-          </Typography>
+        <Menu
+          anchorEl={refreshMenuAnchor}
+          open={Boolean(refreshMenuAnchor)}
+          onClose={() => setRefreshMenuAnchor(null)}
+          MenuListProps={{ dense: true }}
+        >
+          <MenuItem sx={{ fontSize: 11 }} onClick={() => { setRefreshMenuAnchor(null); onRefreshValues?.(); }}>
+            {strings.reportBuilder.refreshValues}
+          </MenuItem>
+          {onRefreshSheetData && (
+            <MenuItem sx={{ fontSize: 11 }} disabled={refreshSheetDataLoading} onClick={() => { setRefreshMenuAnchor(null); onRefreshSheetData(); }}>
+              {strings.tableRefresh.refreshSheetData}
+            </MenuItem>
+          )}
+        </Menu>
+        {onInsertModeChange && (
+          <Tooltip title={`${insertMode === 'live' ? strings.insertMode.liveDescription : strings.insertMode.staticDescription}`}>
+            <Box component="label" sx={{ ml: 'auto', display: 'flex', alignItems: 'center', gap: 0.25, whiteSpace: 'nowrap', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={insertMode === 'live'}
+                onChange={(event) => onInsertModeChange(event.target.checked ? 'live' : 'static')}
+                aria-label={strings.insertMode.live}
+                style={{ width: 13, height: 13, margin: 0, accentColor: tokens.colorPrimary }}
+              />
+              <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>{strings.insertMode.live}</Typography>
+            </Box>
+          </Tooltip>
         )}
       </Box>
+
+      {compatibilityWarning && (
+        <Alert severity="warning" sx={{ mx: 1.25, my: 0.5, py: 0.375, borderRadius: 0.5, bgcolor: tokens.colorRedBg, color: tokens.colorRed, '& .MuiAlert-icon': { color: tokens.colorRed, py: 0.125 }, '& .MuiAlert-message': { minWidth: 0, py: 0 } }}>
+          <Typography sx={{ fontSize: 11, fontWeight: 700, lineHeight: 1.25, color: tokens.colorRed }}>
+            {compatibilityWarning.title}
+          </Typography>
+          {compatibilityWarning.messages.slice(0, 3).map(message => (
+            <Typography key={message} sx={{ fontSize: 10.5, lineHeight: 1.3, color: tokens.colorRed }}>
+              {message}
+            </Typography>
+          ))}
+          {compatibilityWarning.compatibleDimensionNames && compatibilityWarning.compatibleDimensionNames.length > 0 && (
+            <Typography sx={{ fontSize: 10.5, lineHeight: 1.3, color: tokens.colorRed }}>
+              {strings.zone.compatibleDimensions} {compatibilityWarning.compatibleDimensionNames.join(', ')}
+            </Typography>
+          )}
+        </Alert>
+      )}
 
       <Dialog open={Boolean(editingFilter)} onClose={() => closeFilterDialog(true)} maxWidth={false} sx={{ '& .MuiDialog-paper': { width: 300, borderRadius: 2 } }}>
         <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>

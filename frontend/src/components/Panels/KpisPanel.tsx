@@ -11,7 +11,6 @@ import {
   Chip,
   CircularProgress,
   IconButton,
-  Snackbar,
   Stack,
   Tooltip,
   Typography,
@@ -181,16 +180,18 @@ export default function KpisPanel() {
   // F-101-01: publish/unpublish a KPI to the BI catalogues from the SPA. The
   // backend requires the model itself to be deployed first (409 otherwise); the
   // error surfaces so the modeller knows to deploy the model.
-  const [publishError, setPublishError] = useState<string | null>(null);
+  // Bug-9559: shares the one app-wide toast (mounted in App.tsx) instead of a
+  // panel-local Snackbar.
+  const setGlobalMessage = useBuilderStore((s) => s.setGlobalMessage);
   const deployMut = useMutation({
     mutationFn: (kpi: Kpi) => kpisApi.deploy(projectId, modelId, kpi.id),
     onSuccess: () => qc.invalidateQueries({ queryKey }),
-    onError: (err: unknown) => setPublishError(extractApiError(err, t("kpis.publishFailed"))),
+    onError: (err: unknown) => setGlobalMessage(extractApiError(err, t("kpis.publishFailed")), "error"),
   });
   const undeployMut = useMutation({
     mutationFn: (kpi: Kpi) => kpisApi.undeploy(projectId, modelId, kpi.id),
     onSuccess: () => qc.invalidateQueries({ queryKey }),
-    onError: (err: unknown) => setPublishError(extractApiError(err, t("kpis.unpublishFailed"))),
+    onError: (err: unknown) => setGlobalMessage(extractApiError(err, t("kpis.unpublishFailed")), "error"),
   });
 
   const isAdmin = isTenantAdmin();
@@ -199,7 +200,12 @@ export default function KpisPanel() {
     async (kpiId: string) => {
       setEvalLoading((prev) => ({ ...prev, [kpiId]: true }));
       try {
-        const result = await kpisApi.evaluate(projectId, modelId, kpiId);
+        // Bug-9881: the KPI panel is the AUTHORING surface — its Evaluate
+        // button previews the definition the modeller is editing, including a
+        // draft on an undeployed model. It is the only caller that opts out of
+        // the deployed-snapshot default; every consumption surface (Excel, the
+        // scorecard, the gateway, the agent) serves the deployed number.
+        const result = await kpisApi.evaluate(projectId, modelId, kpiId, false);
         setEvalData((prev) => ({ ...prev, [kpiId]: result }));
       } catch {
         setEvalData((prev) => ({
@@ -582,16 +588,6 @@ export default function KpisPanel() {
         entityType="kpi"
         onApplyKpi={applyKpiTemplate}
       />
-      <Snackbar
-        open={publishError !== null}
-        autoHideDuration={6000}
-        onClose={() => setPublishError(null)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        <Alert severity="error" onClose={() => setPublishError(null)} sx={{ width: "100%" }}>
-          {publishError}
-        </Alert>
-      </Snackbar>
     </Box>
   );
 }

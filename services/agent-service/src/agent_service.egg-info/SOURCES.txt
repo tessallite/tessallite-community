@@ -34,6 +34,7 @@ src/eval/__init__.py
 src/eval/comparison.py
 src/eval/runner.py
 src/exec/__init__.py
+src/exec/model_surface.py
 src/exec/query.py
 src/exec/recipe.py
 src/guardrails/__init__.py
@@ -82,6 +83,8 @@ tests/test_block_f.py
 tests/test_blocked_original_access_gate.py
 tests/test_body_fk_project_scope.py
 tests/test_budget_guardrails.py
+tests/test_bug9054_readiness.py
+tests/test_bug9897_grounding_is_the_executor_surface.py
 tests/test_bug_5951_5952_5956_5957.py
 tests/test_bug_6045_6330_6331_6332_6334.py
 tests/test_bug_6521_idempotent_reservation.py
@@ -91,12 +94,16 @@ tests/test_bug_8290_judge_pending_lifecycle.py
 tests/test_bug_8349_8350_webhook_security.py
 tests/test_bug_8355_webhook_tenant_pool_isolation.py
 tests/test_bug_8356_webhook_project_idor.py
+tests/test_bug_8371_turn_started_identity.py
 tests/test_bug_8411_agent_webhook_event_filters.py
 tests/test_bug_8445_8446_project_gate_consolidation.py
 tests/test_bug_8453_agent_row_security_denial.py
 tests/test_bug_8500_recipe_duplicate_steps.py
 tests/test_bug_8553_agent_webhook_rotation_signal.py
 tests/test_bug_8712_agent_deployed_catalogue.py
+tests/test_bug_9196_embed_persona_claims.py
+tests/test_bug_9738_benchmark_containment.py
+tests/test_bug_9972_current_turn_history.py
 tests/test_chart_renderer.py
 tests/test_chart_selector.py
 tests/test_combine_expr_tree.py
@@ -124,6 +131,7 @@ tests/test_narration_repair.py
 tests/test_plan_validation.py
 tests/test_project_route_authorization_coverage.py
 tests/test_prompt_framing.py
+tests/test_rate_limit_placement.py
 tests/test_read_path_project_scope.py
 tests/test_read_tool_project_path.py
 tests/test_recipe_combine_validation.py

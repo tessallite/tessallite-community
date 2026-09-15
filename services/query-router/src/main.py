@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from shared.config.bootstrap import refresh_system_snapshot
 from shared.config.settings import get_settings
 from shared.metrics import PrometheusMiddleware, metrics_response
+from shared.service_readiness import probe_metadata_database
 from src.api.connection_introspect import router as conn_introspect_router
 from src.api.drill_routes import router as drill_router
 from src.api.headless import router as headless_router
@@ -68,21 +69,27 @@ app.include_router(plugin_router)
 
 async def _metadata_db_ready() -> tuple[bool, str]:
     """Cheap serving-readiness ping (F-030-01). Process liveness is ``/liveness``."""
-    from sqlalchemy import text
-
-    from shared.db.session import SystemSessionLocal
-
-    try:
-        async with SystemSessionLocal() as session:
-            await session.execute(text("SELECT 1"))
-        return True, "ok"
-    except Exception as exc:  # noqa: BLE001 — health must never raise
-        return False, str(exc)
+    return await probe_metadata_database()
 
 
 @app.get("/liveness")
 async def liveness() -> dict:
     return {"status": "ok", "service": "query-router"}
+
+
+@app.get("/readiness")
+async def readiness(response: Response) -> dict:
+    """Bounded metadata-database readiness without changing ``/health``."""
+    body: dict = {"status": "ok", "service": "query-router"}
+    ready, detail = await _metadata_db_ready()
+    if not ready:
+        body["status"] = "degraded"
+        body["detail"] = "metadata database unreachable"
+        response.status_code = 503
+        logging.getLogger(__name__).error(
+            "query-router /readiness DEGRADED — metadata DB unavailable: %s", detail
+        )
+    return body
 
 
 @app.get("/health")

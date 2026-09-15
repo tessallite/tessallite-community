@@ -94,6 +94,15 @@ export const theme = createTheme({
         '#root': {
           height: '100%',
         },
+        '*': {
+          scrollbarWidth: 'thin',
+          scrollbarColor: 'transparent transparent',
+          '&:hover, &:focus-within': { scrollbarColor: '#c4c4c4 transparent' },
+          '&::-webkit-scrollbar': { width: 6, height: 6 },
+          '&::-webkit-scrollbar-track': { background: 'transparent' },
+          '&::-webkit-scrollbar-thumb': { background: 'transparent', borderRadius: 3, transition: 'background-color 0.3s' },
+          '&:hover::-webkit-scrollbar-thumb, &:focus-within::-webkit-scrollbar-thumb': { background: '#c4c4c4' },
+        },
       },
     },
     MuiButton: {

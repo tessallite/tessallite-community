@@ -42,6 +42,10 @@ export function statusFromLabel(label: string | null | undefined): KpiDisplaySta
 // bespoke label still shows as authored. The map keys are the canonical English
 // strings the backend emits for the standard/centred/variance presets and the
 // trend classifier.
+//
+// Bug-7232: the fail-loud backend-authored evaluation labels are added to the
+// same map — they are fixed sentences in model-service/src/api/kpis.py, not
+// custom band labels, so non-English users must not see them verbatim.
 const DEFAULT_LABEL_KEYS: Record<string, string> = {
   "off target": "kpiScorecard.offTarget",
   "near target": "kpiScorecard.nearTarget",
@@ -54,14 +58,38 @@ const DEFAULT_LABEL_KEYS: Record<string, string> = {
   stable: "kpiScorecard.flat",
   declining: "kpiScorecard.declining",
   "insufficient data": "kpiScorecard.insufficientData",
+  // Fail-loud evaluation labels (backend-authored fixed sentences).
+  "restricted by row security": "kpiScorecard.statusRowSecurityRestricted",
+  "model is not deployed — deploy the model before evaluating kpis":
+    "kpiScorecard.modelNotDeployed",
+  "evaluation failed — this time-intelligence kpi needs a time dimension":
+    "kpiScorecard.tiNeedsTimeDimension",
+  "composite evaluation failed — circular composite reference":
+    "kpiScorecard.compositeCycle",
+  "evaluation failed — check kpi expression and model scope":
+    "kpiScorecard.evaluationFailedGeneric",
+  "target query failed": "kpiScorecard.targetQueryFailed",
+  "no expression configured": "kpiScorecard.noExpression",
+  "evaluation failed — every child kpi errored": "kpiScorecard.allChildrenErrored",
 };
+
+// Bug-7232: the composite-depth label carries a dynamic nesting count (the
+// backend's _MAX_COMPOSITE_DEPTH constant), so it cannot sit in the exact-match
+// map. Prefix-match it and render the fixed translated sentence.
+const COMPOSITE_DEPTH_PREFIX =
+  "Composite evaluation failed — composite nesting deeper than";
+
+const FALLBACK_KEY = "kpiScorecard.compositeDepthExceeded";
 
 export function localizeKpiLabel(
   label: string | null | undefined,
   t: (key: string) => string,
 ): string | null {
   if (!label) return null;
-  const key = DEFAULT_LABEL_KEYS[label.trim().toLowerCase()];
+  const trimmed = label.trim();
+  const key =
+    DEFAULT_LABEL_KEYS[trimmed.toLowerCase()] ??
+    (trimmed.startsWith(COMPOSITE_DEPTH_PREFIX) ? FALLBACK_KEY : undefined);
   if (!key) return label; // custom label — show as authored
   const translated = t(key);
   // t() returns the key unchanged when missing; fall back to the raw label.

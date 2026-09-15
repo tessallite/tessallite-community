@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
+from result_fakes import ScalarResult
 
 from src.ir.logical_query import BoundQuery, LogicalQuery
 from src.routing.router import route_query
@@ -51,7 +52,7 @@ class _Result:
         self._rows = list(rows)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return list(self._rows)

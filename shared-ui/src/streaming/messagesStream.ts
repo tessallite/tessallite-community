@@ -1,4 +1,7 @@
-import type { StreamCallbacks } from "../types/streaming";
+import type {
+  StreamCallbacks,
+  StreamLifecycleOptions,
+} from "../types/streaming";
 import { StreamError } from "../types/streaming";
 
 const READ_TIMEOUT_MS = 45_000;
@@ -62,6 +65,40 @@ interface DeliveryState {
   receivedMeaningful: boolean;
 }
 
+function isStreamActive(lifecycle: StreamLifecycleOptions): boolean {
+  return !lifecycle.signal?.aborted && (lifecycle.isCurrent?.() ?? true);
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof Error && err.name === "AbortError") ||
+    (typeof DOMException !== "undefined" &&
+      err instanceof DOMException &&
+      err.name === "AbortError")
+  );
+}
+
+function waitForRetry(
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => finish(true), delayMs);
+    const onAbort = () => finish(false);
+    const finish = (shouldRetry: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(shouldRetry);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) finish(false);
+  });
+}
+
 // Bug-7380: terminal events that signal a business-valid stream end.
 const TERMINAL_EVENTS = new Set([
   "turn.completed",
@@ -73,6 +110,7 @@ async function attemptStream(
   rawResponse: Response,
   callbacks: StreamCallbacks,
   delivery: DeliveryState,
+  lifecycle: StreamLifecycleOptions,
 ): Promise<boolean> {
   let buffer = "";
   let currentEvent = "";
@@ -80,6 +118,11 @@ async function attemptStream(
   let deliveredTerminal = false;
 
   const dispatchFrame = () => {
+    if (!isStreamActive(lifecycle)) {
+      currentEvent = "";
+      dataLines = [];
+      return;
+    }
     // Bug-7548 — per the SSE spec, a frame with `data:` lines but no `event:`
     // field defaults to the event type "message". Do not silently drop such
     // spec-legal data-only frames (the previous `&& currentEvent` guard did).
@@ -92,7 +135,7 @@ async function attemptStream(
         if (TERMINAL_EVENTS.has(eventName)) {
           deliveredTerminal = true;
         }
-        callbacks.onEvent(eventName, data);
+        if (isStreamActive(lifecycle)) callbacks.onEvent(eventName, data);
       } catch {
         // ignore malformed data payloads
       }
@@ -123,10 +166,14 @@ async function attemptStream(
     }
   };
 
+  if (!isStreamActive(lifecycle)) return false;
+
   if (!rawResponse.ok || !rawResponse.body) {
+    if (!isStreamActive(lifecycle)) return false;
     const errBody = await rawResponse
       .json()
       .catch(() => ({ error: "unknown" }));
+    if (!isStreamActive(lifecycle)) return false;
     callbacks.onError(
       new StreamError(
         "http_error",
@@ -139,10 +186,23 @@ async function attemptStream(
 
   const reader = rawResponse.body.getReader();
   const decoder = new TextDecoder();
+  let cancelPromise: Promise<void> | null = null;
+  const cancelReader = () => {
+    if (!cancelPromise) {
+      cancelPromise = reader.cancel().catch(() => {});
+    }
+    return cancelPromise;
+  };
+  const onAbort = () => {
+    void cancelReader();
+  };
+  lifecycle.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     while (true) {
+      if (!isStreamActive(lifecycle)) return false;
       const { done, value } = await readWithTimeout(reader, READ_TIMEOUT_MS);
+      if (!isStreamActive(lifecycle)) return false;
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
@@ -155,9 +215,12 @@ async function attemptStream(
       buffer = lines.pop() ?? "";
 
       for (const line of lines) {
+        if (!isStreamActive(lifecycle)) return false;
         consumeLine(line);
       }
     }
+
+    if (!isStreamActive(lifecycle)) return false;
 
     // Bug-7548 — flush any residual buffered line (an unterminated final frame
     // that arrived without a trailing newline), then close the frame.
@@ -167,6 +230,8 @@ async function attemptStream(
     }
     dispatchFrame();
 
+    if (!isStreamActive(lifecycle)) return false;
+
     // Bug-7380 + F-037-01/F-024-05: a business-valid stream MUST end with a
     // terminal event (turn.completed / turn.blocked / turn.error). If EOF
     // arrives without one, the transport close was not a business completion —
@@ -175,6 +240,7 @@ async function attemptStream(
     // error, not a silent success: raise it so the UI offers recovery instead
     // of leaving the user's question on screen with no answer.
     if (!deliveredTerminal) {
+      if (!isStreamActive(lifecycle)) return false;
       callbacks.onError(
         new StreamError(
           "unexpected_end",
@@ -184,9 +250,11 @@ async function attemptStream(
       return false;
     }
 
+    if (!isStreamActive(lifecycle)) return false;
     callbacks.onComplete();
     return true;
   } finally {
+    lifecycle.signal?.removeEventListener("abort", onAbort);
     // Bug found in L3 (adjacent, pre-existing): `reader.cancel()` returns a
     // PROMISE. Cancelling a stream that is already in the "errored" state
     // (e.g. after a genuine reader.read() rejection — a real network drop,
@@ -195,7 +263,7 @@ async function attemptStream(
     // NOT catch a promise rejection, so this became an unhandled rejection
     // on every real transport failure mid-stream, not just a synthetic one.
     try {
-      await reader.cancel();
+      await cancelReader();
     } catch {
       /* already closed/errored — nothing to cancel */
     }
@@ -205,22 +273,26 @@ async function attemptStream(
 export function sendMessageStream(
   fetchStream: () => Promise<Response>,
   callbacks: StreamCallbacks,
+  lifecycle: StreamLifecycleOptions = {},
 ): { promise: Promise<void> } {
   const promise = (async () => {
     const delivery: DeliveryState = { receivedMeaningful: false };
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (!isStreamActive(lifecycle)) return;
       try {
         const response = await fetchStream();
-        await attemptStream(response, callbacks, delivery);
+        if (!isStreamActive(lifecycle)) return;
+        await attemptStream(response, callbacks, delivery, lifecycle);
         return;
       } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (!isStreamActive(lifecycle) || isAbortError(err)) return;
         if (delivery.receivedMeaningful) {
           // Bug-6521 — once meaningful content has streamed, retrying would
           // duplicate visible text, so this is always reported as
           // "connection lost" (never retried) regardless of the underlying
           // cause (a StreamError from readWithTimeout, or a raw transport
           // rejection from reader.read()/fetch).
+          if (!isStreamActive(lifecycle)) return;
           callbacks.onError(
             new StreamError(
               "connection_lost",
@@ -230,15 +302,18 @@ export function sendMessageStream(
           return;
         }
         if (attempt < MAX_RETRIES) {
-          await new Promise((r) =>
-            setTimeout(r, RETRY_DELAY_MS * (attempt + 1)),
+          const shouldRetry = await waitForRetry(
+            RETRY_DELAY_MS * (attempt + 1),
+            lifecycle.signal,
           );
+          if (!shouldRetry || !isStreamActive(lifecycle)) return;
           continue;
         }
         // Retries exhausted with no meaningful content ever received. Keep a
         // StreamError's own code (e.g. "timeout"); normalise anything else
         // (a raw fetch/reader rejection) into "network_error" so the caller
         // always receives a typed, classifiable error.
+        if (!isStreamActive(lifecycle)) return;
         callbacks.onError(
           err instanceof StreamError
             ? err

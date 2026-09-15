@@ -4,6 +4,18 @@ export interface StreamCallbacks {
   onComplete: () => void;
 }
 
+/**
+ * Lifecycle authority for one logical send.
+ *
+ * `signal` cancels the transport and `isCurrent` protects callbacks that may
+ * arrive after a caller has superseded the send without being able to cancel
+ * the underlying promise immediately.
+ */
+export interface StreamLifecycleOptions {
+  signal?: AbortSignal;
+  isCurrent?: () => boolean;
+}
+
 export interface CompoundStep {
   step_number: number;
   title?: string;

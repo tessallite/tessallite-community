@@ -15,6 +15,7 @@ Validates that:
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 from shared.model_snapshot.importer import (
     _collect_pks,
@@ -47,6 +48,26 @@ def test_schema_version_is_current():
     # families this module exercises still travel; the constant just moved
     # forward.
     assert SNAPSHOT_SCHEMA_VERSION == 6
+
+
+def test_human_snapshot_contract_docs_match_runtime():
+    """Bug-8193: the published snapshot contract must track the serializer."""
+    repo_root = Path(__file__).resolve().parents[4]
+    architecture = (
+        repo_root / "docs" / "architecture" /
+        "architecture_model-versioning-and-deploy.md"
+    ).read_text(encoding="utf-8")
+    matrix = (
+        repo_root / "docs" / "architecture" /
+        "architecture_snapshot-coverage-matrix.md"
+    ).read_text(encoding="utf-8")
+    version = str(SNAPSHOT_SCHEMA_VERSION)
+
+    assert f"schema_version {version}" in architecture
+    assert f"current: {version}" in architecture
+    assert f"SNAPSHOT_SCHEMA_VERSION = {version}" in matrix
+    assert "joins[].population_participation_source" in architecture
+    assert "joins[].population_participation_source" in matrix
 
 
 def test_collect_pks_remaps_attribute_relationships():

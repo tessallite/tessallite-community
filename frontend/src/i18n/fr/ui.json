@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "Locataire de démonstration",
   "projectNav.setup": "Configuration",
   "projectNav.ssoMappings": "Mappages SSO",
+  "projectNav.ssoIdp": "Fournisseur d'identité",
+  "projectNav.embedTokens": "Jetons d'intégration",
   "projectNav.usersAccess": "Utilisateurs & Accès",
   "projectNav.webhooks": "Webhooks",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "Un redémarrage du service est requis pour que cette modification prenne effet",

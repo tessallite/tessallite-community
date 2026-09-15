@@ -22,7 +22,7 @@ This article explains how to create, bind, and manage calendar tables.
 
 ## Calendar table requirement rule
 
-Use a physical calendar table only when the calendar or workflow needs one. Standard, fiscal, ISO Week, and Thai Buddhist time variants can use the calendar type on the time hierarchy without a bound table. Retail 4-4-5 and Hijri time variants need a bound physical calendar table. Dense date enumeration, custom business period columns, coverage checks, and role-playing calendar aliases also need a bound table because those workflows join to or inspect real calendar rows.
+Use a physical calendar table only when the calendar or workflow needs one. Standard, fiscal, ISO Week, and Thai Buddhist time variants can use the calendar type on the time hierarchy without a bound table. Retail 4-4-5 and Hijri time variants need a bound physical calendar table. Dense date enumeration, custom business period columns, coverage checks, and calendar dimension aliases also need a bound table because those workflows join to or inspect real calendar rows.
 
 When you bind an existing table, map the real source columns. Do not keep default names such as `date_key` or `year_no` unless those columns actually exist in the source.
 
@@ -158,6 +158,8 @@ Use **Check calendar coverage** to confirm the calendar actually spans your fact
 This matters because of a quiet failure mode: if some fact dates fall **outside** the calendar — for example the fact table has 2026 rows but the calendar only goes to 2025 — those rows get NULL period values and **drop silently out of period rollups**. Your year-to-date and monthly totals would simply under-count, with no error to warn you. The coverage check turns that silent gap into a clear message: it reports the exact fact range and calendar range so you can see the shortfall and extend the calendar to cover it. A green result means every fact date is covered.
 
 Run this whenever you load new fact data, change the calendar's range, or notice a period total looking lower than you expected.
+
+The coverage check is a modelling action, not a reporting one. It reads the physical calendar and fact tables directly, without the persona filtering that applies to normal queries, so it is offered to modellers and administrators only, and it can be pointed only at a table and date column the model already contains. Viewers do not see the button; a request for a table outside the model is refused.
 
 ---
 

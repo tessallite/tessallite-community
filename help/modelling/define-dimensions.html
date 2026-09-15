@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Define Dimensions</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-09-10</span></div>
     <h1>Define Dimensions</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/model-builder-dimension-form.png" alt="Model Builder — Dimension creation form."></figure>
 <h2>What this covers</h2>
@@ -22,6 +22,10 @@
 <h2>What a dimension is</h2>
 <p>A dimension maps a business name to a column in the model&#x27;s source tables. For example, <code>orders.status_cd</code> might be exposed as a dimension named <code>Order Status</code>. BI tools see <code>Order Status</code> as a queryable column in the model&#x27;s virtual schema.</p>
 <p>Dimensions can come from any table in the model &mdash; fact tables, dimension tables, or any other joined table. Which table a dimension belongs to affects whether it can participate in aggregate routing (dimensions on tables included in the aggregate grain) or whether queries using it are served from raw source data.</p>
+<h2>Flat fields and large value lists</h2>
+<p>A dimension is one field. It is not a drill hierarchy. Excel groups these flat fields under <strong>Dimensions</strong> so they are easy to find.</p>
+<p>Prefer fields with a useful, short list of values for everyday grouping. Status, country, channel, and product category are good examples. A transaction ID, payment reference, or exact timestamp may have a different value on almost every row. Keep such a field only when people need to find or filter exact records.</p>
+<p>Tessallite does not load every field&#x27;s values when Excel first reads the field list. It asks for the distinct values of one field after that field is selected, filtered, or expanded. This keeps large identifier lists from slowing the first connection.</p>
 <h2>Dimension fields</h2>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td>Name</td><td>Yes</td><td>Unique identifier for this dimension in the model schema. Business-friendly, title case.</td></tr><tr><td>Source table</td><td>Yes</td><td>The table in the model containing the column.</td></tr><tr><td>Source column</td><td>Yes</td><td>The column in the source table. This column provides the key value (the unique identifier for each member).</td></tr><tr><td>Display column</td><td>No</td><td>A second column from the same table whose values are shown as the member caption in BI tools, while the source column stays the underlying key. For example, <code>customer_id</code> as the source column and <code>customer_name</code> as the display column. When blank, the source column value is used for both key and caption.</td></tr><tr><td>Display name</td><td>No</td><td>Alternate label for BI tools that support display names. Defaults to Name if blank.</td></tr><tr><td>Description</td><td>No</td><td>Free-text explanation shown in model metadata and some BI tool tooltips.</td></tr><tr><td>Default sort order</td><td>No</td><td>ASC or DESC. Controls default sort when an analyst orders by this dimension.</td></tr></tbody></table></div>
 <h2>Steps</h2>

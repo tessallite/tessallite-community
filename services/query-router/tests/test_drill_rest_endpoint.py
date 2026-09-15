@@ -807,8 +807,17 @@ def _mock_db_for_drill_options(*, measure_model_id=None, persona=None):
     return db
 
 
-async def _call_drill_options(measure_id, body, current_user, db, drillable=None):
-    """Call drill_options with mocked dependencies."""
+async def _call_drill_options(
+    measure_id, body, current_user, db, drillable=None,
+    *, simulate_principal=None, simulate_roles=None,
+    simulate_groups=None, simulate_claims=None,
+):
+    """Call drill_options with mocked dependencies.
+
+    Bug-8560: the endpoint now takes the four ``X-Tessallite-Simulate-*``
+    headers, exactly as ``/drill-through`` does. A direct function call has to
+    supply them; FastAPI would supply them from the request.
+    """
     async def _fake_tenant_db(tenant_id):
         yield db
 
@@ -821,7 +830,13 @@ async def _call_drill_options(measure_id, body, current_user, db, drillable=None
             new=AsyncMock(return_value=drillable or []),
         ),
     ):
-        return await drill_options(body, measure_id, current_user)
+        return await drill_options(
+            body, measure_id, current_user,
+            x_simulate_principal=simulate_principal,
+            x_simulate_roles=simulate_roles,
+            x_simulate_groups=simulate_groups,
+            x_simulate_claims=simulate_claims,
+        )
 
 
 async def test_drill_options_nonexistent_persona_returns_404():

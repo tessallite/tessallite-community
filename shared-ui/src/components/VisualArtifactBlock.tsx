@@ -16,6 +16,7 @@ import { SVGRenderer } from "echarts/renderers";
 import type { EChartsCoreOption } from "echarts/core";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { resolveEchartsThemeName } from "../utils/echartsTheme";
+import { useCompactChartHeight } from "../utils/chartLayout";
 import { useChatContext } from "../providers/ChatProvider";
 
 echarts.use([
@@ -72,9 +73,18 @@ export function parseVisualArtifact(value: string | null | undefined): VisualArt
 export function VisualArtifactBlock({
   artifact,
   echartsTheme,
+  heightOverride,
+  compact = false,
 }: {
   artifact: VisualArtifact;
   echartsTheme?: Record<string, unknown>;
+  /**
+   * Replaces the computed canvas height. Used by the maximised view, which
+   * needs the chart to fill the dialog rather than sit at its inline size.
+   * The existing ResizeObserver re-lays the chart out when this changes.
+  */
+  heightOverride?: number | string;
+  compact?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
@@ -87,9 +97,14 @@ export function VisualArtifactBlock({
   // name "tessallite", which collided across instances with different themes.)
   const themeName = resolveEchartsThemeName(echartsTheme);
 
+  // Bug-9921 — the compact chart height is derived from the pane's visible
+  // height (see utils/chartLayout.ts), not a literal, so it adapts as the
+  // Excel task pane is resized. No-op when not compact.
+  const compactHeight = useCompactChartHeight(compact);
+
   const option = useMemo(
-    () => buildEchartsOption(artifact, t),
-    [artifact, t],
+    () => buildEchartsOption(artifact, t, compact),
+    [artifact, t, compact],
   );
 
   useEffect(() => {
@@ -128,35 +143,37 @@ export function VisualArtifactBlock({
     <ErrorBoundary>
       <Box
         sx={{
-          mt: 1,
-          border: 1,
+          mt: compact ? 0 : 1,
+          border: compact ? 0 : 1,
           borderColor: "divider",
-          borderRadius: 1,
+          borderRadius: compact ? 0 : 1,
           bgcolor: "background.paper",
           minWidth: 0,
         }}
       >
-        <Box
-          sx={{
-            px: 1.5,
-            pt: 1.25,
-            pb: 0.25,
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "baseline",
-            gap: 1,
-          }}
-        >
-          <Typography variant="caption" color="text.secondary" fontWeight={600}>
-            {chartTitle(artifact, t)}
-          </Typography>
-        </Box>
+        {!compact && (
+          <Box
+            sx={{
+              px: 1.5,
+              pt: 1.25,
+              pb: 0.25,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+              gap: 1,
+            }}
+          >
+            <Typography variant="caption" color="text.secondary" fontWeight={600}>
+              {chartTitle(artifact, t)}
+            </Typography>
+          </Box>
+        )}
         <Box
           ref={containerRef}
           role="img"
           aria-label={t("chart.ariaLabel", { title: chartTitle(artifact, t) })}
           sx={{
-            height: chartHeight(artifact),
+            height: heightOverride ?? (compact ? compactHeight : chartHeight(artifact)),
             width: "100%",
             minWidth: 0,
           }}
@@ -199,14 +216,14 @@ function KpiCards({ artifact }: { artifact: VisualArtifact }) {
   );
 }
 
-function buildEchartsOption(artifact: VisualArtifact, t: TFn): EChartsCoreOption | null {
+function buildEchartsOption(artifact: VisualArtifact, t: TFn, compact: boolean): EChartsCoreOption | null {
   const chartType = artifact.chart_type;
   if (!chartType || chartType === "kpi" || artifact.rows.length === 0) return null;
 
   if (chartType === "pie") return buildPieOption(artifact, t);
-  if (chartType === "multi_line") return buildLongSeriesOption(artifact, "line", false, t);
+  if (chartType === "multi_line") return buildLongSeriesOption(artifact, "line", false, t, compact);
   if (chartType === "stacked_bar" && artifact.columns.length >= 3) {
-    return buildLongSeriesOption(artifact, "bar", true, t);
+    return buildLongSeriesOption(artifact, "bar", true, t, compact);
   }
 
   const xColumn = artifact.columns[0];
@@ -216,7 +233,9 @@ function buildEchartsOption(artifact: VisualArtifact, t: TFn): EChartsCoreOption
   );
   if (numericColumns.length === 0) return null;
 
-  const labels = artifact.rows.map((row, idx) => String(row[xColumn] ?? `Row ${idx + 1}`));
+  const labels = artifact.rows.map((row, idx) =>
+    String(row[xColumn] ?? t("chart.rowLabel", { n: String(idx + 1) })),
+  );
   const kind = chartType === "h_bar" ? "bar" : chartType === "line" || chartType === "multi_line_wide" ? "line" : "bar";
   const horizontal = chartType === "h_bar";
   const dualAxis = kind === "line" && needsDualAxis(artifact.rows, numericColumns);
@@ -241,7 +260,9 @@ function buildEchartsOption(artifact: VisualArtifact, t: TFn): EChartsCoreOption
       top: 54,
       left: horizontal ? 12 : 20,
       right: dualAxis ? 56 : 24,
-      bottom: labels.length > 8 && !horizontal ? 72 : 38,
+      // Bug-9921: compact drops the visible dataZoom slider (below), so it
+      // does not need the extra bottom margin reserved for that slider.
+      bottom: labels.length > 8 && !horizontal ? (compact ? 48 : 72) : 38,
       containLabel: true,
     },
     xAxis: horizontal
@@ -263,8 +284,15 @@ function buildEchartsOption(artifact: VisualArtifact, t: TFn): EChartsCoreOption
           axisLabel: { fontSize: 11, width: 150, overflow: "truncate" },
         }
       : yAxes,
+    // Bug-9921: the compact task pane is short on vertical room and the
+    // owner flagged the slider as consuming a large share of a small chart,
+    // so compact keeps the "inside" (wheel/pinch/drag) zoom but drops the
+    // visible slider strip via ECharts' own dataZoom config rather than
+    // shrinking it after the fact.
     dataZoom: labels.length > 12 && !horizontal
-      ? [{ type: "slider", height: 18, bottom: 12 }, { type: "inside" }]
+      ? compact
+        ? [{ type: "inside" }]
+        : [{ type: "slider", height: 18, bottom: 12 }, { type: "inside" }]
       : [],
     series: numericColumns.map((col, index) => ({
       type: kind,
@@ -314,6 +342,7 @@ function buildLongSeriesOption(
   kind: "line" | "bar",
   stacked: boolean,
   t: TFn,
+  compact: boolean,
 ): EChartsCoreOption | null {
   const [xCol, seriesCol] = artifact.columns;
   const valueCol = firstNumericColumn(artifact, artifact.columns.slice(2));
@@ -340,7 +369,9 @@ function buildLongSeriesOption(
       top: 54,
       left: 20,
       right: 24,
-      bottom: labels.length > 8 ? 72 : 38,
+      // Bug-9921: compact drops the visible dataZoom slider (below), so it
+      // does not need the extra bottom margin reserved for that slider.
+      bottom: labels.length > 8 ? (compact ? 48 : 72) : 38,
       containLabel: true,
     },
     xAxis: {
@@ -350,8 +381,12 @@ function buildLongSeriesOption(
       axisTick: { alignWithLabel: true },
     },
     yAxis: { type: "value", axisLabel: { fontSize: 11 } },
+    // Bug-9921: same compact dataZoom treatment as buildEchartsOption above
+    // — keep "inside" zoom, drop the visible slider strip.
     dataZoom: labels.length > 12
-      ? [{ type: "slider", height: 18, bottom: 12 }, { type: "inside" }]
+      ? compact
+        ? [{ type: "inside" }]
+        : [{ type: "slider", height: 18, bottom: 12 }, { type: "inside" }]
       : [],
     series: seriesNames.map((name) => ({
       type: kind,

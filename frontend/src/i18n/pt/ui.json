@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "Tenant de Demonstração",
   "projectNav.setup": "Configuração",
   "projectNav.ssoMappings": "Mapeamentos SSO",
+  "projectNav.ssoIdp": "Fornecedor de identidade",
+  "projectNav.embedTokens": "Tokens de incorporação",
   "projectNav.usersAccess": "Utilizadores e Acesso",
   "projectNav.webhooks": "Webhooks",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "É necessário reiniciar o serviço para aplicar esta alteração",

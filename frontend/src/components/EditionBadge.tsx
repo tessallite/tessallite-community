@@ -33,6 +33,16 @@ export default function EditionBadge() {
             ? t("edition.internal-unlimited")
             : name;
 
+  // Bug-9307: a licensed edition (community/enterprise) whose license manager
+  // is unactivated or invalid (model-service's _UnactivatedManager /
+  // _InvalidLicenseManager, edition_status.activated=false) previously showed
+  // an identical plain "Community"/"Enterprise" chip either way. Scoped to
+  // those two real customer-facing tier names only — "unactivated" already
+  // says so via its own label, and "internal-unlimited" is an internal
+  // override hatch, not a licensing state a customer needs flagged.
+  const showNotActivated =
+    edition?.activated === false && (name === "community" || name === "enterprise");
+
   const ent = (limits?.entitlements ?? {}) as Record<string, unknown>;
   const usedModels = limits?.usage?.models;
   const maxModels = ent.models;
@@ -52,6 +62,15 @@ export default function EditionBadge() {
         sx={HEADER_CHIP_SX}
         data-testid="edition-badge"
       />
+      {showNotActivated && (
+        <Chip
+          size="small"
+          variant="outlined"
+          label={t("edition.notActivated")}
+          sx={HEADER_CHIP_SX}
+          data-testid="edition-not-activated"
+        />
+      )}
       {modelsLabel && (
         <Chip
           size="small"

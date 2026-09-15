@@ -84,7 +84,10 @@ _MAX_CACHE_ENTRIES = 256
 class _ResolvedList:
     """A resolved named list ready for expansion."""
 
-    __slots__ = ("name", "data_type", "members", "list_type", "builder_type")
+    __slots__ = (
+        "name", "data_type", "members", "list_type", "builder_type",
+        "refresh_context",
+    )
 
     def __init__(
         self,
@@ -93,12 +96,18 @@ class _ResolvedList:
         members: list[Any],
         list_type: str,
         builder_type: str = "fixedMembers",
+        refresh_context: dict[str, Any] | None = None,
     ):
         self.name = name
         self.data_type = data_type
         self.members = members
         self.list_type = list_type
         self.builder_type = builder_type
+        # Bug-9893: the context the STORED members were computed under —
+        # principal, persona, bypass flag, timestamp and the model query that
+        # produced them. ``None`` for a list refreshed before this was
+        # recorded, which is treated as "context unknown" (fail closed).
+        self.refresh_context = refresh_context
 
 
 # key -> (expires_at, resolved_lists_dict)
@@ -148,12 +157,19 @@ def _extract_lists_from_snapshot(
                 f"'{key}' (names '{result[key].name}' and '{name}'). "
                 f"Remove or rename the duplicate before deploying."
             )
+        refresh_context = (
+            builder_def.get("refresh_context")
+            if isinstance(builder_def, dict) else None
+        )
+        if not isinstance(refresh_context, dict):
+            refresh_context = None
         result[key] = _ResolvedList(
             name=name,
             data_type=data_type,
             members=members,
             list_type=list_type,
             builder_type=builder_type,
+            refresh_context=refresh_context,
         )
     return result
 
@@ -326,6 +342,94 @@ def _render_members(
 
 
 # ---------------------------------------------------------------------------
+# Bug-9893 — serve-time gate on a STORED (materialised) membership
+# ---------------------------------------------------------------------------
+
+# Definition types whose members are COMPUTED from source data by a refresh.
+# A ``fixedMembers`` list is authored by hand in the model builder, so its
+# membership is model content, not a projection of source rows, and row
+# security has nothing to say about it.
+DYNAMIC_BUILDER_TYPES = ("topN", "filter", "sql_query")
+
+
+def named_lists_referenced(
+    sql: str,
+    named_lists: dict[str, _ResolvedList],
+    dialect: str = "postgres",
+) -> list[_ResolvedList]:
+    """The named lists this SQL actually references, in first-seen order."""
+    if not named_lists or "@" not in sql:
+        return []
+    seen: set[str] = set()
+    out: list[_ResolvedList] = []
+    for _start, _end, name in placeholder_spans(sql, dialect):
+        key = name.lower()
+        nlist = named_lists.get(key)
+        if nlist is not None and key not in seen:
+            seen.add(key)
+            out.append(nlist)
+    return out
+
+
+def stored_membership_admissible(
+    nlist: _ResolvedList,
+    *,
+    persona_id: str | None,
+    principal_identity: str | None,
+    row_security_active: bool,
+) -> tuple[bool, str]:
+    """May this persona be served the STORED membership? ``(admissible, why)``.
+
+    Bug-9893 / audit row R6. ``refresh_named_list`` computes a dynamic list's
+    members under whoever pressed Refresh — frequently a modeller holding
+    ``bypass_row_security`` — and the result was then expanded into EVERY
+    persona's query as fixed literals. That is a materialised artifact served
+    to a persona whose filters were never applied to it, which SQL generation
+    rule 4 forbids.
+
+    Stored members are admissible only when:
+
+    * the list's membership is authored, not computed (``fixedMembers``); or
+    * row security does not narrow this caller at all, so any membership the
+      refresh could have produced is one this caller may see; or
+    * the refresh ran under this caller's OWN context — same persona and same
+      principal — and did not bypass row security.
+
+    Anything else (including an unrecorded context on a list refreshed before
+    this contract existed) is inadmissible, and the caller evaluates the list
+    live over its own persona model query.
+    """
+    if nlist.builder_type not in DYNAMIC_BUILDER_TYPES:
+        return True, "static_membership"
+    if not row_security_active:
+        return True, "no_row_security_for_caller"
+    ctx = nlist.refresh_context
+    if not isinstance(ctx, dict):
+        return False, "refresh_context_unknown"
+    if ctx.get("bypass_row_security"):
+        return False, "refreshed_with_row_security_bypassed"
+    same_persona = (ctx.get("persona_id") or None) == (persona_id or None)
+    same_principal = bool(
+        principal_identity
+        and ctx.get("principal_id")
+        and str(ctx.get("principal_id")) == str(principal_identity)
+    )
+    if same_persona and same_principal:
+        return True, "refreshed_under_this_caller_context"
+    return False, "refreshed_under_a_different_row_security_context"
+
+
+def refresh_probe_sql(nlist: _ResolvedList) -> str | None:
+    """The model query a dynamic list's members were computed from, if known."""
+    ctx = nlist.refresh_context
+    if isinstance(ctx, dict):
+        sql = ctx.get("probe_sql")
+        if isinstance(sql, str) and sql.strip():
+            return sql
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Public API — single-pass integration with parameter resolution
 # ---------------------------------------------------------------------------
 
@@ -335,8 +439,15 @@ def expand_named_lists(
     dialect: str = "postgres",
     *,
     declared_param_names: set[str] | None = None,
+    member_overrides: dict[str, list[Any]] | None = None,
 ) -> tuple[str, list[str]]:
     """Expand ``@ListName`` placeholders that match named lists.
+
+    Bug-9893: *member_overrides* maps a lowercase ``@name`` to the membership
+    the CALLER evaluated live over its own persona model query, used instead of
+    the stored membership when the stored one was computed under a row-security
+    context that is not this caller's. Every other rule below (cap, empty,
+    usage shape, typed-literal rendering) applies to the override identically.
 
     Must be called AFTER ``substitute_parameters`` has consumed model parameters
     (or in a coordinated pass where parameter names are excluded). Any remaining
@@ -368,7 +479,7 @@ def expand_named_lists(
     audit: list[str] = []
 
     # Collect spans to expand (validate first, expand right-to-left).
-    expansions: list[tuple[int, int, str, _ResolvedList]] = []
+    expansions: list[tuple[int, int, str, _ResolvedList, list[Any]]] = []
     for start, end, name in spans:
         lower_name = name.lower()
         nlist = named_lists.get(lower_name)
@@ -405,9 +516,25 @@ def expand_named_lists(
                 f"(fixed members or top-N), then redeploy the model."
             )
 
+        # Bug-9893: a membership this caller evaluated live over its own
+        # persona model query replaces the stored one from here on, so every
+        # rule below (empty, cap, rendering) judges what is actually expanded.
+        effective_members = nlist.members
+        if member_overrides is not None and lower_name in member_overrides:
+            effective_members = member_overrides[lower_name]
+
         # Empty list — dynamic types may be empty if never refreshed.
-        if not nlist.members:
-            if nlist.builder_type in ("topN", "filter", "sql_query"):
+        if not effective_members:
+            if member_overrides is not None and lower_name in member_overrides:
+                # Not a modelling problem: the list was evaluated live for this
+                # caller and their own row security left no members.
+                raise ParameterError(
+                    f"Named list '{nlist.name}' has no members for you. It was "
+                    f"evaluated against the rows your row-level security "
+                    f"permits, and none of them qualify. Ask an administrator "
+                    f"if you believe you should have access to more rows."
+                )
+            if nlist.builder_type in DYNAMIC_BUILDER_TYPES:
                 # Bug-7941: direct users to Refresh AND redeploy — refreshed
                 # members only reach queries after a model redeploy.
                 raise ParameterError(
@@ -421,9 +548,9 @@ def expand_named_lists(
             )
 
         # Size cap — defense in depth (also enforced at create time).
-        if len(nlist.members) > max_members:
+        if len(effective_members) > max_members:
             raise ParameterError(
-                f"Named list '{nlist.name}' has {len(nlist.members)} members, "
+                f"Named list '{nlist.name}' has {len(effective_members)} members, "
                 f"exceeding the maximum of {max_members}."
             )
 
@@ -435,16 +562,20 @@ def expand_named_lists(
                 f"Other positions (=, bare reference) are not supported."
             )
 
-        expansions.append((start, end, name, nlist))
+        expansions.append((start, end, name, nlist, effective_members))
 
     # Expand right-to-left so earlier byte offsets stay valid.
     # Audit entries are appended in reverse order, then reversed at the end
     # so the log reads in query order (left to right).
     out = sql
-    for start, end, name, nlist in sorted(expansions, key=lambda s: s[0], reverse=True):
-        rendered = _render_members(nlist.members, nlist.data_type, dialect, nlist.name)
+    for start, end, name, nlist, effective_members in sorted(
+        expansions, key=lambda s: s[0], reverse=True
+    ):
+        rendered = _render_members(
+            effective_members, nlist.data_type, dialect, nlist.name,
+        )
         out = out[:start] + rendered + out[end:]
-        audit.append(f"{nlist.name}({len(nlist.members)} members)")
+        audit.append(f"{nlist.name}({len(effective_members)} members)")
 
     audit.reverse()
     return out, audit

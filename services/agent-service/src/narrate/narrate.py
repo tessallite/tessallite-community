@@ -155,8 +155,22 @@ _SHAPE_FACT_RULES = (
     "Do not claim a series ends early unless its last_period says so. "
     "Do not compare months as bare numbers when full period keys are present. "
     "Do not claim top or bottom rankings unless ranking facts are present. "
+    "For a grouped temporal axis, use the Date range in the data line for source coverage; "
+    "a bucket label such as 1 January is a period key and does not mean the source contains one day. "
+    "When average_comparison has status available, state its supplied target relation and value; "
+    "it was computed from complete grouped rows, so do not say the average is unavailable or recompute it. "
+    "When average_comparison is unavailable or absent, do not infer a comparison. "
     "Disclose table-only output when chart_notes or table facts say the requested chart was rejected. "
-    "Allowed insight statements are readings of provided facts only: peak, trough, first, last, largest, smallest, row count, missing periods, and truncation."
+    "Allowed insight statements are readings of provided facts only: peak, trough, first, last, largest, smallest, row count, benchmark relations, missing periods, and truncation."
+)
+
+_EXPLICIT_RANKING_FACT_RULES = (
+    "The ranking facts include an explicit user-requested ordered limit. "
+    "Treat the returned top or bottom boundary as the definitive requested "
+    "result and state it directly. You may mention that lower-ranked rows "
+    "were omitted by the requested limit, but do not say the requested "
+    "winner cannot be confirmed, is unconfirmed, or requires rerunning "
+    "without the row cap."
 )
 
 
@@ -168,6 +182,55 @@ def _prior_questions_line(prior_questions: list[str]) -> str:
         f"The user previously asked: {quoted}. "
         "Reference prior context where it adds value to the answer."
     )
+
+
+def _has_explicit_ranking_facts(shape_trace: dict[str, Any] | None) -> bool:
+    if not isinstance(shape_trace, dict):
+        return False
+    facts = shape_trace.get("narration_facts")
+    if not isinstance(facts, dict):
+        return False
+    ranking = facts.get("ranking")
+    return bool(
+        isinstance(ranking, dict)
+        and ranking.get("limit_explicit") is True
+        and isinstance(ranking.get("limit"), int)
+        and ranking.get("limit") > 0
+        and ranking.get("direction") in {"asc", "desc"}
+    )
+
+
+def _merge_shape_date_ranges(
+    date_ranges: dict[str, tuple[str, str]],
+    shape_trace: dict[str, Any] | None,
+    columns: list[str],
+) -> dict[str, tuple[str, str]]:
+    """Prefer validated shape coverage for derived temporal bucket columns."""
+    if not isinstance(shape_trace, dict):
+        return date_ranges
+    facts = shape_trace.get("narration_facts")
+    if not isinstance(facts, dict):
+        return date_ranges
+    ranges = facts.get("date_range")
+    if not isinstance(ranges, dict):
+        return date_ranges
+    merged = dict(date_ranges)
+    temporal_tokens = (
+        "date", "time", "timestamp", "year", "month", "quarter",
+        "week", "day", "hour", "period",
+    )
+    for column, bounds in ranges.items():
+        if (
+            not isinstance(column, str)
+            or (column not in columns and column != "period")
+            or not any(token in column.casefold() for token in temporal_tokens)
+            or not isinstance(bounds, (list, tuple))
+            or len(bounds) != 2
+            or any(bound is None for bound in bounds)
+        ):
+            continue
+        merged[column] = (str(bounds[0]), str(bounds[1]))
+    return merged
 
 
 def _build_format_block(
@@ -619,6 +682,9 @@ def _build_narrate_prompt(
     date_ranges: dict = {}
     if total > 0:
         date_ranges = extract_date_ranges(execution.rows, execution.columns)
+        date_ranges = _merge_shape_date_ranges(
+            date_ranges, shape_trace, execution.columns,
+        )
 
     # ── instruction block (first) ─────────────────────────────────────────
     fmt_block = _build_format_block(
@@ -633,6 +699,8 @@ def _build_narrate_prompt(
     instr_parts = [fmt_block]
     if shape_trace:
         instr_parts.append(_SHAPE_FACT_RULES)
+        if _has_explicit_ranking_facts(shape_trace):
+            instr_parts.append(_EXPLICIT_RANKING_FACT_RULES)
     pq = _prior_questions_line(prior_questions or [])
     if pq:
         instr_parts.append(pq)

@@ -387,6 +387,7 @@ class JoinUpdate(BaseModel):
 
 
 class JoinResponse(OrmBase):
+    hidden_calendar_table_ids: list[uuid.UUID] = Field(default_factory=list)
     id: uuid.UUID
     model_id: uuid.UUID
     left_table_id: uuid.UUID

@@ -13,12 +13,14 @@ import userEvent from "@testing-library/user-event";
 const validateExpressionMock = vi.fn();
 const versionsMock = vi.fn();
 const evaluateAdhocMock = vi.fn();
+const updateKpiMock = vi.fn();
 
 vi.mock("../../api/client", () => ({
   kpisApi: {
     validateExpression: (...args: unknown[]) => validateExpressionMock(...args),
     versions: (...args: unknown[]) => versionsMock(...args),
     evaluateAdhoc: (...args: unknown[]) => evaluateAdhocMock(...args),
+    update: (...args: unknown[]) => updateKpiMock(...args),
   },
 }));
 
@@ -163,5 +165,28 @@ describe("KpiWizard time-dimension save gate", () => {
         "This KPI uses time intelligence. Pick a time dimension in the Display step before saving.",
       ),
     ).not.toBeInTheDocument();
+  });
+
+  // Bug-8937/R2-B01: the catch block used to do
+  // `typeof detail === "string" ? detail : JSON.stringify(detail)`, so a
+  // structured {message} detail rendered as a raw JSON blob instead of the
+  // server's actual reason.
+  it("shows the server's structured error message instead of raw JSON on save failure", async () => {
+    updateKpiMock.mockRejectedValue({
+      response: { data: { detail: { message: "a KPI named revenue_growth already exists" } } },
+    });
+    renderWizard(tiKpi({ time_dimension_id: "d1" }));
+    await goToReviewStep();
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(
+      await screen.findByText("a KPI named revenue_growth already exists"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/error_code|"message":/)).not.toBeInTheDocument();
   });
 });

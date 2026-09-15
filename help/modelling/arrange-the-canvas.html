@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arrange the Canvas &mdash; Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Arrange the Canvas</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-09-14</span></div>
+<h1>Arrange the Canvas</h1>
+
+<h2>What this covers</h2>
+<p>Where tables sit on the Model Canvas and how relationship lines are drawn between them. Automatic arrangement, the controls that steer it, and the two ways of holding part of a diagram still while the rest is rearranged.</p>
+<h2>Why layout is a modelling concern</h2>
+<p>A semantic model is a graph, and a graph has no inherent positions. Somebody has to decide where each table goes, and that decision is not cosmetic: the arrangement is how a reader understands the model. A star that looks like a star is read as a star. The same five tables strung out in a line, with connectors crossing each other, get read as "complicated" &mdash; and a reader who thinks a model is complicated asks fewer questions of it.</p>
+<p>Layout is also shared. Positions are saved on the <strong>model</strong>, not per user, so every modeller opening it sees the same diagram. That is deliberate: it makes conversation possible ("the customer dimension, top right"). The cost is that the last save wins, so a large rearrangement is worth agreeing before you make it.</p>
+<h2>Two kinds of decision</h2>
+<p>Everything on this page is one of two things, and it helps to keep them apart:</p>
+<ul>
+<li><strong>Placement</strong> &mdash; where the table cards sit.</li>
+<li><strong>Routing</strong> &mdash; how the relationship lines get from one card to another.</li>
+</ul>
+<p>They are separate. You can rearrange the cards and keep a line you drew by hand. You can reroute every line without moving a single card. The controls are grouped along those lines.</p>
+<h2>Arranging automatically</h2>
+<p>The layout panel (the <strong>Layout presets</strong> control on the canvas toolbar) offers three presets, plus two settings that steer them.</p>
+<h3>Presets</h3>
+<table>
+<thead><tr><th>Preset</th><th>Shape it produces</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td><strong>Hierarchical</strong></td><td>Layered, flowing in one direction</td><td>The model has a clear direction of reading &mdash; a fact and its dimensions, or a snowflake with depth</td></tr>
+<tr><td><strong>Compact Grid</strong></td><td>The same layered engine, tightened up</td><td>The model is large and you want more of it on screen at once</td></tr>
+<tr><td><strong>Radial</strong></td><td>Facts at the centre, everything else on a ring around them</td><td>A star or constellation schema, where "what is at the centre" is the point</td></tr>
+</tbody>
+</table>
+<p>Radial is fact-centred by construction: fact tables form the centre and every other card is placed on a measured ring around them. If a model has no fact table, one representative card takes the centre, so the result is still a star rather than an empty middle.</p>
+<h3>Direction and spacing</h3>
+<p><strong>Direction</strong> (top to bottom, or left to right) applies to the two layered presets and decides which way the layers run. Top-to-bottom suits a model read as a flow; left-to-right suits a wide model on a wide screen.</p>
+<p><strong>Spacing</strong> (normal or compact) trades readability against density. Compact is for getting a big model into one frame; it is not a good default for a model you are still explaining to someone.</p>
+<p>Both settings travel with the action rather than sitting as a separate "apply" step: choose a direction, then choose a preset, and the arrangement uses both. The last combination that actually produced an arrangement is saved with the model, so reopening it starts where you left off.</p>
+<h3>Arrange all, or just a selection</h3>
+<p><strong>Arrange Selected</strong> rearranges only the tables you have selected and leaves everything else exactly where it is. This is the control to reach for when one corner of a large diagram has become messy and the rest is fine &mdash; a full arrange would undo work you want to keep.</p>
+<p>The control tells you what it will do before you use it. With nothing selected it says so; with a selection it states how many tables will move. If every table you have selected is held in place (see below), the control stays unavailable rather than starting an arrangement that cannot move anything.</p>
+<h3>Reroute Links</h3>
+<p><strong>Reroute Links</strong> recomputes every relationship line and does not move a single card. Use it after you have dragged cards around by hand and the lines have become untidy, when you are happy with the placement and only want the connectors redrawn.</p>
+<p>It also returns every relationship to the model's <strong>Edge Pathing</strong> setting. A single relationship can be given its own path style from the Joins panel, and that choice overrides the model setting for that one line &mdash; which is what you want when you set it deliberately, and confusing when you have forgotten. Reroute Links is the one action that clears those individual choices, so the whole diagram follows the model setting again. A relationship whose route is locked keeps its style: you froze that line, and its style is part of what you froze.</p>
+<h2>Holding part of the diagram still</h2>
+<p>Automatic arrangement is all-or-nothing by default: it will move whatever it is allowed to move. Two mechanisms let you decide what it is not allowed to touch, and they protect <strong>different things</strong>.</p>
+<h3>Locking a table's position</h3>
+<p>Locking a table's position protects <strong>where it sits</strong>. A position-locked table is not moved by any automatic arrangement, including the placement of newly added tables. You can still drag it yourself &mdash; the lock is about the machine, not about you.</p>
+<p>Lock a table's position when it carries meaning that the layout engine cannot know: the fact everyone looks at first, a dimension you have deliberately placed next to a related one, a card you have positioned to leave room for something you are about to add.</p>
+<p>A position-locked card shows a padlock in its top-right corner and takes the lock colour on its border, so it is visible why an arrangement left it alone.</p>
+<h3>Locking a relationship's route</h3>
+<p>A lock protects a <strong>relationship's line</strong> &mdash; its complete path, both attachment points, and the bends in between. Nothing recomputes a locked route.</p>
+<p>Lock a route when you have drawn a line by hand to say something: routed it around a table to keep a diagram readable, or pulled it clear of a crowded area. Without a lock, the next Arrange or Reroute is entitled to replace it.</p>
+<p>Locking captures the line <strong>exactly as it is drawn at that moment</strong>. This matters for a route you have never edited: an automatically drawn line has no stored path of its own, it is recalculated each time the diagram is drawn. Locking writes the current one down so it survives reopening the model.</p>
+<p>Locked relationships show a padlock at the midpoint of the line, and their handles are withdrawn &mdash; you cannot accidentally drag a route you have frozen.</p>
+<h3>The two are independent</h3>
+<p>The two locks sit under one heading because they are one idea applied to two subjects, but they stay independent: unlocking a relationship never unlocks a table's position, and releasing a table never releases a relationship.</p>
+<p>A lock does imply one thing about placement, though: the two tables a locked relationship connects are held in place as well, because a frozen line cannot stay accurate if the cards it attaches to move. If you try to drag or resize one of them, the canvas refuses and tells you which relationship to unlock.</p>
+<h2>What the canvas refuses, and why</h2>
+<p>Two refusals are worth understanding, because they look similar and behave differently on purpose.</p>
+<p><strong>Moving a table that a locked relationship attaches to</strong> is refused outright. The card does not move at all, and a message names the reason. Moving it would invalidate the frozen line by definition, so there is nothing to weigh up.</p>
+<p><strong>Moving any other table across a locked line</strong> is allowed while you drag and refused when you let go, at which point the tables go back where they were. Most moves do not go anywhere near a locked line, and refusing all of them up front would mean locking one relationship quietly froze the whole diagram. So the canvas waits to see where the card actually lands.</p>
+<p>A line that merely runs along a card's edge is not "across" it. Connectors legitimately run alongside cards, and treating that as a collision would make ordinary tidying impossible.</p>
+<h2>Editing a route by hand</h2>
+<p>Click a relationship to select it. Its line, both end tables, and the columns it joins on are highlighted together, so you can see the whole relationship rather than tracing the line by eye.</p>
+<p>Selected routes can be edited directly:</p>
+<ul>
+<li><strong>Drag a bend</strong> to move it.</li>
+<li><strong>Drag the line itself</strong> where there is no bend to add one.</li>
+<li><strong>Drag an end point</strong> along a card's border to change where the line attaches.</li>
+<li><strong>Double-click the line</strong> to discard your edits and return it to automatic routing.</li>
+</ul>
+<h3>Orthogonal routes stay orthogonal</h3>
+<p>Relationships are drawn in one of two path styles. <strong>Orthogonal</strong> routes are made of horizontal and vertical segments; <strong>straight</strong> routes are direct lines at any angle.</p>
+<p>When you edit an orthogonal route, the canvas keeps it orthogonal. Drag a bend anywhere you like: neighbouring bends follow, and where a bend's neighbour is a fixed end point the canvas inserts an extra corner instead. You never produce a diagonal segment, and you never have to think about which direction you are allowed to drag.</p>
+<p>An edit that cannot be drawn at all &mdash; a bend dropped inside one of the relationship's own tables, for instance &mdash; is discarded, and the route returns to what it was. The canvas restores rather than saving a broken connector.</p>
+<h2>What is saved, and what is not</h2>
+<table>
+<thead><tr><th>Saved with the model</th><th>Session only</th></tr></thead>
+<tbody>
+<tr><td>Table positions and sizes</td><td>The undo/redo history</td></tr>
+<tr><td>Table position locks</td><td>Which panel is open</td></tr>
+<tr><td>Route locks, and the frozen path itself</td><td>The current zoom and pan</td></tr>
+<tr><td>Hand-drawn bends and attachment points</td><td></td></tr>
+<tr><td>The last layout preset, direction and spacing that produced an arrangement</td><td></td></tr>
+</tbody>
+</table>
+<p>A layout written by an older version of Tessallite opens unchanged &mdash; opening a model never rewrites its saved layout &mdash; and anything in a saved layout that this version does not recognise is kept, not discarded.</p>
+<p>Every change on this page participates in undo. See <a href="canvas-undo-redo.html">Canvas Undo/Redo</a>.</p>
+<h2>Worked example &mdash; tidying a model that has grown</h2>
+<p><strong>Context.</strong> A <code>retail</code> model started as one fact and four dimensions. Over three months it has grown to eleven tables, and the original arrangement no longer makes sense. Two of the relationships have been routed by hand around a crowded corner and those routes are worth keeping.</p>
+<ol>
+<li><strong>Protect what is already right.</strong> Select the two hand-routed relationships in turn and <strong>Lock Route</strong> on each. Their paths are now frozen, and their end tables are held with them.</li>
+<li><strong>Protect the anchor.</strong> The <code>orders</code> fact sits where everyone expects it. Select it and <strong>Lock Table Position</strong>.</li>
+<li><strong>Arrange the rest.</strong> Choose <strong>Left to right</strong>, then <strong>Hierarchical</strong>. The eleven tables are laid out around the locked fact; the locked relationships and their end tables do not move.</li>
+<li><strong>Assess.</strong> The layered result has spread the model wider than the screen. Switch <strong>Spacing</strong> to <strong>Compact</strong> and run <strong>Hierarchical</strong> again.</li>
+<li><strong>Tidy the connectors.</strong> Placement is now right but a few lines wander. <strong>Reroute Links</strong> redraws every unlocked connector against the final positions without moving any card.</li>
+<li><strong>Release what no longer needs protecting.</strong> The position lock on <code>orders</code> can stay &mdash; it will keep the anchor stable through future arrangements. The route locks can stay too, or be released now that the surrounding tables have settled.</li>
+</ol>
+<p>The order matters. Protecting first and arranging second means one arrangement, not an arrangement followed by an attempt to reconstruct what it overwrote.</p>
+<h2>Common pitfalls</h2>
+<p><strong>Arranging before locking.</strong> The most common way to lose work. Automatic arrangement will move anything it is allowed to move, and undo is a single step back &mdash; not a way of recovering a hand-built layout three arrangements later. Lock first.</p>
+<p><strong>Expecting a lock to survive without a path.</strong> Locking a relationship you have never edited freezes the line as currently drawn, which is usually what you want. But if you meant to freeze a <em>particular</em> path, draw it first and then lock &mdash; locking is a snapshot, not an instruction.</p>
+<p><strong>Using Compact spacing as a default.</strong> It fits more on screen and reads worse. Use it to see a large model whole, then switch back.</p>
+<p><strong>Treating a lock as documentation.</strong> Locking a table's position says nothing about the model &mdash; not that a table is important, not that it is a fact, not that it is finished. It only stops automatic placement moving it.</p>
+<p><strong>Locking so much that there is nowhere left to go.</strong> Locked tables are obstacles the arrangement must work around. Lock enough of them, close enough together, and a table has no room left between them &mdash; it is placed outside the group rather than squeezed into a space that does not exist. Lock the few cards whose position genuinely matters, not every card you are happy with.</p>
+<p><strong>Fighting a preset.</strong> If an arrangement is repeatedly not what you want, the model shape and the preset probably disagree. A snowflake will not lay out as a star. Try the other preset before rearranging eleven tables by hand.</p>
+<h2>Troubleshooting</h2>
+<table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>Arrange Selected is unavailable although tables are selected</td><td>Every selected table is locked in place</td><td>The panel says so and gives the count; unlock their position, or unlock the relationship</td></tr>
+<tr><td>A table will not move when dragged</td><td>A locked relationship attaches to it</td><td>The message names the situation; unlock that relationship first</td></tr>
+<tr><td>Tables snapped back after a drag</td><td>The move left a table lying across a locked relationship's path</td><td>Move it elsewhere, or unlock that relationship</td></tr>
+<tr><td>Lock Route is unavailable on a selected relationship</td><td>Its current line cannot be frozen as drawn</td><td>Run Reroute Links, then lock</td></tr>
+<tr><td>Changing Edge Pathing does not change some relationships</td><td>Those relationships have their own path style, set from the Joins panel</td><td>Run Reroute Links, which returns them to the model setting</td></tr>
+<tr><td>A relationship's path style cannot be set back to "follow the model"</td><td>The Joins panel control cycles through three states</td><td>Click it until it returns to following the model setting</td></tr>
+<tr><td>An action on a relationship is refused with a message about the route being locked</td><td>Reset Path and path style cannot change a frozen line</td><td>Unlock the route first, from the Joins panel or the layout panel</td></tr>
+<tr><td>An arrangement moved a table that should have stayed</td><td>Its position was not locked &mdash; arrangement moves everything it may</td><td>Undo, lock its position, arrange again</td></tr>
+<tr><td>A hand-drawn route came back different after Arrange</td><td>Unlocked routes may be replaced by an explicit arrangement</td><td>Lock routes you want kept</td></tr>
+<tr><td>Reopening the model lost a bend</td><td>The edit could not be drawn and was discarded rather than saved</td><td>Redraw it; the canvas will not save a route it cannot draw</td></tr>
+<tr><td>A table was placed well away from the rest after an arrangement</td><td>Locked tables left it no room in the cluster</td><td>Nothing is wrong with the model. Unlock a neighbouring table's position, or move the parked table by hand</td></tr>
+</tbody>
+</table>
+<h2>Related</h2>
+<ul>
+<li><a href="model-canvas-tour.html">Model Canvas Tour</a></li>
+<li><a href="canvas-undo-redo.html">Canvas Undo/Redo</a></li>
+<li><a href="define-joins.html">Define Joins</a></li>
+<li><a href="add-tables-to-a-model.html">Add Tables to a Model</a></li>
+</ul>
+<nav class="page-nav"><a href="model-canvas-tour.html" class="page-nav-btn prev">&larr; Model Canvas Tour</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="canvas-undo-redo.html" class="page-nav-btn next">Canvas Undo/Redo &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

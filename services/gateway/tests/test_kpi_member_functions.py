@@ -156,8 +156,9 @@ def test_bug6259_expression_target_not_advertised_as_mdx():
 
 
 def test_bug5695_empty_goal_still_serves_value_status():
-    # A measure target whose measure is missing -> empty goal, but KPI_STATUS is
-    # the raw value member (no CASE built against a blank goal).
+    # A measure target whose measure is missing is not a fully executable native
+    # KPI row. The member-function resolver still exposes the empty goal/value
+    # distinction independently of native catalogue eligibility.
     from src.dax.mdschema import _rows_kpis
     kpi = {
         "name": "dd", "value_measure_id": "m-fee",
@@ -165,9 +166,7 @@ def test_bug5695_empty_goal_still_serves_value_status():
         "direction": "higher_is_better",
     }
     rows = _rows_kpis("cat", [kpi], _MEASURES)
-    assert rows[0]["KPI_GOAL"] == ""
-    assert rows[0]["KPI_STATUS"] == "[Measures].[fee_amount]"
-    assert not rows[0]["KPI_STATUS"].upper().startswith("CASE")
+    assert rows == []
 
 
 def test_resolve_trend_empty_returns_none():

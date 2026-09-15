@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Deploy a Model</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-18</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span></div>
     <h1>Deploy a Model</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/model-builder-toolbar-deploy.png" alt="Model Builder toolbar showing the Deploy and Undeploy buttons."></figure>
 <h2>What this covers</h2>
@@ -35,6 +35,7 @@
 <h2>What deploying freezes</h2>
 <p>When you deploy, Tessallite takes a <strong>snapshot</strong> of the model's shape — its measures (names, formulas, aggregation, type), dimensions, hierarchy levels, and which columns are hidden — and serves <em>that snapshot</em> to BI tools. This is called <strong>pinning</strong>.</p>
 <p>Pinning is what makes your draft edits safe. After a model is deployed you can keep working in the Builder: rename a measure, change a formula from <code>SUM(amount)</code> to <code>SUM(amount) - SUM(discount)</code>, un-hide a column, add a hierarchy level. <strong>None of those edits reach Excel, Power BI, or the query router until you Save and Deploy again.</strong> BI tools keep seeing the deployed version exactly as it was, so a report never changes underneath the person reading it just because someone happened to be editing the model.</p>
+<p><strong>Named List refresh also stays in the draft.</strong> Refresh computes and stores new members, but queries continue using the deployed membership. The list editor explains this before refresh and, after success, tells you to <strong>Save and Deploy</strong> the model to use the refreshed members in queries.</p>
 <p>Three things are deliberately <strong>not</strong> frozen, because they are safety controls that must take effect immediately:</p>
 <ul><li><strong>Row security and personas</strong> — if you tighten who can see which rows, the new restriction applies on the very next query. A security rule never waits for a redeploy.</li><li><strong>Column-level security (data tags)</strong> — restricting a tagged column takes effect at once, for the same reason. You should never have to redeploy to <em>remove</em> access.</li><li><strong>Aggregates and pocket tables</strong> — these are speed-up tables the scheduler and optimiser maintain underneath the pinned shape. Routing a query to one of them never changes <em>which</em> numbers come back; it only changes how fast.</li></ul>
 <p>Two other actions apply immediately without a Deploy, because the product treats them as <strong>governance actions</strong> (like un-deploying) rather than definition edits:</p>

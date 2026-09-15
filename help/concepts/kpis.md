@@ -238,7 +238,7 @@ All KPI operations (create, update, delete, certify, deprecate, revert) are logg
 
 KPIs are exposed to BI tools via the gateway:
 
-- **XMLA** -- MDSCHEMA_KPIS rowset returns KPI metadata including expression, target, status, and trend. Composite parent/child relationships and weights are included.
+- **XMLA** -- MDSCHEMA_KPIS returns only deployed KPI rows with a non-empty executable `KPI_VALUE` and complete measure lineage visible to the connected persona. The `KPI_VALUE` member is the same member the Execute path resolves; composite parent/child relationships and weights are included when the tree is natively executable without dangling rows.
 - **JDBC** -- A virtual `$KPIs` table is registered for each model (e.g. `Sales$KPIs`). BI clients can query it like a regular table:
 
 ```sql

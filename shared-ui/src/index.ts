@@ -14,7 +14,12 @@ export type {
   AgentPersona,
   SelectableModel,
 } from "./types/config";
-export type { StreamCallbacks, CompoundStep, StreamErrorCode } from "./types/streaming";
+export type {
+  StreamCallbacks,
+  StreamLifecycleOptions,
+  CompoundStep,
+  StreamErrorCode,
+} from "./types/streaming";
 export { StreamError, resolveStreamErrorMessage } from "./types/streaming";
 
 // Provider

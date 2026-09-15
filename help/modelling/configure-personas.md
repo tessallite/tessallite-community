@@ -9,7 +9,7 @@ updated: 2026-06-12
 
 A **persona** is a named subset of a model. It lists the measures, dimensions, and hierarchies that a given audience is allowed to query, and — optionally — a set of default filters that are merged into every query from that audience.
 
-Row security decides **which rows** a caller sees. A persona decides **which measures and dimensions** they can even ask about. The two are orthogonal and compose: every rule from both layers fires on every query, in that order (persona first, then row security).
+Row security decides **which rows** a caller sees. A persona decides **which measures and dimensions** they can even ask about. The two are orthogonal and compose: whichever rules apply to the caller fire in that order (persona first, then row security). A caller with no persona assigned has no persona rules to fire — row security still applies.
 
 Use a persona when one model serves several audiences that should see different parts of the catalogue. Typical cases:
 
@@ -17,7 +17,24 @@ Use a persona when one model serves several audiences that should see different 
 - **External partner feed.** A partner can see shipment counts and dates but not margins, costs, or internal customer names. A `partner` persona strips the sensitive measures and dimensions out of every query.
 - **Compliance-sensitive pilot.** A new calculated measure is under legal review. It lives in the model but is gated behind a `legal_review` persona until sign-off. Regular users never see it.
 
-A model can carry any number of personas. Each is independent. They are never ORed together — a caller is tied to at most one persona, which is chosen by **connecting to that persona's virtual catalog**. The gateway emits one catalog per persona named `<model.slug>_<persona.slug>` alongside the base `<model.slug>` catalog. A seeded `technical` persona per model exposes every column (including hidden ones) as `<model.slug>_technical`, which is the classic modeller view. It is reserved for admins, modellers, and users granted the `model_technical` role (see "Audience roles and persona assignment" below).
+A model can carry any number of personas. Each is independent. They are never ORed together — a caller is tied to at most one persona, which is chosen by **connecting to that persona's virtual catalog**. The gateway emits one catalog per persona named `<model.slug>_<persona.slug>` alongside the base `<model.slug>` catalog. A seeded `technical` persona per model exposes every column (including hidden ones) as `<model.slug>_technical`, which is the classic modeller view. Access to that CATALOGUE — the browsing and discovery surface — is reserved for admins, modellers, and users granted the `model_technical` role (see "Audience roles and persona assignment" below).
+
+Read that precisely: what is reserved is the technical CATALOGUE, not the underlying fields. Hiding a field is curation — it keeps the field out of the default business view, out of `SELECT *` and out of discovery. It is not an access control, and it never has been. A caller with query access who names a hidden field explicitly can still read it on the base catalogue, and can still use it in a `WHERE` filter. If a field must be unreadable by an audience, restrict it with a persona allow-list or column-level security; do not rely on hiding it.
+
+---
+
+## A persona is a smaller model
+
+Think of a persona as a smaller copy of the model. It is cut down to what one audience is allowed to see. Nobody actually copies anything. A persona is just a rule. It says which measures, dimensions, and rows count as "the model" for that audience. But everything built from the model treats it that way.
+
+That is the whole idea to hold onto. A persona sees a smaller model. Everything built from the model is built from that smaller model too. This includes a named set, a saved query, and a KPI. It also includes a summary table, a subtotal, a preview, and an export. It even includes the assistant's answers. A rule you set once applies everywhere. There is no second list to keep. There is no way for a report to show what the persona cannot see.
+
+Two consequences follow directly:
+
+- **If it cannot be built from your smaller model, you do not see it.** Say a named set is ranked by a measure you cannot see. You will not be offered that set at all. It is not greyed out. It is simply absent from the list. The same is true of a Named Query or a KPI. It is true of any saved object that reaches outside your allow list.
+- **A summary table is only used for you when your security can still be applied to it.** Tessallite may build a KPI value, an aggregate, or a pocket table ahead of time. It serves that to you only when it can still narrow it to your allow list and your row-security rules. When it cannot, Tessallite computes the answer live instead. It never serves you a number that was really built for someone with wider access.
+
+This is why a persona works cleanly with row security and column security. Every derived object in the model follows the same rule. You never have to configure any of them twice. See [Configure Row Security](configure-row-security.md) and [Column-Level Security](column-level-security.md) for the layers that stack under a persona.
 
 ---
 
@@ -41,6 +58,8 @@ Dimensions are governance concepts; hierarchies are presentation objects built f
 
 This means you do not need to maintain both dimension and hierarchy allow lists in lockstep. Restricting dimensions cascades into hierarchies naturally. The hierarchy allow list is still useful for hiding entire hierarchies that are allowed by their dimensions but should not be shown to the audience.
 
+Hierarchy members follow the same surface as any other query: when a BI client browses or drills a hierarchy level, the member list it is served is built from the persona's own model query, so it carries the persona's default filters and row-level security and shows only the members that appear in rows that audience is allowed to see.
+
 ![The Personas panel showing three personas for the acme demo: Finance, Ops, and Partner, with the Finance row expanded to reveal the three measure allow-list chips and a default filter on fiscal_year.](../assets/screencaps/personas-panel-overview.png)
 
 *Figure 1 — The Personas panel. Each row shows the persona's name, description, and a one-glance summary of its allow lists and default filters. The preview-on-canvas action opens the model canvas with this persona pre-selected as a dimmed overlay.*
@@ -49,7 +68,9 @@ This means you do not need to maintain both dimension and hierarchy allow lists 
 
 ## How the Router applies a persona
 
-Every query — from the gateway, the plugin execution endpoint, or internal REST paths — runs through the persona gate **before** row security and before route selection. The gate runs this four-step procedure:
+Every query — from the gateway, the plugin execution endpoint, or internal REST paths — first resolves an **effective persona**, and enforcement runs only when one applies. A caller connected to a persona catalogue, or assigned a persona, is gated. A caller on the base `<model.slug>` catalogue with no persona assigned resolves to no persona, which by design means unrestricted access to the model — so there is no allow-list to enforce for them. That is the documented matrix, not a gap: restriction comes from ASSIGNING a persona (or from column-level and row-level security), never from the absence of one.
+
+When a persona does apply, the gate runs **before** row security and before route selection, using this four-step procedure:
 
 1. **Resolve the persona.** For gateway queries, the catalog name determines the persona. For the Excel plugin, the `persona_id` field in the request body is used. Embedded users always use the persona set in their token. The server determines the effective persona — the client sends a request, but the server decides.
 2. **Check the allow lists.** For each measure in the bound query, confirm its ID is in `included_measure_ids` (or the list is empty). Same for each dimension and hierarchy. The **first** object that falls outside is rejected with a generic `OBJECT_NOT_AVAILABLE` 403 (the error does not name the hidden object).

@@ -69,7 +69,7 @@ class TestBug5189PersonaMemberDiscovery:
 
         async def capturing_get_dimension_members(
             model_id, dimension_name, tenant_slug, jwt_token,
-            *, persona_id=None,
+            *, persona_id=None, limit=None,
         ):
             captured_persona_ids.append(persona_id)
             return {"members": [], "levels": []}
@@ -89,7 +89,7 @@ class TestBug5189PersonaMemberDiscovery:
       <Restrictions>
         <RestrictionList>
           <CUBE_NAME>m</CUBE_NAME>
-          <DIMENSION_UNIQUE_NAME>[Region]</DIMENSION_UNIQUE_NAME>
+          <HIERARCHY_UNIQUE_NAME>[Dimensions].[Region]</HIERARCHY_UNIQUE_NAME>
         </RestrictionList>
       </Restrictions>
       <Properties>
@@ -142,7 +142,7 @@ class TestBug5189PersonaMemberDiscovery:
 
         async def capturing_get_dimension_members(
             model_id, dimension_name, tenant_slug, jwt_token,
-            *, persona_id=None,
+            *, persona_id=None, limit=None,
         ):
             captured_persona_ids.append(persona_id)
             return {"members": [], "levels": []}
@@ -162,7 +162,7 @@ class TestBug5189PersonaMemberDiscovery:
       <Restrictions>
         <RestrictionList>
           <CUBE_NAME>m</CUBE_NAME>
-          <DIMENSION_UNIQUE_NAME>[Region]</DIMENSION_UNIQUE_NAME>
+          <HIERARCHY_UNIQUE_NAME>[Dimensions].[Region]</HIERARCHY_UNIQUE_NAME>
         </RestrictionList>
       </Restrictions>
       <Properties>

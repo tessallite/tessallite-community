@@ -113,7 +113,7 @@ async def test_bug9510_9511_endpoint_filtered_batch_skips_cache_and_prefetch(cli
         patch.object(kpis_module, "_dimension_data_types", new_callable=AsyncMock, return_value={}),
     ):
         response = await client.post(
-            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis/evaluate-batch",
+            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis/evaluate-batch?deployed_only=false",
             json={
                 "kpi_ids": [str(kpi_id)],
                 "filters": [
@@ -214,7 +214,7 @@ async def test_bug9512_invalid_request_filters_refuse_before_consumers(
         patch.object(kpis_module, "_dimension_data_types", new_callable=AsyncMock, return_value={}),
     ):
         response = await client.post(
-            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis/evaluate-batch",
+            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(kpi.id)], "filters": [request_filter]},
         )
 
@@ -319,7 +319,7 @@ async def test_bug9511_filtered_batch_slices_kpi_referenced_target(client):
         patch.object(kpis_module, "_get_measure_value", side_effect=fake_measure),
     ):
         response = await client.post(
-            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis/evaluate-batch",
+            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis/evaluate-batch?deployed_only=false",
             json={
                 "kpi_ids": [str(parent.id)],
                 "filters": [

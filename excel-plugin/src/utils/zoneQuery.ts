@@ -209,7 +209,8 @@ export function resolveZoneItemName(item: ZoneItem, lists: ZoneResolutionLists):
  *
  * - Values -> measures.
  * - Rows + Columns -> dimensions (a named set / level binds via its dimension).
- * - Explicit filter items -> their configured operator/values.
+ * - Dimension filter items -> their configured operator/values.
+ * - Measure filter items -> structured measure predicates with deployed agg.
  * - Named-set items (any zone) -> an `in` filter over their member keys on the
  *   bound dimension (F-025-11), in addition to any axis placement.
  *
@@ -235,12 +236,15 @@ export function buildZoneQuery(
   // emitted as a plain filter item (which would double-constrain or, worse,
   // bind its UUID as a `set` operator on a non-existent member).
   const filterItems = zoneItems.filter(i => i.zone === 'filters' && i.kind !== 'named_set');
+  const measureIds = new Set((lists.measures || []).map(m => m.id));
+  const measureFilterItems = filterItems.filter(i => measureIds.has(i.id));
+  const dimensionFilterItems = filterItems.filter(i => !measureIds.has(i.id));
 
   // Bug-5289: an unedited filter chip (no operator, no values) must be omitted
   // entirely — emitting `operator: 'set'` with no values is invalid and causes
   // the query-router to reject the request. Only emit filters that have a
   // configured operator AND at least one value.
-  const explicitFilters = filterItems
+  const explicitFilters = dimensionFilterItems
     .filter(f => f.operator && f.values?.length)
     .map(f => ({
       dimension: resolve(f),
@@ -257,6 +261,22 @@ export function buildZoneQuery(
     }));
 
   const filters = [...explicitFilters, ...namedSetFilters];
+
+  // Bug-9824: a measure chip is a predicate over the grouped measure value,
+  // not a source-row field. Carry the stable measure id and the deployed
+  // metadata's effective aggregation; the query-router rebinds the aggregation
+  // from its own deployed snapshot before rendering HAVING.
+  const measureFilters = measureFilterItems
+    .filter(f => f.operator && f.values?.length)
+    .map(f => {
+      const measure = lists.measures!.find(m => m.id === f.id)!;
+      return {
+        measureId: measure.id,
+        operator: f.operator!,
+        values: f.values!,
+        effectiveAggregation: measure.default_agg,
+      };
+    });
 
   if (measures.length === 0) return null;
 
@@ -290,6 +310,7 @@ export function buildZoneQuery(
     measures,
     dimensions: allDims,
     filters: filters.length > 0 ? filters : undefined,
+    measureFilters: measureFilters.length > 0 ? measureFilters : undefined,
     order: finalOrder,
     limit,
   };
@@ -394,20 +415,44 @@ export function buildLocalPivotQuery(
 const LOCAL_PIVOT_ADDITIVE_AGGS = new Set(['sum', 'count', 'count_star']);
 const LOCAL_PIVOT_ADDITIVE_SEMI_BEHAVIORS = new Set(['', 'none', 'sum', 'additive']);
 
-export function isMeasureSafeForLocalPivot(measure: Pick<Measure, 'default_agg' | 'measure_type' | 'semi_additive_behavior'>): boolean {
+export function isMeasureSafeForLocalPivot(
+  measure: Pick<
+    Measure,
+    'default_agg' | 'measure_type' | 'semi_additive_behavior'
+    | 'variant_of_measure_id' | 'is_additive'
+  >,
+): boolean {
   const agg = (measure.default_agg || '').trim().toLowerCase();
   const semi = (measure.semi_additive_behavior || '').trim().toLowerCase();
   return (
+    // Bug-9882: the PRODUCER's verdict comes first. `is_additive` is the
+    // product's single definition of effective additivity, and it is the only
+    // thing that can express a modeller declaring a plain sum measure
+    // non-additive (a rate stored as a sum, a balance) — nothing about that
+    // measure's shape reveals it, so the tests below all pass for it and Excel
+    // would sum it. `!== false` rather than `=== true`: a server that omits
+    // the field must fall through to the shape tests, not block everything.
+    measure.is_additive !== false &&
     measure.measure_type === 'standard' &&
+    // Bug-9882: a TIME VARIANT (CAGR, lag, lead, moving average, last-N) is a
+    // 'standard' sum measure as far as `measure_type` is concerned, so the
+    // three tests below all pass for it. Excel then re-aggregates a growth
+    // rate or a moving average by SUM across rows — a wrong number with no
+    // error anywhere, which is exactly what this gate exists to stop. The
+    // producer marks a variant with `variant_of_measure_id`; there is no
+    // 'variant' measure_type to test for.
+    !measure.variant_of_measure_id &&
     LOCAL_PIVOT_ADDITIVE_AGGS.has(agg) &&
     LOCAL_PIVOT_ADDITIVE_SEMI_BEHAVIORS.has(semi)
   );
 }
 
 /**
- * Excel can freely re-aggregate local PivotTable values. Block measures whose
- * model metadata says they are calculated, variant, semi-additive, or use a
- * non-additive default aggregation.
+ * Excel can freely re-aggregate local PivotTable values, and the only operation
+ * it knows is SUM. Block every measure the model says must not be added up:
+ * the producer's own `is_additive` verdict first, then the shapes that verdict
+ * is derived from (calculated, time variant, semi-additive, or a non-additive
+ * default aggregation) as a backstop for a response that omits the flag.
  */
 export function unsafeLocalPivotMeasures(zoneItems: ZoneItem[], measures: Measure[] | undefined): Measure[] {
   if (!measures?.length) return [];

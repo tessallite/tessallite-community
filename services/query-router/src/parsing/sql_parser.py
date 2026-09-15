@@ -377,6 +377,11 @@ def parse_sql_to_ir(
         input_dialect=dialect,
         expression_occurrences=expression_occurrences,
         time_period_grains=_time_period_grains,
+        # Bug-9740: publish the set the strict GROUP BY gate above already
+        # computed. The parser has no model, so it cannot know that one of
+        # these bare names is a MEASURE; the binder can, and needs to know
+        # which projections were truly bare before it decides.
+        ungrouped_bare_columns=list(ungrouped_bare),
     )
 
 

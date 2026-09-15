@@ -204,6 +204,11 @@ async def test_bug9433_catalog_honors_hidden_source_columns_for_select_star(monk
 
     monkeypatch.setattr(router_client, "get_model_personas", _authorized_persona)
     monkeypatch.setattr(router_client.settings, "LOOKER_GATEWAY_ENABLED", True)
+    # Bug-9855: this scenario is the PRIVILEGED caller (an admin sees every
+    # persona and its base relation stays the unrestricted business view). A
+    # non-privileged technical-persona holder's base relation now carries the
+    # technical columns, because that is what the router serves them.
+    monkeypatch.setattr(router_client, "_caller_is_privileged", lambda _tok: True)
     result = await router_client.fetch_model_metadata(MODEL_ID, "acme", "jwt")
     table_columns = result[1]
 

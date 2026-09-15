@@ -148,6 +148,56 @@ describe("LicenseAndEdition", () => {
     expect(screen.queryByText("Activated")).not.toBeInTheDocument();
   });
 
+  // Bug-9318: a broken compiled license-manager build (license_state:
+  // "manager_load_failed") is a distinct fail-closed state from both
+  // "invalid" and "expired" — a build/packaging fault, not a licence
+  // document problem. It previously fell through to no handling at all and
+  // presented as a plain missing licence.
+  it("renders a distinct manager-load-failed banner and chip, not 'Activated'", () => {
+    mockEdition.mockReturnValue({
+      data: {
+        edition: "community",
+        activated: false,
+        enforcement: true,
+        license_state: "manager_load_failed",
+        load_error: "ImportError: cannot load closed verifier module",
+      },
+      isLoading: false,
+    });
+    mockLimits.mockReturnValue({
+      data: { entitlements: { models: 2 }, usage: {} },
+      isLoading: false,
+    });
+    render(<LicenseAndEdition />);
+    expect(screen.getByTestId("license-manager-load-failed-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("license-manager-load-failed-chip")).toHaveTextContent(
+      "License manager error",
+    );
+    expect(
+      screen.getByText(/build or packaging fault, not a license problem/i),
+    ).toBeInTheDocument();
+    // The raw load_error is shown, but only as a clearly-labelled secondary detail.
+    expect(
+      screen.getByText("Technical detail: ImportError: cannot load closed verifier module"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Activated")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("license-invalid-chip")).not.toBeInTheDocument();
+  });
+
+  it("omits the technical-detail line when load_error is absent", () => {
+    mockEdition.mockReturnValue({
+      data: { edition: "community", activated: false, license_state: "manager_load_failed" },
+      isLoading: false,
+    });
+    mockLimits.mockReturnValue({
+      data: { entitlements: { models: 2 }, usage: {} },
+      isLoading: false,
+    });
+    render(<LicenseAndEdition />);
+    expect(screen.getByTestId("license-manager-load-failed-banner")).toBeInTheDocument();
+    expect(screen.queryByText(/Technical detail/)).not.toBeInTheDocument();
+  });
+
   it("does not show the invalid banner for a normal activated licence", () => {
     mockEdition.mockReturnValue({
       data: { edition: "community", activated: true },

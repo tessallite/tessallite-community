@@ -7,6 +7,7 @@ import {
   Tooltip,
 } from "@mui/material";
 import { ContentCopy, ExpandMore, ExpandLess } from "@mui/icons-material";
+import { useChatContext } from "../providers/ChatProvider";
 
 interface QueryBlockProps {
   label: string;
@@ -24,6 +25,7 @@ function formatQueryValue(value: unknown): string {
 }
 
 export function QueryBlock({ label, value }: QueryBlockProps) {
+  const { t } = useChatContext();
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const text = formatQueryValue(value);
@@ -66,7 +68,7 @@ export function QueryBlock({ label, value }: QueryBlockProps) {
         >
           {label}
         </Typography>
-        <Tooltip title={copied ? "Copied" : "Copy"}>
+        <Tooltip title={copied ? t("queryBlock.copied") : t("queryBlock.copy")}>
           <IconButton
             size="small"
             onClick={(e) => {

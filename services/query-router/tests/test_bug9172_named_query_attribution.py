@@ -81,7 +81,10 @@ async def test_live_named_query_fallback_passes_id_and_reason_to_inner_pipeline(
     )
     response = types.SimpleNamespace(route_type="source", reason="source")
     inner_execute = AsyncMock(return_value=response)
-    nq = types.SimpleNamespace(id=str(named_query_id), name="sales")
+    nq = types.SimpleNamespace(
+        id=str(named_query_id), name="sales",
+        definition_sql="SELECT * FROM sales",
+    )
 
     with patch.object(routes, "_handle_execute", inner_execute):
         result = await routes._execute_named_query_live(
@@ -118,7 +121,10 @@ async def test_live_named_query_preexec_failure_keeps_attribution():
     failure = routes.HTTPException(status_code=422, detail="invalid definition")
     inner_execute = AsyncMock(side_effect=failure)
     preexec = AsyncMock()
-    nq = types.SimpleNamespace(id=str(named_query_id), name="sales")
+    nq = types.SimpleNamespace(
+        id=str(named_query_id), name="sales",
+        definition_sql="SELECT * FROM sales",
+    )
 
     with patch.object(routes, "_handle_execute", inner_execute), patch.object(
         routes, "_log_preexec_failure", preexec

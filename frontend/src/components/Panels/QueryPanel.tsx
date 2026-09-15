@@ -59,6 +59,7 @@ import { TIME_VARIANT_NAMES } from "../../constants/timeVariants";
 import CalendarBindingHint from "../CalendarBindingHint";
 import { ui } from "../../theme/tokens";
 import { rowSecurityDeniedAll } from "../../utils/rowSecurity";
+import { extractApiError } from "../../utils/extractApiError";
 import { useBuilderStore } from "../../store/builderStore";
 import { syncPublishedSessionVars } from "./querySessionVars";
 import {
@@ -228,6 +229,7 @@ export default function QueryPanel() {
   const [saveOpen, setSaveOpen] = useState(false);
   const [saveName, setSaveName] = useState("");
   const [saveDesc, setSaveDesc] = useState("");
+  const saveDisabled = !sql.trim() || sql.trim() === "SELECT 1";
 
   const saveMutation = useMutation({
     mutationFn: (data: { name: string; description?: string; query_text: string }) =>
@@ -278,31 +280,28 @@ export default function QueryPanel() {
   };
 
   function extractError(err: unknown): string {
+    // Bug-8993: delegate the generic detail-extraction step to the canonical
+    // extractApiError, keeping only this panel's distinctive value-add — the
+    // typed error_type -> translated-lead-line mapping — layered on top.
     const detail =
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (err as { response?: { data?: { detail?: any } } })?.response?.data?.detail;
-    if (detail) {
-      if (typeof detail === "string") return detail;
-      if (typeof detail === "object" && detail !== null) {
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      const errorType =
+        "error_type" in detail && typeof detail.error_type === "string"
+          ? detail.error_type
+          : null;
+      const i18nKey = errorType ? QUERY_ERROR_TYPE_KEYS[errorType] : undefined;
+      if (i18nKey) {
         const rawMessage =
           "message" in detail && typeof detail.message === "string"
             ? detail.message
             : null;
-        const errorType =
-          "error_type" in detail && typeof detail.error_type === "string"
-            ? detail.error_type
-            : null;
-        const i18nKey = errorType ? QUERY_ERROR_TYPE_KEYS[errorType] : undefined;
-        if (i18nKey) {
-          const lead = t(i18nKey);
-          return rawMessage ? `${lead}\n${rawMessage}` : lead;
-        }
-        if (rawMessage) return rawMessage;
-        return JSON.stringify(detail);
+        const lead = t(i18nKey);
+        return rawMessage ? `${lead}\n${rawMessage}` : lead;
       }
     }
-    if (err instanceof Error) return err.message;
-    return t("errors.requestFailed");
+    return extractApiError(err, t("errors.requestFailed"));
   }
 
   function captureError(err: unknown) {
@@ -535,15 +534,20 @@ export default function QueryPanel() {
           onChange={setPersonaId}
         />
         <Tooltip title={t("query.saveQuery")}>
-          <Button
-            size="small"
-            variant="outlined"
-            startIcon={<SaveIcon fontSize="small" />}
-            onClick={() => setSaveOpen(true)}
-            disabled={!sql.trim() || sql.trim() === "SELECT 1"}
+          <span
+            tabIndex={saveDisabled ? 0 : undefined}
+            aria-label={saveDisabled ? t("query.saveQuery") : undefined}
           >
-            {t("common.save")}
-          </Button>
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={<SaveIcon fontSize="small" />}
+              onClick={() => setSaveOpen(true)}
+              disabled={saveDisabled}
+            >
+              {t("common.save")}
+            </Button>
+          </span>
         </Tooltip>
         <FormControl size="small" sx={{ minWidth: 140 }}>
           <Select
@@ -709,6 +713,11 @@ export default function QueryPanel() {
             </>
           ) : (
             <>
+              {validateResult.error_type === "deployed_snapshot_unavailable" && (
+                <Typography component="div" fontWeight={600}>
+                  {t("query.deployedSnapshotUnavailable")}
+                </Typography>
+              )}
               {validateResult.errors.map((e, i) => (
                 <div key={i}>{e}</div>
               ))}
@@ -758,6 +767,16 @@ export default function QueryPanel() {
           </Box>
           <HighlightedSql sql={formatSql(rewrittenSql)} />
         </Box>
+      )}
+      {/* Bug-7389: the execute envelope's security_rules_applied is the only
+          place a security-filter fired at all is visible; render it next to
+          the trace SQL rather than leaving the analyst to infer it. */}
+      {executeResult?.security_rules_applied && executeResult.security_rules_applied.length > 0 && (
+        <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: -0.5, mb: 1 }}>
+          {executeResult.security_rules_applied.includes("__deny_all__")
+            ? t("query.securityFiltersDenyAll")
+            : t("query.securityFiltersApplied", { count: String(executeResult.security_rules_applied.length) })}
+        </Typography>
       )}
       <QueryFieldCompatibilityAlert
         feedback={explainResult?.field_compatibility}

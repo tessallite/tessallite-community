@@ -1,3 +1,4 @@
+import { extractApiError } from "../utils/extractApiError";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   safeLocalGet,
@@ -1259,7 +1260,7 @@ export default function Explorer() {
           />
           {createModel.isError && (
             <Alert severity="error" sx={{ mt: 1 }}>
-              {t("explorer.failedToCreateModel")}
+              {extractApiError(createModel.error, t("explorer.failedToCreateModel"))}
             </Alert>
           )}
         </DialogContent>

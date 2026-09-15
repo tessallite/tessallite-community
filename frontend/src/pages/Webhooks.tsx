@@ -43,6 +43,8 @@ import { webhooksApi } from "../api/client";
 import type { WebhookEndpoint, WebhookDelivery } from "../api/types";
 import HelpIconButton from "../components/HelpIconButton";
 import { useT } from "../i18n";
+import { extractApiError } from "../utils/extractApiError";
+import { useConfirm } from "../components/Confirm";
 
 function maskUrl(url: string): string {
   try {
@@ -268,6 +270,7 @@ function EndpointsTab({
   onSecretRotated: (secret: string) => void;
 }) {
   const t = useT();
+  const confirm = useConfirm();
   const qc = useQueryClient();
   const { data: endpoints = [], isLoading } = useQuery({
     queryKey: ["webhooks"],
@@ -285,9 +288,38 @@ function EndpointsTab({
     onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
   });
 
+  // Bug-7336: "Test delivery" fired the request and invalidated the query but
+  // never told the user whether the test actually succeeded — a network-down
+  // endpoint and a working one looked identical. Track the last outcome per
+  // endpoint and tested URL, shown only against the receiver that triggered it.
+  const [testResult, setTestResult] = useState<{ id: string; url: string; ok: boolean; message: string } | null>(null);
+  useEffect(() => {
+    if (testResult && !endpoints.some((ep) => ep.id === testResult.id && ep.url === testResult.url)) {
+      setTestResult(null);
+    }
+  }, [endpoints, testResult]);
+
   const testMut = useMutation({
-    mutationFn: (id: string) => webhooksApi.test(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
+    mutationFn: ({ id }: Pick<WebhookEndpoint, "id" | "url">) => webhooksApi.test(id),
+    // Bug-9566: clear any previous outcome the moment a new test starts, so a
+    // stale success/failure chip from an earlier run (or from before the
+    // endpoint's URL was edited) never shows while a new test is in flight.
+    onMutate: () => setTestResult(null),
+    onSuccess: (data, { id, url }) => {
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+      const ok = data.status === "delivered";
+      setTestResult({
+        id,
+        url,
+        ok,
+        message: ok
+          ? t("webhooks.testDeliverySuccess", { code: String(data.response_code ?? "") })
+          : data.error_message || t("webhooks.testDeliveryFailed"),
+      });
+    },
+    onError: (err: unknown, { id, url }) => {
+      setTestResult({ id, url, ok: false, message: extractApiError(err, t("webhooks.testDeliveryFailed")) });
+    },
   });
 
   const rotateMut = useMutation({
@@ -361,12 +393,22 @@ function EndpointsTab({
                   <Tooltip title={t("webhooks.testDeliveryTooltip")}>
                     <IconButton
                       size="small"
-                      onClick={() => testMut.mutate(ep.id)}
+                      onClick={() => testMut.mutate({ id: ep.id, url: ep.url })}
                       disabled={testMut.isPending}
                     >
                       <SendIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
+                  {testResult?.id === ep.id && testResult.url === ep.url && (
+                    <Tooltip title={testResult.message}>
+                      <Chip
+                        size="small"
+                        color={testResult.ok ? "success" : "error"}
+                        label={testResult.ok ? t("webhooks.testDeliverySuccessShort") : t("webhooks.testDeliveryFailedShort")}
+                        sx={{ mr: 0.5 }}
+                      />
+                    </Tooltip>
+                  )}
                   <Tooltip title={t("webhooks.deliveryHistoryTooltip")}>
                     <IconButton size="small" onClick={() => onHistory(ep)}>
                       <RefreshIcon fontSize="small" />
@@ -375,7 +417,17 @@ function EndpointsTab({
                   <Tooltip title={t("webhooks.rotateSecretTooltip")}>
                     <IconButton
                       size="small"
-                      onClick={() => rotateMut.mutate(ep.id)}
+                      onClick={async () => {
+                        // Bug-6573: rotation was immediate with no confirmation —
+                        // the old secret dies instantly and cannot be recovered.
+                        const ok = await confirm({
+                          title: t("webhooks.rotateSecretConfirmTitle"),
+                          message: t("webhooks.rotateSecretConfirmMessage"),
+                          confirmLabel: t("webhooks.rotateSecretTooltip"),
+                        });
+                        if (!ok) return;
+                        rotateMut.mutate(ep.id);
+                      }}
                       disabled={rotateMut.isPending}
                     >
                       <ReplayIcon fontSize="small" />
@@ -532,6 +584,14 @@ function EndpointDialog({
     enabled: open,
   });
 
+  // Bug-9614 / D21-SOL-R1-F01: retain the persisted selection while the
+  // catalogue loads, but only render and submit values the current catalogue
+  // still recognizes. An empty intersection stays explicit, never wildcard.
+  const currentEventTypes = new Set(eventTypes.map((eventType) => eventType.value));
+  const normalizedSelectedEvents = new Set(
+    Array.from(selectedEvents).filter((filter) => currentEventTypes.has(filter)),
+  );
+
   const isEdit = endpoint !== null;
 
   const handleOpen = () => {
@@ -551,7 +611,9 @@ function EndpointDialog({
 
   const saveMut = useMutation({
     mutationFn: async (): Promise<{ secret?: string; rotated: boolean }> => {
-      const filters = allEvents ? ["*"] : Array.from(selectedEvents);
+      const filters = allEvents
+        ? ["*"]
+        : Array.from(normalizedSelectedEvents);
       if (endpoint) {
         // Bug-8556: repointing the endpoint at a different receiver rotates
         // the signing secret server-side and returns the one-time plaintext
@@ -579,7 +641,10 @@ function EndpointDialog({
     },
   });
 
-  const valid = name.trim() !== "" && url.trim() !== "" && (allEvents || selectedEvents.size > 0);
+  const valid =
+    name.trim() !== "" &&
+    url.trim() !== "" &&
+    (allEvents || normalizedSelectedEvents.size > 0);
 
   return (
     <Dialog
@@ -633,9 +698,9 @@ function EndpointDialog({
                   control={
                     <Checkbox
                       size="small"
-                      checked={selectedEvents.has(et.value)}
+                      checked={normalizedSelectedEvents.has(et.value)}
                       onChange={(e) => {
-                        const next = new Set(selectedEvents);
+                        const next = new Set(normalizedSelectedEvents);
                         if (e.target.checked) next.add(et.value);
                         else next.delete(et.value);
                         setSelectedEvents(next);

@@ -22,6 +22,7 @@ import { renderDimValue } from "../pivot";
 import type { CellCoord } from "../types";
 import PivotErrorAlert from "../PivotErrorAlert";
 import { toPivotError, type PivotPanelError } from "../pivotErrors";
+import { routeBadgeLabel } from "../routeLabels";
 
 type Props = {
   measure: Measure;
@@ -122,7 +123,8 @@ export default function DrillMiniPanel({ measure, coord, rowDims, colDims, perso
         <Chip size="small" label={measure.measure_type} variant="outlined" />
         {result && (
           <Typography variant="caption" color="text.secondary">
-            {result.route_type && `${result.route_type} · `}{t("drillMini.rowsOnPage", { count: String(result.rows.length) })}
+            {/* Bug-7281: raw route_type is untranslated backend English; route the pivot's shared label helper (Bug-6282 precedent) so it never diverges. */}
+            {result.route_type && `${routeBadgeLabel(result.route_type, t)} · `}{t("drillMini.rowsOnPage", { count: String(result.rows.length) })}
             {result.execution_ms > 0 && ` · ${result.execution_ms} ms`}
           </Typography>
         )}

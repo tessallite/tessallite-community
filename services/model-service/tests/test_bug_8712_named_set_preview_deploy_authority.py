@@ -207,6 +207,11 @@ async def test_invalid_deployed_snapshot_fails_closed_with_409(client):  # noqa:
     assert "DEPLOYED_SNAPSHOT_INVALID" in resp.json()["detail"]
 
 
+async def _refuse_probe(*, model_id, sql, persona_id, bearer, timeout_s=15.0):
+    """The persona gate refuses a probe projecting a dimension it excludes."""
+    return False
+
+
 @pytest.mark.asyncio
 async def test_deployed_preview_keeps_persona_scoping(client):  # noqa: F811
     """The persona gate judges the SERVED definition, not the draft.
@@ -224,7 +229,7 @@ async def test_deployed_preview_keeps_persona_scoping(client):  # noqa: F811
     )
     db.execute = AsyncMock(
         side_effect=routed_execute(
-            dimensions=[(dim_id, "Region")],
+            dimensions=[("Region",)],
         )
     )
     persona = types.SimpleNamespace(
@@ -237,6 +242,13 @@ async def test_deployed_preview_keeps_persona_scoping(client):  # noqa: F811
         patch(
             "src.api.named_sets.resolve_effective_persona",
             new=AsyncMock(return_value=persona),
+        ),
+        # Bug-9877: the persona verdict is the query-router bind. Stub the hop
+        # with the refusal the real gate returns for a dimension outside the
+        # allow-list.
+        patch(
+            "src.api.named_set_visibility.probe_binds",
+            new=_refuse_probe,
         ),
     ):
         resp = await client.post(f"{PREFIX}/{NS_ID}/preview?deployed_only=true")

@@ -356,6 +356,61 @@ def test_shape_facts_are_included_in_direct_narration_prompt():
     assert "missing_monthly_periods" in prompt
 
 
+def test_Bug_9974_prompt_uses_shape_filter_coverage_for_year_bucket():
+    execution = _execution(
+        [
+            {"business_date_year": "2026-01-01T00:00:00Z", "amount": 10},
+            {"business_date_year": "2026-01-01T00:00:00Z", "amount": 20},
+        ],
+        ["business_date_year", "amount"],
+        rows_returned=2,
+    )
+    shape_trace = {
+        "shape": "breakdown",
+        "narration_facts": {
+            "date_range": {
+                "business_date_year": ["2026-01-01", "2026-09-10"],
+            },
+        },
+    }
+
+    _, prompt = _build_narrate_prompt(
+        "sys", "Break that down by year", execution, shape_trace=shape_trace,
+    )
+
+    assert "business_date_year: 2026-01-01 to 2026-09-10" in prompt
+    assert "business_date_year: 2026-01-01 to 2026-01-01" not in prompt
+
+
+def test_Bug_9973_prompt_uses_available_average_comparison_fact():
+    execution = _execution(
+        [{"account_type": "CREDIT", "base_amount": 36_179_774.10}],
+        ["account_type", "base_amount"],
+        rows_returned=1,
+    )
+    shape_trace = {
+        "shape": "breakdown",
+        "narration_facts": {
+            "average_comparison": {
+                "status": "available",
+                "target_category": "CREDIT",
+                "target_relation": "above",
+                "average_value": 36_144_113.234,
+            },
+        },
+    }
+
+    _, prompt = _build_narrate_prompt(
+        "sys",
+        "What is the total base amount for each account type, and is CREDIT above or below the average?",
+        execution,
+        shape_trace=shape_trace,
+    )
+
+    assert "state its supplied target relation" in prompt
+    assert '"target_relation": "above"' in prompt
+
+
 # ---------------------------------------------------------------------------
 # R10 (compound scope — Lane D review add) — the multi-row compound narrator
 # view (computed.result_rows) is capped at 25 while the full per-dimension

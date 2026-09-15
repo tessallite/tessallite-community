@@ -1,24 +1,22 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import {
-  Box, Typography, CircularProgress, Skeleton, Chip, Button,
+  Box, Typography, CircularProgress, Skeleton, Button,
   Select, MenuItem,
   Dialog, DialogTitle, DialogContent, DialogActions,
   List, ListItem, ListItemText, ListItemIcon,
+  IconButton, Popover, Tooltip,
 } from '@mui/material';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import {
-  AccountTreeOutlined,
-  FunctionsOutlined,
-  ManageSearchOutlined,
-  RefreshOutlined,
-  TableChartOutlined,
+  SortOutlined,
 } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import SearchBar from '../common/SearchBar';
-import { useMeasures, useDimensions, useHierarchies, useKpis, useNamedSets, useGlossary, useAliasMap, useFieldCompatibility } from '../../hooks/useModel';
+import { useMeasures, useDimensions, useHierarchies, useKpis, useNamedSets, useGlossary, useAliasMap, useFieldCompatibility, usePersonas } from '../../hooks/useModel';
 import { executeQuery, discoverMembers, type PluginExecuteParams } from '../../api/queryRouter';
 import { rowSecurityDeniedAll } from '../../utils/rowSecurity';
 import { useToast } from '../Toast/ToastProvider';
+import { useConfirm } from '../Confirm/ConfirmProvider';
 import { useExcel } from '../../hooks/useExcel';
 import type { ReportTemplate } from '../../utils/reportTemplates';
 import { ApiError, formatApiError } from '../../api/client';
@@ -30,6 +28,7 @@ import { refreshTables, buildRefreshDetailRows, type RefreshDetailRow } from '..
 import RefreshDetailsPanel from './RefreshDetailsPanel';
 import { getInsertMode } from '../../utils/storage';
 import { buildZoneQuery, buildLocalPivotFieldMapping, buildLocalPivotQuery, evaluateNamedSetZoneGate, resolveNamedSetDimension, resolveZoneAxes, pivotZoneResult, resolveZoneItemName, planKpiZoneAdd, planKpiZoneRemove, unsafeLocalPivotMeasures } from '../../utils/zoneQuery';
+import { normaliseMeasureRows, parseMeasureValue } from '../../utils/measureValues';
 import { describeMeasureFormulaInsertResult, describeKpiFormulaInsertResult, describeChartInsertResult, describeTableInsertResult, planKpiInsertAction, planKpiCubeEligibility, type KpiFormulaRouteReason } from '../../utils/measureFormulaInsert';
 import { buildTableDrillMetadata } from '../../utils/drillMetadata';
 import { buildScorecardPayload } from '../../utils/kpiScorecard';
@@ -68,18 +67,20 @@ interface ReportBuilderProps {
   personaId?: string | null;
   personaSlug?: string | null;
   modelsList?: { id: string; name: string; slug?: string }[];
-  onModelChange?: (modelId: string) => void;
 }
 
-export default function ReportBuilder({ projectId, modelId, serverUrl, personaId, personaSlug, modelsList, onModelChange }: ReportBuilderProps) {
+export default function ReportBuilder({ projectId, modelId, serverUrl, personaId, personaSlug, modelsList }: ReportBuilderProps) {
   const { showToast } = useToast();
   const handleBusy = useCallback(() => showToast(strings.toasts.excelBusy, 'info'), [showToast]);
+  // R3 (alert-mechanism audit, 2026-08-25): a styled confirm dialog instead
+  // of useExcel's native window.confirm() fallback.
+  const confirm = useConfirm();
   const {
     insertTable: excelInsertTable, insertFormula, insertLiteral, insertChart: excelInsertChart,
     insertLocalPivot: excelInsertLocalPivot, insertNamedSetAsFormulas, insertKpiFormulas,
     insertKpiFullRow, insertKpiValueOnly, insertKpiStatusOnly,
     insertKpiValueFormula, insertMeasureAsFormula, insertKpiScorecard,
-  } = useExcel(undefined, handleBusy, modelId);
+  } = useExcel(confirm, handleBusy, modelId);
 
   const { data: measures, isLoading: measuresLoading } = useMeasures(projectId, modelId, personaId);
   const { data: dimensions, isLoading: dimsLoading } = useDimensions(projectId, modelId, personaId);
@@ -87,6 +88,18 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
   const { data: kpis, isLoading: kpisLoading } = useKpis(projectId, modelId, personaId);
   const { data: namedSets, isLoading: namedSetsLoading } = useNamedSets(projectId, modelId, personaId);
   const { data: glossary } = useGlossary(projectId, modelId, personaId);
+  // Bug-7396: resolve display names for the Query Trace modal so it never
+  // shows the raw model/persona UUIDs (personas query key/cache is shared
+  // with usePersonaFiltered in App.tsx — no extra network call).
+  const { data: personas } = usePersonas(projectId, modelId);
+  const traceModelName = useMemo(
+    () => modelsList?.find((m) => m.id === modelId)?.name ?? null,
+    [modelsList, modelId],
+  );
+  const tracePersonaName = useMemo(
+    () => (personaId ? personas?.find((p) => p.id === personaId)?.name ?? null : null),
+    [personas, personaId],
+  );
   const { data: aliasMap } = useAliasMap(projectId, modelId, personaId);
 
   const [search, setSearch] = useState('');
@@ -113,6 +126,7 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
   // F-025-27: optional result sort. Empty field = no explicit ordering.
   const [sortField, setSortField] = useState<string>('');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [sortAnchorEl, setSortAnchorEl] = useState<HTMLElement | null>(null);
 
   // Bug-6365: the active row cap. Defaults to REPORT_ROW_LIMIT; the Top N
   // Breakdown template lowers it (with a descending sort) so it actually ranks
@@ -418,7 +432,9 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
         for (const [k, d] of Object.entries(result.annotation.dimensions || {})) titles[k] = d.title;
       }
       const { headers, rows } = pivotZoneResult(
-        result.data as Record<string, unknown>[],
+        // Bug-9876: measure columns arrive as numeric strings; the backing
+        // table and the local PivotTable must receive numbers.
+        normaliseMeasureRows(result.data as Record<string, unknown>[], measureKeys),
         shouldPivotColumns ? rowDimNames : flatDimNames,
         shouldPivotColumns ? colDimNames : [],
         measureKeys,
@@ -704,10 +720,12 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
       try {
         const params: PluginExecuteParams = { projectId, modelId, personaId: personaId || undefined };
         const result = await executeQuery({ measures: [m.name], limit: 1 }, params);
-        const rawValue = result.data?.[0]?.[m.name];
-        const cellValue = (rawValue === null || rawValue === undefined)
+        // Bug-9876: a numeric string from the router becomes a number cell;
+        // non-numeric text is still written through the values channel.
+        const parsed = parseMeasureValue(result.data?.[0]?.[m.name]);
+        const cellValue = (parsed === null || parsed === undefined)
           ? '#N/A'
-          : String(rawValue);
+          : (typeof parsed === 'number' ? parsed : String(parsed));
         await insertLiteral(cellValue);
       } catch {
         showToast(strings.toasts.insertFailed, 'error');
@@ -1271,25 +1289,22 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
   }, [sortOptions, sortField]);
 
   return (
-    <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {modelsList && modelsList.length > 1 && onModelChange && (
-        <Box sx={{ px: 1.5, py: 0.75, borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: tokens.colorWhite }}>
-          <Typography sx={{ fontSize: 9, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', mb: 0.25 }}>
-            {strings.reportBuilder.modelLabel}
-          </Typography>
-          <Select
-            aria-label={strings.reportBuilder.modelSelectorAria}
-            size="small"
-            value={modelId}
-            onChange={e => onModelChange(e.target.value as string)}
-            sx={{ fontSize: 11, minWidth: 0, width: '100%', '& .MuiSelect-select': { py: 0.5, px: 1 } }}
-          >
-            {modelsList.map(m => (
-              <MenuItem key={m.id} value={m.id} sx={{ fontSize: 11 }}>{m.name}</MenuItem>
-            ))}
-          </Select>
-        </Box>
-      )}
+    /* Bug-9752 round 3: the panel's scroll container must stay a plain BLOCK
+       box. When it was also `display: flex; flexDirection: column` (round 2),
+       every section below it became a flex item with the default
+       `flex-shrink: 1`, and MUI's <Collapse> always renders an inline
+       `min-height: 0` (its collapsedSize) which cancels the flex automatic
+       minimum size that normally stops an item shrinking below its content.
+       So the moment the panel's content exceeded the pane height -- i.e. as
+       soon as any field-library section was expanded -- the flex algorithm
+       shrank that expanded <Collapse> back to zero height, while its entered
+       state (`height: auto; overflow: visible`) kept painting the cards. The
+       result was an expanded section rendering ON TOP of the sections below
+       instead of pushing them down. In normal block flow each section box
+       grows with its content and moves the next one down, which is the
+       behaviour the panel needs; `flex: 1` still applies here because this
+       box is itself a flex ITEM of the tab panel. */
+    <Box sx={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>
 
       <ZoneMappingGrid
         items={zoneItems}
@@ -1306,73 +1321,93 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
           compatibleDimensionNames: zoneCompatibility.compatibleDimensionNames,
         } : null}
         insertDisabledReason={compatibilityBlockedReason}
+        compatibilityByDimensionId={zoneCompatibility.unavailableByDimensionId}
+        onRefreshValues={() => { refreshCustomFunctionValues(); showToast(strings.toasts.refreshingValues, 'info'); }}
+        onRefreshSheetData={handleRefreshSheetData}
+        refreshSheetDataLoading={tableRefreshLoading}
+        onOpenCubeWizard={() => setCubeWizardOpen(true)}
+        onOpenConnectionWizard={() => setConnWizardOpen(true)}
+        onOpenTrace={lastQuery ? () => setTraceOpen(true) : undefined}
+        hasLastQuery={Boolean(lastQuery)}
+        insertMode={insertModeState}
+        onInsertModeChange={handleInsertModeChange}
       />
 
-      {sortOptions.length > 0 && (
-        <Box
-          sx={{
-            display: 'flex', alignItems: 'center', gap: 0.75, px: 1.25, py: 0.75,
-            borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: tokens.colorWhite,
-          }}
-        >
-          <Typography sx={{ fontSize: 11, fontWeight: 700, color: tokens.colorTextSecondary }}>
-            {strings.reportBuilder.sortBy}
-          </Typography>
-          <Select
-            size="small"
-            displayEmpty
-            value={sortField}
-            onChange={(e) => setSortField(e.target.value as string)}
-            sx={{ fontSize: 11, minWidth: 140, flex: 1 }}
-          >
-            <MenuItem value="" sx={{ fontSize: 11 }}>{strings.reportBuilder.sortNone}</MenuItem>
-            {sortOptions.map((o) => (
-              <MenuItem key={o.field} value={o.field} sx={{ fontSize: 11 }}>{o.label}</MenuItem>
-            ))}
-          </Select>
-          <Select
-            size="small"
-            value={sortDir}
-            disabled={!sortField}
-            onChange={(e) => setSortDir(e.target.value as 'asc' | 'desc')}
-            sx={{ fontSize: 11, minWidth: 96 }}
-          >
-            <MenuItem value="asc" sx={{ fontSize: 11 }}>{strings.reportBuilder.sortAscending}</MenuItem>
-            <MenuItem value="desc" sx={{ fontSize: 11 }}>{strings.reportBuilder.sortDescending}</MenuItem>
-          </Select>
-        </Box>
-      )}
+      <RefreshDetailsPanel key={refreshGeneration} rows={refreshDetails} />
 
-      <Box sx={{ px: 1.25, py: 1, borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: tokens.colorWhite }}>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.75 }}>
-          <ManageSearchOutlined sx={{ fontSize: 17, color: tokens.colorTextSecondary }} />
-          <Box sx={{ minWidth: 0, flex: 1 }}>
-            <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, lineHeight: 1.2 }}>
-              {strings.reportBuilder.availableFields}
-            </Typography>
-            <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, lineHeight: 1.2 }}>
-              {strings.reportBuilder.availableFieldsHint}
-            </Typography>
-          </Box>
-        </Box>
-        <SearchBar
-          value={search}
-          onChange={setSearch}
-          placeholder={strings.reportBuilder.searchPlaceholder}
-        />
-        <Box sx={{ display: 'flex', gap: 0.5, mt: 0.75 }}>
-          <Chip
-            label={strings.reportBuilder.certifiedOnly}
-            size="small"
-            clickable
-            variant={certifiedOnly ? 'filled' : 'outlined'}
-            color={certifiedOnly ? 'success' : 'default'}
-            onClick={() => setCertifiedOnly(!certifiedOnly)}
-            sx={{ fontSize: 10, height: 20 }}
+      <Box sx={{ px: 1.25, py: 0.5, display: 'flex', alignItems: 'center', gap: 0.75, borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: tokens.colorWhite }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <SearchBar
+            value={search}
+            onChange={setSearch}
+            placeholder={strings.reportBuilder.searchFields}
           />
         </Box>
+        <Tooltip title={strings.reportBuilder.certifiedHint}>
+          <Box component="label" sx={{ display: 'flex', alignItems: 'center', gap: 0.25, flexShrink: 0, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={certifiedOnly}
+              onChange={(event) => setCertifiedOnly(event.target.checked)}
+              aria-label={strings.reportBuilder.certifiedOnly}
+              style={{ width: 13, height: 13, margin: 0, accentColor: tokens.colorPrimary }}
+            />
+            <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>{strings.reportBuilder.certified}</Typography>
+          </Box>
+        </Tooltip>
+        <Tooltip title={strings.reportBuilder.sortBy}>
+          <span>
+            <IconButton
+              size="small"
+              aria-label={strings.reportBuilder.sortBy}
+              onClick={(event) => setSortAnchorEl(event.currentTarget)}
+              disabled={sortOptions.length === 0}
+              sx={{ width: 24, height: 24, color: sortField ? tokens.colorPrimary : tokens.colorTextSecondary, '&:hover': { bgcolor: tokens.colorPrimaryBg }, '&.Mui-disabled': { color: '#b0b0b0' } }}
+            >
+              <SortOutlined sx={{ fontSize: 16 }} />
+            </IconButton>
+          </span>
+        </Tooltip>
+        <Popover
+          open={Boolean(sortAnchorEl)}
+          anchorEl={sortAnchorEl}
+          onClose={() => setSortAnchorEl(null)}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+          transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+        >
+          <Box sx={{ p: 1.25, width: 220 }}>
+            <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', letterSpacing: '0.04em', mb: 0.5 }}>
+              {strings.reportBuilder.sortBy}
+            </Typography>
+            <Select
+              fullWidth
+              size="small"
+              displayEmpty
+              value={sortField}
+              onChange={(event) => setSortField(event.target.value as string)}
+              sx={{ fontSize: 11, mb: 0.75, '& .MuiSelect-select': { py: 0.5, px: 1 } }}
+            >
+              <MenuItem value="" sx={{ fontSize: 11 }}>{strings.reportBuilder.sortNone}</MenuItem>
+              {sortOptions.map((o) => (
+                <MenuItem key={o.field} value={o.field} sx={{ fontSize: 11 }}>{o.label}</MenuItem>
+              ))}
+            </Select>
+            <Select
+              fullWidth
+              size="small"
+              value={sortDir}
+              disabled={!sortField}
+              onChange={(event) => setSortDir(event.target.value as 'asc' | 'desc')}
+              sx={{ fontSize: 11, '& .MuiSelect-select': { py: 0.5, px: 1 } }}
+            >
+              <MenuItem value="asc" sx={{ fontSize: 11 }}>{strings.reportBuilder.sortAscending}</MenuItem>
+              <MenuItem value="desc" sx={{ fontSize: 11 }}>{strings.reportBuilder.sortDescending}</MenuItem>
+            </Select>
+          </Box>
+        </Popover>
       </Box>
 
+      <Box sx={{ borderTop: `2px solid ${tokens.colorPrimary}` }}>
       {loading ? (
         <Box sx={{ flex: 1, p: 1.5 }}>
           <Skeleton variant="text" width="60%" height={20} sx={{ mb: 1 }} />
@@ -1384,7 +1419,7 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
           <Skeleton variant="rectangular" height={64} sx={{ mb: 0.5, borderRadius: 1 }} />
         </Box>
       ) : (
-        <Box sx={{ flex: 1, overflowY: 'auto' }}>
+        <>
           <MeasureLibrary
             measures={filteredMeasures}
             searchQuery={debouncedSearch}
@@ -1397,6 +1432,10 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
             onAddToValues={(measureId) => {
               const m = filteredMeasures.find(fm => fm.id === measureId);
               if (m) addToZone(m.id, m.display_name, 'values');
+            }}
+            onAddToFilter={(measureId) => {
+              const m = filteredMeasures.find(fm => fm.id === measureId);
+              if (m) addToZone(m.id, m.display_name, 'filters', 'numeric');
             }}
             onInsertMeasureAsFunction={handleInsertMeasureAsFunction}
             onInsertMeasureAsFormula={handleInsertMeasureAsFormula}
@@ -1479,95 +1518,9 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
             onToggle={() => setHierExpanded(!hierExpanded)}
             onAssignToRows={(h, level) => { handleAddHierarchyToZone(h, level, 'rows'); }}
           />
-
-          <Box sx={{ px: 1.25, py: 0.5, display: 'flex', alignItems: 'center', gap: 0.75, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
-            <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary }}>
-              {strings.insertMode.label}
-            </Typography>
-            <Chip
-              label={strings.insertMode.live}
-              size="small"
-              clickable
-              variant={insertModeState === 'live' ? 'filled' : 'outlined'}
-              color={insertModeState === 'live' ? 'primary' : 'default'}
-              onClick={() => handleInsertModeChange('live')}
-              sx={{ fontSize: 10, height: 20 }}
-            />
-            <Chip
-              label={strings.insertMode.static}
-              size="small"
-              clickable
-              variant={insertModeState === 'static' ? 'filled' : 'outlined'}
-              color={insertModeState === 'static' ? 'primary' : 'default'}
-              onClick={() => handleInsertModeChange('static')}
-              sx={{ fontSize: 10, height: 20 }}
-            />
-          </Box>
-
-          <Box sx={{ p: 1.25, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(72px, 1fr))', gap: 0.5 }}>
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<RefreshOutlined sx={{ fontSize: 16 }} />}
-              onClick={() => { refreshCustomFunctionValues(); showToast(strings.toasts.refreshingValues, 'info'); }}
-              sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-            >
-              {strings.reportBuilder.refreshValues}
-            </Button>
-            <Button
-              size="small"
-              variant="outlined"
-              aria-label={strings.tableRefresh.refreshSheetDataAria}
-              startIcon={<TableChartOutlined sx={{ fontSize: 16 }} />}
-              onClick={handleRefreshSheetData}
-              disabled={tableRefreshLoading}
-              sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-            >
-              {strings.tableRefresh.refreshSheetData}
-            </Button>
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<FunctionsOutlined sx={{ fontSize: 16 }} />}
-              onClick={() => setCubeWizardOpen(true)}
-              sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-            >
-              {strings.reportBuilder.cubeButton}
-            </Button>
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<AccountTreeOutlined sx={{ fontSize: 16 }} />}
-              onClick={() => setConnWizardOpen(true)}
-              sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-            >
-              {strings.reportBuilder.connectButton}
-            </Button>
-            {lastQuery && (
-              <Button
-                size="small"
-                variant="outlined"
-                startIcon={<ManageSearchOutlined sx={{ fontSize: 16 }} />}
-                onClick={() => setTraceOpen(true)}
-                sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
-              >
-                {strings.reportBuilder.traceButton}
-              </Button>
-            )}
-          </Box>
-
-          {/*
-            Bug-7397 R12-5: the details surface behind the refresh toast's
-            "(see details)". Without it every honest skip reason the refresh
-            computes -- concurrent modification, table resized, corrupted
-            provenance, blocked cell blocks -- was dead text the user could
-            never read, and a transient skip looked identical to a permanent
-            failure. Keyed by refresh generation so a new refresh collapses the
-            previous run's expanded list instead of showing stale rows open.
-          */}
-          <RefreshDetailsPanel key={refreshGeneration} rows={refreshDetails} />
-        </Box>
+        </>
       )}
+      </Box>
 
       <TemplatePicker
         open={templatesOpen}
@@ -1602,8 +1555,8 @@ export default function ReportBuilder({ projectId, modelId, serverUrl, personaId
         onClose={() => setTraceOpen(false)}
         query={lastQuery}
         route={lastRoute}
-        modelId={modelId}
-        personaId={personaId}
+        modelName={traceModelName}
+        personaName={tracePersonaName}
       />
 
       <Dialog

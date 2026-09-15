@@ -37,5 +37,10 @@ export function partitionJoinsByEndpoints(
  * silently logging it to the console made calendar joins look like data loss.
  */
 export function countDroppedJoins(joins: Join[], nodeIds: Set<string>): number {
-  return partitionJoinsByEndpoints(joins, nodeIds).dropped.length;
+  return joins.filter((join) => {
+    const hidden = new Set(join.hidden_calendar_table_ids ?? []);
+    return [join.left_table_id, join.right_table_id].some(
+      (id) => !nodeIds.has(id) && !hidden.has(id),
+    );
+  }).length;
 }

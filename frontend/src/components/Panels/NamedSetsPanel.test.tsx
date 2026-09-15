@@ -1288,9 +1288,10 @@ describe("NamedSetsPanel", () => {
     expect(screen.getByTestId("tess-empty-dynamic")).toBeTruthy();
   });
 
-  it("2026-08-11 named-list refresh vintage: success updates members and vintage in the UI", async () => {
+  it("refresh updates draft members and vintage and explains that queries require Save and Deploy", async () => {
     const refreshMock = vi.fn().mockResolvedValue({
       id: "ns-dyn-1",
+      deploy_required: true,
       name: "TopAccounts",
       display_name: "Top Accounts",
       list_type: "sql_fixed",
@@ -1373,6 +1374,10 @@ describe("NamedSetsPanel", () => {
       expect(screen.getByTestId("tess-refresh-btn")).toBeTruthy();
     });
 
+    expect(screen.getByTestId("tess-refresh-deploy-notice").textContent).toBe(
+      "Refresh updates draft members only. Queries keep the deployed membership until you Save and Deploy the model.",
+    );
+
     // Click refresh
     await user.click(screen.getByTestId("tess-refresh-btn"));
 
@@ -1385,6 +1390,9 @@ describe("NamedSetsPanel", () => {
     expect(screen.getByText("Charlie")).toBeTruthy();
     expect(screen.getByTestId("tess-last-refreshed").textContent).toContain(
       "Last refreshed:",
+    );
+    expect(screen.getByTestId("tess-refresh-deploy-notice").textContent).toBe(
+      "Draft members refreshed. Save and Deploy the model to use them in queries.",
     );
   });
 

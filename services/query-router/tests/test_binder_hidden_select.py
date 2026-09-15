@@ -393,3 +393,31 @@ async def test_hidden_dim_as_count_distinct_measure_resolves():
         )
     measure_names = {m.name for m in bound.resolved_measures}
     assert "channel_code" in measure_names
+
+    assert next(m for m in bound.resolved_measures if m.name == "channel_code").is_query_only is True
+
+
+async def test_bug10013_unknown_dimension_rejected_before_workload_logging():
+    from fastapi import HTTPException
+    from src.api import routes
+
+    shape = _patches(
+        visible_dims=[VISIBLE_DIM], hidden_dims=[HIDDEN_DIM],
+        visible_measures=[VISIBLE_MEASURE], hidden_measures=[],
+        hidden_col_ids=HIDDEN_IDS,
+    )
+    miss = AsyncMock()
+    success = AsyncMock()
+    with shape, patch.object(routes, "_bind_query_parameters", AsyncMock()), \
+         patch.object(routes, "log_query_miss", miss), \
+         patch.object(routes, "record_query_success", success):
+        with pytest.raises(HTTPException) as failure:
+            await routes._handle_execute(
+                routes.ExecuteRequest(model_id="model-1", protocol="jdbc",
+                    raw_query="SELECT non_existing_dimension FROM modely"),
+                AsyncMock(), user_identity="app@example.com",
+            )
+    assert failure.value.status_code == 422
+    assert "Unknown column" in str(failure.value.detail)
+    miss.assert_not_awaited()
+    success.assert_not_awaited()

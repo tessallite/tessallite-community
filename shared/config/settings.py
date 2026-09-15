@@ -40,13 +40,23 @@ _TESTING = (
 
 
 class Settings(BaseSettings):
+    SYSTEM_LOGS_ENABLED: bool = True
+    SYSTEM_LOG_RETENTION_DAYS: int = Field(default=30, ge=0, le=36500)
     # System DB — global PostgreSQL that stores the tenant registry + per-tenant DB URLs
     SYSTEM_DATABASE_URL: str = "postgresql+asyncpg://tessallite:tessallite@localhost:5432/tessallite_system"
+    # System pool: 0 is unlimited; positive values cap connections.
+    # Deployment maps service-specific defaults here.
+    SYSTEM_DB_POOL_SIZE: int = Field(default=2, ge=0)
+
+    # Bug-9613 / D20 and Bug-9646: request-engine pool size. Other services
+    # retain two; scheduler and optimizer deployments map their approved
+    # bounded value of four here.
+    TENANT_DB_POOL_SIZE: int = Field(default=2, ge=2, le=4)
 
     # Bug-9192 / RFGPT-002: max retained per-tenant request engines in THIS
-    # process. Each engine holds pool_size=2 connections; an unbounded cache
-    # of engines can still exhaust PostgreSQL max_connections under a large
-    # active-tenant sweep. LRU eviction disposes the oldest engines.
+    # process. The retained connection ceiling is the product of this value
+    # and TENANT_DB_POOL_SIZE; an unbounded cache can still exhaust PostgreSQL
+    # under a large active-tenant sweep. LRU eviction disposes oldest engines.
     TENANT_ENGINE_CACHE_MAX: int = Field(default=16, ge=1)
 
     # Credential encryption — Fernet symmetric key (base64-encoded, 32 bytes)
@@ -75,6 +85,21 @@ class Settings(BaseSettings):
     # Auth — JWT signing material (rotation requires service restart)
     JWT_SECRET_KEY: str = "CHANGE_ME_use_strong_secret_in_production"
     JWT_ALGORITHM: str = "HS256"
+    # Durable per-account login lockout. Owner decision 2026-09-15: Tessallite
+    # does not lock accounts. 0 means NEVER lock and is the default; a tenant
+    # that wants the old behaviour sets a positive threshold explicitly.
+    #
+    # The previous default (5, with ge=1 so it could not be switched off) is the
+    # mechanism that made a third party able to lock out a legitimate operator:
+    # the lock is keyed on the ACCOUNT, not the caller, so anything failing
+    # logins against an address locks that address for everyone. An orphaned log
+    # forwarder doing exactly that blocked every Community install on this host
+    # for five days (Bug-10059), and the install error pointed at readiness.
+    #
+    # This does NOT touch query or table locks - with_for_update, and the
+    # advisory locks in migrations/refresh/cleanup, are concurrency correctness
+    # and stay exactly as they are.
+    TESSALLITE_LOGIN_LOCKOUT_MAX_FAILURES: int = Field(default=0, ge=0)
 
     # Open-core Community Edition licensing. Default ON: unactivated instances
     # deny capped creates until a signed licence is installed. Set
@@ -207,6 +232,12 @@ class Settings(BaseSettings):
     # whole HTTP request.
     GATEWAY_HEALTH_JDBC_PROBE_TIMEOUT_SECONDS: float = 2.0
 
+    # Bug-9054: every dependency-aware /readiness probe has one bounded budget.
+    # This is intentionally independent from /health and /liveness semantics;
+    # a stalled metadata database must produce a readiness failure, not pin an
+    # HTTP worker indefinitely or trigger a liveness restart cascade.
+    READINESS_PROBE_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=30)
+
     # Bug-8533 auto-recovery half: /health telling the truth does not RESTART
     # anything on Docker Compose or `docker run` — `restart: unless-stopped`
     # acts on process EXIT, not on health. So the gateway watches its own accept
@@ -223,6 +254,24 @@ class Settings(BaseSettings):
     # Consecutive failures required before the process exits. A successful probe
     # resets the count to zero.
     GATEWAY_JDBC_WATCHDOG_FAILURE_LIMIT: int = 3
+
+    # DR2-07/DR3I-06 (investor Demo RC): a live fault-injection proof for the
+    # watchdog above needs the JDBC accept loop specifically dead while the
+    # rest of the event loop -- including the watchdog's own probe task --
+    # keeps running (Bug-8533's actual failure shape; a full process kill
+    # exercises Docker's ordinary crash-recovery instead and would "pass" even
+    # if the watchdog code were removed entirely). False by default: the
+    # chaos-test endpoint this gates does not even get REGISTERED on the
+    # FastAPI app unless explicitly turned on, so there is zero attack surface
+    # in any deployment that has not opted in.
+    GATEWAY_ALLOW_CHAOS_TESTING: bool = False
+
+    # CG-C01 / DR3I-08 (investor Demo RC): the scheduler and optimizer freeze
+    # controls pause process-wide background mutation. They are not a tenant
+    # operation and must not be part of an ordinary shared deployment's API
+    # surface. Both services register the controls only when this explicit
+    # deployment-level opt-in is true.
+    SCHEDULER_FREEZE_CONTROLS_ENABLED: bool = False
 
     # Gateway SSL/TLS (JDBC listener)
     GATEWAY_SSL_ENABLED: bool = False
@@ -281,6 +330,17 @@ class Settings(BaseSettings):
     # nginx or not needed). Enable on edge deployments that expose 8080 directly
     # to BI clients (Excel/Power BI XMLA) over the public internet.
     GATEWAY_XMLA_TLS_ENABLED: bool = False
+    # Bug-9887: lifetime of the XMLA Basic-auth credential -> JWT cache
+    # (``gateway/src/dax/credential_cache.py``). The cache is keyed on the
+    # IDENTITY (username + salted password hash), so one login serves every
+    # catalogue that identity opens for this long. It is also the RESIDUAL
+    # REVOCATION WINDOW: a deactivated, deleted, role-changed or
+    # password-changed account can keep authenticating over XMLA for at most
+    # this many seconds before the next request forces a fresh model-service
+    # login (the policy-propagation contract's "maximum existing-token
+    # lifetime"). Clamped to 3600 s in the module; 0 disables the cache and
+    # restores a login per request.
+    GATEWAY_XMLA_CREDENTIAL_CACHE_TTL_SECONDS: int = 600
     LOOKER_GATEWAY_ENABLED: bool = False
 
     # Public-facing XMLA gateway URL used to generate .odc connection files
@@ -354,6 +414,18 @@ class Settings(BaseSettings):
     # never silent. Tune down only if a source has pathologically large dims.
     MEMBER_DISCOVERY_LIMIT: int = 100000
 
+    # Bug-9865: max per-dimension member fetches the XMLA member Discover runs
+    # at once. An UNRESTRICTED MDSCHEMA_MEMBERS browses every dimension in the
+    # cube, and the old unbounded ``asyncio.gather`` opened one model-service
+    # preview per dimension simultaneously (111 on the demo technical catalog).
+    # The tenant connection pool is TENANT_DB_POOL_SIZE (default 2, max 4), so
+    # the surplus requests queued on the pool until SQLAlchemy's pool timeout
+    # and returned 500 — the dimension then vanished from the rowset silently
+    # and the whole Discover took as long as that pool timeout. Bounding the
+    # fan-out just above the pool keeps every dimension served and removes the
+    # timeout wall. Raise only alongside TENANT_DB_POOL_SIZE.
+    XMLA_MEMBER_FETCH_CONCURRENCY: int = Field(default=6, ge=1, le=64)
+
     # Headless API rate limit — max requests per minute per tenant.
     HEADLESS_RATE_LIMIT: int = 100
 
@@ -392,6 +464,30 @@ class Settings(BaseSettings):
     # ``redis://host:6379/0`` or ``memcached://host:11211``) to enforce a
     # single ceiling across all replicas. No new dependency — URI passthrough.
     RATE_LIMIT_STORAGE_URI: str = ""
+
+    # Bug-9164 / F-R4-01: how many reverse-proxy hops sit in front of THIS
+    # placement, i.e. how far from the right of ``X-Forwarded-For`` the real
+    # client's address is. The rate limiter keys token-less requests (every
+    # login) on the client address; behind a proxy the immediate peer is the
+    # proxy, so without this every user shared one bucket and a single login
+    # burst throttled everyone.
+    #
+    # 0 (the default) never believes the header: the peer is the client. The
+    # compose files set 1 for the model-service, which only ever receives
+    # requests through the shipped nginx; the gateway keeps 0 because its JDBC
+    # and XMLA ports are published straight onto the host network, where a
+    # peer IS the client and must not be able to choose its own bucket by
+    # sending the header. A Helm deployment with an ingress in front of nginx
+    # sets 2. Trust is a hop count, never an address range: private ranges
+    # are where the client population lives, not a proxy identifier.
+    TRUSTED_PROXY_HOPS: int = Field(default=0, ge=0)
+
+    # Optional allow-list of the proxy hops' own addresses (comma-separated IP
+    # addresses or CIDR networks). Blank (the default) applies the hop count to
+    # every peer; set it to restrict header trust to the named proxies, e.g.
+    # when a service port is reachable from more than the proxy. The literal
+    # ``none`` trusts no peer at all. Ignored while TRUSTED_PROXY_HOPS is 0.
+    TRUSTED_PROXY_IPS: str = ""
 
     # Named Lists — SQL-path fixed member lists (section 5.5 of the spec).
     # Default member-count cap per list and hard ceiling an operator may raise it to.
@@ -443,6 +539,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_placeholder_secrets(self) -> "Settings":
+        # Bug-9613 / D20: increasing the scheduler tenant pool from two to four
+        # must not silently double the retained cross-tenant connection budget.
+        # Validate this even under pytest: it is a resource invariant, not a
+        # production-secret check.
+        retained_tenant_connections = (
+            self.TENANT_DB_POOL_SIZE * self.TENANT_ENGINE_CACHE_MAX
+        )
+        if retained_tenant_connections > 32:
+            raise ValueError(
+                "TENANT_DB_POOL_SIZE * TENANT_ENGINE_CACHE_MAX must be <= 32 "
+                f"(got {self.TENANT_DB_POOL_SIZE} * "
+                f"{self.TENANT_ENGINE_CACHE_MAX} = {retained_tenant_connections})"
+            )
+
         if _TESTING:
             return self
         for field_name in (

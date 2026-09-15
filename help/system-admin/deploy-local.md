@@ -13,6 +13,10 @@ Detailed operations reference for a local Docker Compose deployment. For Communi
 
 ---
 
+## Development stack and licences
+
+The source-checkout development stack (`tessallite/infra/docker-compose.yml`) defaults `TESSALLITE_DEV_UNLIMITED` to `true`, so creating models does not require a licence. This setting is passed into model-service. Community and other licensed deployments retain licence enforcement. New model errors show the server explanation, including missing activation, a model limit, or a duplicate name; a generic message is used when no explanation is available.
+
 ## Requirements
 
 - Docker Desktop 24 or later with Compose v2.

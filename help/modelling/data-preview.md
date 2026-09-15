@@ -51,6 +51,7 @@ Use the pagination controls to navigate through the data. The preview fetches ea
 - **Large tables may be slow.** On BigQuery or Spark sources, even a `LIMIT 100` query has a minimum latency due to job startup overhead.
 - **No filtering or sorting.** The preview shows raw data in source order. For filtered or sorted views, use the Measure Query Panel.
 - **Row security not applied.** The preview shows source rows regardless of persona or row security rules. It is a modeller tool, not an end-user view.
+- **Modeller role required.** Because the preview reads the physical table with no persona, column security or row security applied, it is restricted to the modeller role and above. A viewer is not offered the Preview Data button and a viewer's request is rejected.
 
 ---
 

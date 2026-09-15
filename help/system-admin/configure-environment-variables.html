@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Configure Environment Variables</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-24</span></div>
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-08-26</span></div>
     <h1>Configure Environment Variables</h1>
 <h2>What this covers</h2>
 <p>The variables you set in <code>.env</code> (Community/local) or Secret Manager (GCP) to start Tessallite. These are the <strong>bootstrap</strong> variables — the bare minimum the services need before they can read anything from the database. Operational tuning knobs (rate limits, optimizer thresholds, scheduler cadences) are set in the System Admin UI and are not covered here.</p>
@@ -36,7 +36,7 @@
 <div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>SYSTEM_DATABASE_URL</code></td><td>Full PostgreSQL connection URL. Format: <code>postgresql+asyncpg://postgres:&lt;password&gt;@&lt;vm-ip&gt;:5432/tessallite_system</code></td></tr>
 </tbody></table></div>
-<p>The scripted GCP deploy (<code>deploy/gcp/</code>) sets this automatically using the Compute Engine VM's IP address. You do not set it by hand unless you are connecting to a custom database host.</p>
+<p>The scripted GCP deploy (<code>deploy/gcp/</code>) sets this automatically using the Compute Engine VM's IP address. You do not set it by hand unless you are connecting to a custom database host. The same deploy persists <code>ENFORCE_SECRET_STRENGTH=true</code> and passes it to every backend Cloud Run service and the VM gateway; local, test, CI, and demo defaults remain warning-only.</p>
 <h2>Optional variables</h2>
 <div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>JDBC_PORT</code></td><td><code>5433</code></td><td>Port on which the gateway listens for JDBC connections.</td></tr>

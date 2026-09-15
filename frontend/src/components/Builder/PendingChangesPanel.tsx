@@ -23,23 +23,16 @@ import { useConfirm } from "../Confirm";
 import { useModelEditorStore } from "../../store/useModelEditorStore";
 import { DiffBody, useDiffCategoryLabels } from "./VersionDiffPanel";
 import { invalidateModelScopedCaches } from "./modelCacheInvalidation";
-
-// Mirrors the panel-level extractError pattern used across the builder dialogs
-// (Bug-7616): surface the backend detail instead of swallowing it.
-function extractError(e: unknown): string {
-  const err = e as {
-    response?: { data?: { detail?: string | { message?: string } } };
-    message?: string;
-  };
-  const detail = err?.response?.data?.detail;
-  if (typeof detail === "string") return detail;
-  if (detail && typeof detail === "object" && detail.message) return detail.message;
-  return err?.message ?? "";
-}
+import { extractApiError } from "../../utils/extractApiError";
 
 type Props = {
   projectId: string;
   modelId: string;
+  /** Whether the caller may author the model (editor role AND not a read-only
+   *  share link — the same signal that gates Save). Gates discard-unsaved,
+   *  which POSTs /discard-draft (require_role("modeler")). Bug-9387: without
+   *  this gate a sub-modeler saw an actionable button that 403s on click. */
+  canModel: boolean;
   /** Whether the caller may revert (project/tenant admin). Gates discard-to-
    *  deployed, which is the admin Revert operation under the hood. */
   canRevert: boolean;
@@ -63,7 +56,12 @@ type Props = {
  *     changes. It reuses the admin Revert endpoint (history is preserved), so
  *     it is gated on {@link Props.canRevert}.
  */
-export default function PendingChangesPanel({ projectId, modelId, canRevert }: Props) {
+export default function PendingChangesPanel({
+  projectId,
+  modelId,
+  canModel,
+  canRevert,
+}: Props) {
   const t = useT();
   const qc = useQueryClient();
   const confirm = useConfirm();
@@ -97,7 +95,7 @@ export default function PendingChangesPanel({ projectId, modelId, canRevert }: P
     onError: (e: unknown) =>
       setError(
         t("pendingChanges.discardFailed", {
-          error: extractError(e) || t("errors.requestFailed"),
+          error: extractApiError(e, "") || t("errors.requestFailed"),
         }),
       ),
   });
@@ -120,7 +118,7 @@ export default function PendingChangesPanel({ projectId, modelId, canRevert }: P
     onError: (e: unknown) =>
       setError(
         t("pendingChanges.discardFailed", {
-          error: extractError(e) || t("errors.requestFailed"),
+          error: extractApiError(e, "") || t("errors.requestFailed"),
         }),
       ),
   });
@@ -230,7 +228,7 @@ export default function PendingChangesPanel({ projectId, modelId, canRevert }: P
                 ? t("pendingChanges.hideChanges")
                 : t("pendingChanges.reviewChanges")}
             </Button>
-            {unsaved.base_version != null && (
+            {canModel && unsaved.base_version != null && (
               <Button
                 size="small"
                 color="warning"
@@ -243,6 +241,11 @@ export default function PendingChangesPanel({ projectId, modelId, canRevert }: P
               </Button>
             )}
           </Stack>
+        )}
+        {!canModel && !unsaved.base_version_unavailable && unsavedCount > 0 && (
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+            {t("pendingChanges.readOnlyHint")}
+          </Typography>
         )}
         {showUnsaved && !unsaved.base_version_unavailable && (
           <Box sx={{ mt: 1 }}>

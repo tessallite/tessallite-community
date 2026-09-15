@@ -35,4 +35,33 @@ describe("EditionBadge", () => {
     render(<EditionBadge />);
     expect(screen.getByTestId("edition-badge")).toHaveTextContent("Internal unlimited");
   });
+
+  // Bug-9307: an unactivated/invalid license manager reports the real edition
+  // name (e.g. "community") with activated=false — the chip used to look
+  // identical to a genuinely activated edition either way.
+  describe("not-activated marker (Bug-9307)", () => {
+    it("shows a Not activated chip for a real edition reporting activated=false", () => {
+      mockEdition.mockReturnValue({ data: { edition: "community", activated: false } });
+      render(<EditionBadge />);
+      expect(screen.getByTestId("edition-not-activated")).toHaveTextContent("Not activated");
+    });
+
+    it("does not show the marker for an activated edition", () => {
+      mockEdition.mockReturnValue({ data: { edition: "community", activated: true } });
+      render(<EditionBadge />);
+      expect(screen.queryByTestId("edition-not-activated")).toBeNull();
+    });
+
+    it("does not show the marker for the unactivated placeholder edition (already self-describing)", () => {
+      mockEdition.mockReturnValue({ data: { edition: "unactivated", activated: false } });
+      render(<EditionBadge />);
+      expect(screen.queryByTestId("edition-not-activated")).toBeNull();
+    });
+
+    it("does not show the marker for the internal-unlimited hatch", () => {
+      mockEdition.mockReturnValue({ data: { edition: "internal-unlimited", activated: false } });
+      render(<EditionBadge />);
+      expect(screen.queryByTestId("edition-not-activated")).toBeNull();
+    });
+  });
 });

@@ -18,6 +18,7 @@ from typing import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import MultipleResultsFound
 
 from shared.db.models import (
     Dimension,
@@ -105,15 +106,11 @@ async def apply_remediation(
 
 
 async def _resolve_model_table(model_id: object, event: SchemaChangeEvent, db: AsyncSession):
-    """Resolve the ``ModelTable`` a drift event refers to.
+    """Resolve the exact registration compared by the detector.
 
-    Bug-7886: a multi-connection model can carry the same ``physical_name``
-    under more than one source connection, so a ``(model_id, physical_name)``
-    lookup is ambiguous and ``scalar_one_or_none`` raised
-    ``MultipleResultsFound`` (surfaced as a 500 from the schema-drift trigger).
-    Scope by the event's ``source_id`` when present so the tuple is unique, and
-    fall back to the first match for legacy events that carry no ``source_id``
-    rather than crashing the whole drift run.
+    Several registrations can share both a source and physical table name.
+    Legacy events without an ID are safe only when that lookup is unique.
+    Never repair an arbitrary registration on an ambiguous match.
     """
     stmt = select(ModelTable).where(
         ModelTable.model_id == model_id,
@@ -122,8 +119,17 @@ async def _resolve_model_table(model_id: object, event: SchemaChangeEvent, db: A
     source_id = getattr(event, "source_id", None)
     if source_id is not None:
         stmt = stmt.where(ModelTable.source_id == source_id)
+    table_id = (event.detail or {}).get("model_table_id")
+    if table_id is not None:
+        stmt = stmt.where(ModelTable.id == uuid.UUID(str(table_id)))
     result = await db.execute(stmt)
-    return result.scalars().first()
+    try:
+        return result.scalar_one_or_none()
+    except MultipleResultsFound as exc:
+        raise ValueError(
+            f"Schema drift event for {event.table_name!r} matches multiple model "
+            "table registrations but has no model_table_id; run a new schema check."
+        ) from exc
 
 
 async def _handle_added(

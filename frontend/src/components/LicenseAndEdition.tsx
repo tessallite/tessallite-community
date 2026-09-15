@@ -146,6 +146,11 @@ export default function LicenseAndEdition() {
   // Both are non-active states with a distinct error chip and banner.
   const licenseInvalid = edition?.license_state === "invalid";
   const licenseExpired = edition?.license_state === "expired";
+  // Bug-9318: a broken compiled license-manager build (a packaging fault, not
+  // a licence document problem) previously fell through to the same "invalid"
+  // handling above — grep for `manager_load_failed` over this file found no
+  // handling at all, so it silently mis-presented as "no licence installed".
+  const managerLoadFailed = edition?.license_state === "manager_load_failed";
   const editionLabel =
     name === "community"
       ? t("edition.community")
@@ -198,7 +203,7 @@ export default function LicenseAndEdition() {
           label={editionLabel}
           data-testid="license-edition-chip"
         />
-        {edition?.activated && !licenseInvalid && !licenseExpired && (
+        {edition?.activated && !licenseInvalid && !licenseExpired && !managerLoadFailed && (
           <Chip
             size="small"
             color="success"
@@ -224,6 +229,15 @@ export default function LicenseAndEdition() {
             data-testid="license-expired-chip"
           />
         )}
+        {managerLoadFailed && (
+          <Chip
+            size="small"
+            color="error"
+            variant="filled"
+            label={t("license.managerLoadFailedChip")}
+            data-testid="license-manager-load-failed-chip"
+          />
+        )}
       </Stack>
 
       {/* Bug-7680: installed-but-invalid licence — surface a distinct error
@@ -240,6 +254,21 @@ export default function LicenseAndEdition() {
       {licenseExpired && (
         <Alert severity="warning" data-testid="license-expired-banner" sx={{ mt: 1 }}>
           {t("license.expiredBody")}
+        </Alert>
+      )}
+
+      {/* Bug-9318: the license MANAGER itself failed to load in this build — a
+          packaging/build fault, not a licence document being invalid/expired/
+          missing. Never dumped raw (load_error is shown only as a labelled,
+          clearly-secondary technical-detail line, not as the leading message). */}
+      {managerLoadFailed && (
+        <Alert severity="error" data-testid="license-manager-load-failed-banner" sx={{ mt: 1 }}>
+          {t("license.managerLoadFailedBody")}
+          {edition?.load_error && (
+            <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
+              {t("license.managerLoadFailedDetail", { detail: edition.load_error })}
+            </Typography>
+          )}
         </Alert>
       )}
 

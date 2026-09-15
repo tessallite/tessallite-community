@@ -129,6 +129,7 @@ class TestBug5424HierarchyMemberData:
             model_id, hierarchy_id, tenant_slug, jwt_token,
             project_id="", *, sample_size=1000, expand_level=None,
             parent_key=None, persona_id=None, include_key_path=False,
+            ancestor_keys=None, include_level_counts=True,
         ):
             captured_calls.append({"persona_id": persona_id})
             return {
@@ -174,6 +175,7 @@ class TestBug5424HierarchyMemberData:
             model_id, hierarchy_id, tenant_slug, jwt_token,
             project_id="", *, sample_size=1000, expand_level=None,
             parent_key=None, persona_id=None, include_key_path=False,
+            ancestor_keys=None, include_level_counts=True,
         ):
             captured_calls.append({"persona_id": persona_id})
             return {"members": [], "levels_summary": []}

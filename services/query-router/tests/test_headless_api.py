@@ -2106,3 +2106,82 @@ async def test_headless_route_trace_publishes_no_redaction_flag(client):
         )
     assert resp.status_code == 200, resp.text
     assert "reason_redacted" not in resp.json()["route"]
+
+
+# ---------------------------------------------------------------------------
+# Bug-9917: NUMERIC measures leave /headless/query as JSON NUMBERS
+# ---------------------------------------------------------------------------
+
+class TestHeadlessMeasureValuesAreNumbers:
+    """Bug-9917 (same root cause as Bug-9876 on ``/plugin/execute``).
+
+    The executor hands the endpoint ``Decimal`` values and pydantic's JSON mode
+    renders a ``Decimal`` as a STRING -- ``"180442041.28"`` for one measure and
+    ``"1.0E+5"`` for the next, because ``str(Decimal)`` follows the exponent.
+    A headless consumer summing ``rows`` or loading a dataframe then gets a
+    text column. The wire type is asserted on the RAW body text: ``resp.json()``
+    would turn a JSON number back into a float and hide a quoted string.
+    """
+
+    @staticmethod
+    def _raw_token(body_text: str, measure: str) -> str:
+        import re
+        m = re.search(rf'"{measure}"\s*:\s*("?[^,}}]*"?)', body_text)
+        assert m, f"{measure!r} not present in the response body: {body_text}"
+        return m.group(1)
+
+    async def _run(self, client, rows, measures):
+        model = _make_model()
+        bound = _make_bound(model)
+        bound.resolved_measures = [_make_measure(name) for name in measures]
+        columns = ["region", *measures]
+        with ExitStack() as stack:
+            _headless_patches(stack, bound=bound, rows=rows, columns=columns)
+            return await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model, measures=measures),
+                headers=_auth_headers(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_decimal_measure_reaches_the_wire_as_a_number(self, client):
+        from decimal import Decimal
+        resp = await self._run(
+            client,
+            [{"region": "US", "base_amount": Decimal("180442041.28")}],
+            ["base_amount"],
+        )
+        assert resp.status_code == 200, resp.text
+        token = self._raw_token(resp.text, "base_amount")
+        assert not token.startswith('"'), (
+            f"base_amount left the boundary as TEXT ({token})"
+        )
+        assert resp.json()["rows"][0]["base_amount"] == pytest.approx(180442041.28)
+
+    @pytest.mark.asyncio
+    async def test_scientific_notation_decimal_reaches_the_wire_as_a_plain_number(self, client):
+        from decimal import Decimal
+        resp = await self._run(
+            client,
+            [{"region": "US", "transaction_count": Decimal("1.0E+5")}],
+            ["transaction_count"],
+        )
+        assert resp.status_code == 200, resp.text
+        token = self._raw_token(resp.text, "transaction_count")
+        assert token == "100000", (
+            f"transaction_count must be a plain JSON integer, got {token}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dimension_values_are_not_renumbered(self, client):
+        """Only measure columns are typed; a dimension value that looks numeric
+        keeps the exact text the source returned (member matching)."""
+        from decimal import Decimal
+        resp = await self._run(
+            client,
+            [{"region": "0042", "base_amount": Decimal("1.5")}],
+            ["base_amount"],
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["rows"][0]["region"] == "0042"
+        assert self._raw_token(resp.text, "base_amount") == "1.5"

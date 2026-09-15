@@ -41,6 +41,8 @@ The route trace explains whether Tessallite used an aggregate, a pocket table, o
 
 A query you run often can be saved to the model's **Saved Queries** without retyping it. Give the query a name and an optional description. New saved queries are **personal by default**: only you can see them. Select **Share with everyone who can access this model** when you want teammates to see and run one; shared entries carry a **Shared** badge.
 
+Select **Play** to open Query Panel and run the saved SQL immediately through the current governed model context.
+
 Changing or deleting a saved query is governed:
 
 - You may always edit or delete a query **you** created.

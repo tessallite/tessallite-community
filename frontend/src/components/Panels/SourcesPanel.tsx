@@ -62,6 +62,7 @@ import TableEditDialog, { type TableEditTab } from "./TableEditDialog";
 import AliasMapDialog from "./AliasMapDialog";
 import TargetPanel from "./TargetPanel";
 import DataPreviewPanel from "../Builder/DataPreviewPanel";
+import { canPerform } from "../../auth/explorerPrivileges";
 import { useConfirm } from "../Confirm";
 import { useBuilderStore } from "../../store/builderStore";
 import { ui } from "../../theme/tokens";
@@ -212,6 +213,8 @@ function SourceTables({
   const [classifyStep, setClassifyStep] = useState(0); // 0=select, 1=review
   const [editDialog, setEditDialog] = useState<{ table: ModelTable; initialTab: TableEditTab } | null>(null);
   const [previewTable, setPreviewTable] = useState<ModelTable | null>(null);
+  // Bug-9896: raw source-table preview is modeller-and-above.
+  const canPreviewData = canPerform("table.previewData");
   const [createAliasDialog, setCreateAliasDialog] = useState<{ table: ModelTable } | null>(null);
   const [newAlias, setNewAlias] = useState("");
   const [newAliasDisplayName, setNewAliasDisplayName] = useState("");
@@ -764,17 +767,21 @@ function SourceTables({
               }}
               secondaryAction={
                 <Box display="flex" gap={0.25} alignItems="center">
-                  <Tooltip title={t("sources.previewDataTooltip")}>
-                    <IconButton
-                      size="small"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setPreviewTable(table);
-                      }}
-                    >
-                      <TableRowsIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
+                  {/* Bug-9896: the raw source preview is a modelling surface
+                      (modeller+). Do not offer a button a viewer cannot use. */}
+                  {canPreviewData && (
+                    <Tooltip title={t("sources.previewDataTooltip")}>
+                      <IconButton
+                        size="small"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPreviewTable(table);
+                        }}
+                      >
+                        <TableRowsIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  )}
                   <Tooltip title={t("sources.editTableTooltip")}>
                     <IconButton
                       size="small"

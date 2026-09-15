@@ -13,14 +13,28 @@ The Model Canvas records your editing actions and lets you step backwards and fo
 
 ## What is tracked
 
-One user action equals one undo step. The canvas tracks four kinds of actions:
+One user action equals one undo step. The canvas tracks these kinds of actions:
 
 | Action | What undo does |
 |---|---|
-| **Moving a table** (one drag gesture, however far) | Puts the table back where the drag started. |
-| **Applying a layout preset** (radial, hierarchical, compact) | Restores every table to its position before the redraw — the whole redraw is one step. |
+| **Moving a table** (one drag gesture, however far) | Puts the table back where the drag started, together with any relationship lines the move caused to be redrawn. |
+| **Resizing a table** | Restores the previous size, and the lines that were redrawn to fit it. |
+| **Arranging the model** (any preset, whole model or selection) | Restores every table to its position before the arrangement, and every relationship to the route it had — the whole arrangement is one step. |
+| **Rerouting the links** | Restores the previous routes. No table moved, so nothing else changes. |
+| **Editing a route by hand** (a bend, or an attachment point) | Restores the previous path. |
+| **Locking or unlocking a relationship** | Reverses the lock, and with it the path the lock froze. |
+| **Locking or unlocking a table's position** | Reverses the lock. The tables do not move — locking a position changes no coordinate. |
 | **Renaming a table** | Restores the previous display name. |
 | **Creating or deleting a join** | Deletes the created join, or recreates the deleted one. |
+
+A move or resize is one step even though it changes two things — the table's
+geometry and the relationship lines that had to be redrawn around it. Undo puts
+both back together, because splitting them would let you undo a move and be left
+with lines drawn for where the table used to be.
+
+A gesture the canvas refuses records nothing. Dragging a table across a locked
+relationship's path puts the tables back, and there is no undo step for it: the
+move did not happen.
 
 The very first drag is immediately undoable — move a table, press Ctrl+Z, and it snaps back. Undo always reverses the **most recent** action first; pressing it again walks further back, one action at a time. Redo replays the undone actions in order. Making a new change after an undo clears the redo history, just like a text editor.
 
@@ -63,9 +77,10 @@ In practice: undo freely, reload safely — but do your undoing before you leave
 ## Related
 
 - [Model Canvas Tour](model-canvas-tour.md)
+- [Arrange the Canvas](arrange-the-canvas.md)
 - [Define Joins](define-joins.md)
 - [Define Dimensions](define-dimensions.md)
 
 ---
 
-<- [Model Canvas Tour](model-canvas-tour.md) | [Home](../index.md) | [Define Joins ->](define-joins.md)
+← [Arrange the Canvas](arrange-the-canvas.md) | [Home](../index.md) | [Define Joins →](define-joins.md)

@@ -101,6 +101,19 @@ class DeployedShape:
     # (Bug-7981).
     join_rows: list[dict[str, Any]] = field(default_factory=list)
     user_defined_attribute_rows: list[dict[str, Any]] = field(default_factory=list)
+    # Bug-9490: the UDA COLUMN REFERENCES, not just the UDA definitions. The
+    # CLS closure decides whether a UDA-backed object reaches a restricted
+    # column by walking these refs; reading them live while the query is
+    # compiled from this snapshot split the authority. The snapshot already
+    # carries them (``serialiser`` writes ``uda_column_refs``), so this only
+    # exposes what was already pinned.
+    uda_column_ref_rows: list[dict[str, Any]] = field(default_factory=list)
+    # Bug-9490 (review F1): the deployed KPI DEFINITIONS. The $KPIs scorecard
+    # serves a value evaluated under the deployed definition, so the security
+    # lineage walk that authorises it must read the same definition. Reading
+    # live KPI rows let a draft edit change what a deployed value was checked
+    # against. The snapshot already carries them; only the shape did not.
+    kpi_rows: list[dict[str, Any]] = field(default_factory=list)
     # Qualified column index: (table_id, casefold physical column name) -> column
     # id. The ONLY safe way to resolve a qualified leaf — an unqualified name may
     # be ambiguous across tables, but (table_id, name) is unique.
@@ -406,6 +419,8 @@ def _build_shape(model_id: uuid.UUID, snapshot: dict[str, Any]) -> DeployedShape
         user_defined_attribute_rows=(
             snapshot.get("user_defined_attributes", []) or []
         ),
+        uda_column_ref_rows=snapshot.get("uda_column_refs", []) or [],
+        kpi_rows=snapshot.get("kpis", []) or [],
         qualified_column_ids=qualified_column_ids,
         table_name_ids=table_name_ids,
         calendar_tables=calendar_tables,
@@ -678,95 +693,6 @@ async def resolve_calc_dependency_measures(
     return out
 
 
-@dataclass
-class LiveMetadataBundle:
-    """The binder's live-load metadata, cached per deployed model version.
-
-    F-003-14: when a deployed model has no usable version snapshot (seed v1 /
-    empty snapshot), the binder falls back to loading measures, dimensions,
-    hierarchy-level dimensions, hidden-column ids, and (for ``SELECT *``)
-    physical column names from the live tables — up to five sequential
-    queries on the hot path of every query. These are immutable per deployed
-    model version, so they are cached keyed by ``(model_id,
-    deployed_version_id, deploy_epoch)`` exactly like
-    ``resolve_deployed_shape``; the key changes on re-deploy or revert,
-    making the cache multi-replica safe.
-    """
-
-    measures: list[Any]
-    dimensions: list[Any]
-    hierarchy_levels: list[Any]
-    hidden_column_ids: set[Any]
-    physical_columns_visible: set[str]
-    physical_columns_all: set[str]
-    # Lowercase physical column name -> stable ModelColumn id (str). Live-load
-    # analogue of DeployedShape.physical_column_ids; feeds the binder's derived
-    # leaf binding on the seed-v1 / empty-snapshot fallback path. Additive.
-    physical_column_ids: dict[str, str] = field(default_factory=dict)
-
-
-# key -> (expires_at, LiveMetadataBundle)
-# Key is (model_id, deployed_version_id, deploy_epoch).
-_LIVE_CACHE: dict[tuple[str, str, int], tuple[float, LiveMetadataBundle]] = {}
-
-
-def invalidate_live_metadata(model_id: object | None = None) -> None:
-    """Drop cached live-metadata bundles. No arg clears everything (test hook)."""
-    if model_id is None:
-        _LIVE_CACHE.clear()
-        return
-    mid = str(model_id)
-    for key in [k for k in _LIVE_CACHE if k[0] == mid]:
-        _LIVE_CACHE.pop(key, None)
-
-
-async def resolve_live_metadata_bundle(
-    model: Any,
-    db: AsyncSession,
-    *,
-    loader,
-) -> Optional[LiveMetadataBundle]:
-    """Return the cached live-metadata bundle for a deployed model, loading once.
-
-    ``loader`` is an async callable ``() -> LiveMetadataBundle`` that performs
-    the live DB loads. It is invoked only on a cache miss. The bundle is keyed
-    by ``(model_id, deployed_version_id, deploy_epoch)``; a model with no
-    deploy pointer is never cached (returns None so the caller loads live
-    every time — but the binder rejects undeployed models at its gate before
-    reaching here).
-
-    On a miss the loaded ORM objects are expunged from ``db`` so the cached
-    instances are detached-but-loaded and never expire against a closed
-    session — the same lifetime the deployed-snapshot path already relies on.
-    """
-    deployed_version_id = getattr(model, "deployed_version_id", None)
-    if deployed_version_id is None:
-        return None
-
-    epoch = getattr(model, "deploy_epoch", 0) or 0
-    key = (str(model.id), str(deployed_version_id), epoch)
-    now = time.monotonic()
-    cached = _LIVE_CACHE.get(key)
-    if cached is not None and cached[0] > now:
-        return cached[1]
-
-    bundle = await loader()
-
-    # Detach the loaded ORM objects so the cached copies remain readable after
-    # the originating request's session closes (read-only downstream use).
-    for obj in (*bundle.measures, *bundle.dimensions):
-        try:
-            db.expunge(obj)
-        except Exception:
-            pass
-
-    if len(_LIVE_CACHE) >= _MAX_CACHE_ENTRIES:
-        oldest_key = min(_LIVE_CACHE, key=lambda k: _LIVE_CACHE[k][0])
-        _LIVE_CACHE.pop(oldest_key, None)
-    _LIVE_CACHE[key] = (now + _CACHE_TTL_SECONDS, bundle)
-    return bundle
-
-
 def hierarchy_level_dimensions_from_snapshot(
     shape: DeployedShape,
 ) -> list[types.SimpleNamespace]:
@@ -843,9 +769,6 @@ __all__ = [
     "hierarchy_level_dimensions_from_snapshot",
     "invalidate",
     "reset_request_pins",
-    "LiveMetadataBundle",
-    "resolve_live_metadata_bundle",
-    "invalidate_live_metadata",
     "SnapshotAuthority",
     "resolve_snapshot_authority",
     "resolve_serving_authority",

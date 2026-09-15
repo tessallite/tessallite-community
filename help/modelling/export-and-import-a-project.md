@@ -2,7 +2,7 @@
 title: "Export and Import a Project"
 audience: tenant-admin
 area: modelling
-updated: 2026-05-28
+updated: 2026-08-27
 ---
 
 ## What this covers
@@ -30,6 +30,8 @@ This article covers export options, the import workflow, how connections and cre
 - **Export** requires the Admin role on the project.
 - **Import** requires Tenant Admin or System Admin privileges.
 - If you plan to include credentials in the export, choose a passphrase at least 8 characters long. You will need the same passphrase on import.
+- For a locked hosted-demo tenant, Tessallite rejects credential-bearing exports before loading credential keys or project data. This applies when the tenant is listed in `DEMO_SOURCE_LOCKED_TENANTS` or is classified as a demo by its licence.
+- Metadata-only export remains available to an authorized project admin for a locked hosted-demo tenant.
 
 ---
 

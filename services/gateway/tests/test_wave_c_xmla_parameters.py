@@ -144,7 +144,7 @@ async def test_undeclared_parameter_is_client_fault(monkeypatch):
         tenant_slug="demo", jwt_token="tok", session_id="sid-p2",
     )
     body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
-    assert "soap11env:Client" in body, body
+    assert xs.XMLA_CLIENT_FAULT_CODE in body, body
     assert "Unknown model parameter" in body
     assert not capture  # the query never ran
 
@@ -269,7 +269,7 @@ async def test_b1_drillthrough_undeclared_parameter_faults(monkeypatch):
         tenant_slug="demo", jwt_token="tok", session_id="sid-b1b",
     )
     body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
-    assert "soap11env:Client" in body, body
+    assert xs.XMLA_CLIENT_FAULT_CODE in body, body
     assert "Unknown model parameter" in body, body
     assert not capture, "drill query must not run when parameters are rejected"
 
@@ -286,6 +286,6 @@ async def test_b1_drillthrough_malformed_parameter_faults(monkeypatch):
         tenant_slug="demo", jwt_token="tok", session_id="sid-b1c",
     )
     body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
-    assert "soap11env:Client" in body, body
+    assert xs.XMLA_CLIENT_FAULT_CODE in body, body
     assert "more than once" in body, body
     assert not capture, "drill query must not run when parameters are malformed"

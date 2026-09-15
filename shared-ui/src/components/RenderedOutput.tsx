@@ -21,6 +21,7 @@ import { useChatContext } from "../providers/ChatProvider";
 interface RenderedOutputProps {
   html: string;
   chartsCss?: string;
+  compact?: boolean;
   /**
    * Bug-6584: optional URL of a served charts stylesheet. Only when this is a
    * non-empty string does the iframe emit a `<link rel="stylesheet">`. Hosts
@@ -35,10 +36,12 @@ function RenderedContent({
   html,
   chartsCss,
   chartsCssHref,
+  compact,
 }: {
   html: string;
   chartsCss?: string;
   chartsCssHref?: string;
+  compact?: boolean;
 }) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
@@ -246,7 +249,7 @@ function RenderedContent({
       sx={{
         width: "100%",
         height,
-        maxHeight: "70vh",
+        maxHeight: compact ? 220 : "70vh",
         border: 0,
         display: "block",
         bgcolor: "background.default",
@@ -255,7 +258,7 @@ function RenderedContent({
   );
 }
 
-export function RenderedOutput({ html, chartsCss, chartsCssHref }: RenderedOutputProps) {
+export function RenderedOutput({ html, chartsCss, chartsCssHref, compact = false }: RenderedOutputProps) {
   const [expanded, setExpanded] = useState(false);
   const { t } = useChatContext();
 
@@ -273,7 +276,7 @@ export function RenderedOutput({ html, chartsCss, chartsCssHref }: RenderedOutpu
         </Box>
       }
     >
-      <Box sx={{ mt: 1, position: "relative", minWidth: 0 }}>
+      <Box sx={{ mt: compact ? 0.5 : 1, position: "relative", minWidth: 0 }}>
         <Box
           sx={{
             border: 1,
@@ -283,7 +286,7 @@ export function RenderedOutput({ html, chartsCss, chartsCssHref }: RenderedOutpu
             bgcolor: "background.paper",
           }}
         >
-          <RenderedContent html={html} chartsCss={chartsCss} chartsCssHref={chartsCssHref} />
+          <RenderedContent html={html} chartsCss={chartsCss} chartsCssHref={chartsCssHref} compact={compact} />
         </Box>
         <IconButton
           size="small"

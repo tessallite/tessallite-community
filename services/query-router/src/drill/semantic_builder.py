@@ -952,6 +952,43 @@ async def _resolve_pk_tiebreaker_dims(
     return tuple(names)
 
 
+def normalize_object_id(value: Any) -> str:
+    """Canonical comparison form for a persona allow-list id.
+
+    Bug-6832: a UUID reaches this code as a ``UUID``, as lower-case hex, as
+    upper-case hex, or wrapped in braces depending on whether it came from the
+    ORM, a deployed snapshot, or a request body. Every allow-list comparison in
+    the drill surface goes through this one function so a case variant can never
+    make the option catalogue and the executor disagree.
+    """
+    return str(value).lower().strip("{}")
+
+
+def filter_drillable_by_persona(
+    drillable: Sequence[DrillableHierarchy],
+    allowed_hierarchy_ids: set[str] | None,
+) -> list[DrillableHierarchy]:
+    """Narrow a drillable set to the persona's ``included_hierarchy_ids``.
+
+    Bug-6274 / Bug-8560 (audit rows A33/A34): ``/drill-options`` advertises the
+    drills and ``build_drill_sql`` selects the one to execute. Both narrow by
+    the persona hierarchy allow-list, and they must narrow IDENTICALLY —
+    anything the catalogue offers must be executable, and anything the executor
+    would accept must be offered. They share this function so the two cannot
+    drift; previously each route filtered with its own inline comparison, and
+    only one of them normalised the id.
+
+    An empty or absent allow-list imposes no restriction.
+    """
+    if not allowed_hierarchy_ids:
+        return list(drillable)
+    allow = {normalize_object_id(h) for h in allowed_hierarchy_ids}
+    return [
+        h for h in drillable
+        if normalize_object_id(h.hierarchy_id) in allow
+    ]
+
+
 async def resolve_drill_options(
     *,
     measure_id: UUID,
@@ -1056,16 +1093,13 @@ async def build_drill_sql(
         db, measure.model_id, dims_by_name, snap=snap,
     )
 
-    # Bug-6274 [SECURITY]: honour the persona hierarchy allow-list the same way
-    # ``/drill-options`` does. Filter the drillable set to the persona's
-    # ``included_hierarchy_ids`` BEFORE selection so neither an explicit
-    # ``hierarchy_id`` nor the single-hierarchy auto-select can step down a
-    # hierarchy the persona is not permitted to see. An empty/None allow-list
-    # imposes no restriction (mirrors the ``if hier_allow:`` gate in the route).
-    if allowed_hierarchy_ids:
-        drillable = [
-            h for h in drillable if str(h.hierarchy_id) in allowed_hierarchy_ids
-        ]
+    # Bug-6274 [SECURITY] / Bug-8560: honour the persona hierarchy allow-list
+    # through the SAME function ``/drill-options`` advertises with, so the
+    # catalogue and the executor cannot disagree. Filtering happens BEFORE
+    # selection so neither an explicit ``hierarchy_id`` nor the single-hierarchy
+    # auto-select can step down a hierarchy the persona is not permitted to see.
+    # An empty/None allow-list imposes no restriction.
+    drillable = filter_drillable_by_persona(drillable, allowed_hierarchy_ids)
 
     drill_target: DrillableHierarchy | None = None
     if hierarchy_id is not None:

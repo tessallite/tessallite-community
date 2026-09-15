@@ -217,7 +217,7 @@ export default function RowSecurityPanel() {
       setFormError(null);
     },
     onError: (err: unknown) => {
-      setFormError(extractError(err) || t("errors.requestFailed"));
+      setFormError(extractApiError(err, "") || t("errors.requestFailed"));
     },
   });
 
@@ -230,7 +230,7 @@ export default function RowSecurityPanel() {
       setDialogOpen(false);
       setFormError(null);
     },
-    onError: (err: unknown) => setFormError(extractError(err) || t("errors.requestFailed")),
+    onError: (err: unknown) => setFormError(extractApiError(err, "") || t("errors.requestFailed")),
   });
 
   const deleteMutation = useMutation({
@@ -263,7 +263,7 @@ export default function RowSecurityPanel() {
     },
     onError: (err: unknown) => {
       setSimResult(null);
-      setSimError(extractError(err) || t("errors.requestFailed"));
+      setSimError(extractApiError(err, "") || t("errors.requestFailed"));
     },
   });
 
@@ -794,10 +794,6 @@ function parseClaims(raw: string): Record<string, string> {
  * 422 came out as a stringified array. Callers keep their `|| t(...)` fallback,
  * so the empty string preserves their existing behaviour.
  */
-function extractError(err: unknown): string {
-  return extractApiError(err, "");
-}
-
 function defaultProbeQuery(
   slug: string | undefined,
   rules: RowSecurityRule[] | undefined,

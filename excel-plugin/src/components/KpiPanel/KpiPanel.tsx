@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
-  Box, Typography, Chip, Skeleton, TextField, InputAdornment, IconButton,
+  Box, Typography, Chip, Skeleton, TextField, InputAdornment, IconButton, Checkbox,
 } from '@mui/material';
 import {
   SearchOutlined,
@@ -8,6 +8,8 @@ import {
   BarChartOutlined,
   DashboardOutlined,
   RefreshOutlined,
+  ChevronRight,
+  ExpandMore,
 } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import { getKpis, evaluateKpiBatch, getMeasures, reportKpiUsage } from '../../api/modelService';
@@ -34,6 +36,7 @@ interface KpiPanelProps {
 }
 
 type FilterMode = 'all' | 'certified';
+type StatusFilter = 1 | 0 | -1 | null;
 
 const STATUS_COLORS: Record<number, string> = {
   1: '#2e7d32',
@@ -72,6 +75,8 @@ export default function KpiPanel({
   // The KPI list still loads; this banner surfaces why values are missing.
   const [evalError, setEvalError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterMode>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(null);
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -136,7 +141,7 @@ export default function KpiPanel({
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  const filteredKpis = useMemo(() => {
+  const searchedKpis = useMemo(() => {
     let list = kpis;
     if (filter === 'certified') {
       list = list.filter(k => k.certification_status === 'certified');
@@ -150,6 +155,11 @@ export default function KpiPanel({
     }
     return list;
   }, [kpis, filter, debouncedSearch]);
+
+  const filteredKpis = useMemo(() => {
+    if (statusFilter == null) return searchedKpis;
+    return searchedKpis.filter(kpi => results.get(kpi.id)?.status === statusFilter);
+  }, [searchedKpis, results, statusFilter]);
 
   const grouped = useMemo(() => {
     const groups = new Map<string, Kpi[]>();
@@ -178,6 +188,15 @@ export default function KpiPanel({
     }
     return { good, warning, poor };
   }, [results]);
+
+  const toggleFolder = useCallback((folder: string) => {
+    setCollapsedFolders(previous => {
+      const next = new Set(previous);
+      if (next.has(folder)) next.delete(folder);
+      else next.add(folder);
+      return next;
+    });
+  }, []);
 
   const handleInsertTable = useCallback(async (kpi: Kpi) => {
     const r = results.get(kpi.id);
@@ -275,136 +294,201 @@ export default function KpiPanel({
     }
   }, [kpis, measuresById, results, evalError, onInsertScorecard, connectionName, modelSlug, showToast, projectId, modelId, personaId]);
 
-  if (loading) {
-    return (
-      <Box sx={{ p: 2, display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-        <Skeleton variant="rectangular" height={32} sx={{ borderRadius: 1 }} />
-        <Skeleton variant="rectangular" height={80} sx={{ borderRadius: 1 }} />
-        <Skeleton variant="rectangular" height={80} sx={{ borderRadius: 1 }} />
-        <Skeleton variant="rectangular" height={80} sx={{ borderRadius: 1 }} />
-      </Box>
-    );
-  }
-
-  if (error) {
-    return (
-      <Box sx={{ p: 3, textAlign: 'center' }}>
-        <Typography sx={{ fontSize: 13, color: tokens.colorRed, mb: 1 }}>{error}</Typography>
-        <Box
-          component="button"
-          onClick={fetchData}
-          sx={{ fontSize: 12, px: 2, py: 0.75, borderRadius: 1, cursor: 'pointer', border: `1px solid ${tokens.colorPrimary}`, color: tokens.colorPrimary, bgcolor: 'transparent' }}
-        >
-          {strings.kpiPanel.tryAgain}
-        </Box>
-      </Box>
-    );
-  }
-
-  if (kpis.length === 0) {
-    return (
-      <Box sx={{ p: 3, textAlign: 'center' }}>
-        <Typography sx={{ fontSize: 14, fontWeight: 600, color: tokens.colorCharcoal, mb: 0.5 }}>
-          {strings.kpiPanel.noKpisTitle}
-        </Typography>
-        <Typography sx={{ fontSize: 12, color: tokens.colorTextSecondary }}>
-          {strings.kpiPanel.noKpisDescription}
-        </Typography>
-      </Box>
-    );
-  }
-
   return (
-    <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {/* Header */}
-      <Box sx={{ px: 1.5, py: 1, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.75 }}>
-          <Typography sx={{ fontSize: 13, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-            {templates.kpiPanel.kpiCount(kpis.length)}
-          </Typography>
-          <IconButton size="small" onClick={fetchData} title={strings.kpiPanel.refreshKpis} sx={{ width: 26, height: 26 }}>
-            <RefreshOutlined sx={{ fontSize: 15 }} />
-          </IconButton>
-          {kpis.length > 0 && (
-            <IconButton
-              size="small"
-              onClick={handleInsertAllScorecard}
-              title={strings.kpiPanel.insertAllScorecard}
-              sx={{ width: 26, height: 26, color: tokens.colorGoldDark }}
-            >
-              <DashboardOutlined sx={{ fontSize: 15 }} />
-            </IconButton>
-          )}
-        </Box>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
-          {statusCounts.good > 0 && (
-            <Chip label={templates.kpiPanel.statusCount(statusCounts.good, strings.kpiPanel.good)} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600 }} />
-          )}
-          {statusCounts.warning > 0 && (
-            <Chip label={templates.kpiPanel.statusCount(statusCounts.warning, strings.kpiPanel.warning)} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600 }} />
-          )}
-          {statusCounts.poor > 0 && (
-            <Chip label={templates.kpiPanel.statusCount(statusCounts.poor, strings.kpiPanel.poor)} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(211,47,47,0.08)', color: '#d32f2f', fontWeight: 600 }} />
-          )}
-        </Box>
-      </Box>
-
-      {/* Evaluation error banner — list still renders, values unavailable (F-025-03) */}
-      {evalError && (
-        <Box sx={{ px: 1.5, py: 0.75, borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: 'rgba(237,108,2,0.06)' }}>
-          <Typography sx={{ fontSize: 11, color: '#ed6c02' }}>
-            {evalError}
-          </Typography>
-        </Box>
-      )}
-
-      {/* Filter bar */}
-      <Box sx={{ px: 1.5, py: 0.75, display: 'flex', alignItems: 'center', gap: 0.75, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
-        {(['all', 'certified'] as const).map(f => (
-          <Chip
-            key={f}
-            label={f === 'all' ? strings.kpiPanel.filterAll : strings.kpiPanel.filterCertified}
-            size="small"
-            variant={filter === f ? 'filled' : 'outlined'}
-            onClick={() => setFilter(f)}
-            sx={{
-              fontSize: 10, height: 20, fontWeight: 600, cursor: 'pointer',
-              ...(filter === f ? { bgcolor: tokens.colorPrimary, color: '#fff' } : { color: tokens.colorTextSecondary }),
-            }}
-          />
-        ))}
+    <Box sx={{
+      flex: 1,
+      minHeight: 0,
+      overflow: 'auto',
+    }}>
+      {/* Compact controls: one 34px row replaces the former title/filter rows. */}
+      <Box sx={{
+        minHeight: 34,
+        height: 34,
+        px: 1.25,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 0.75,
+        borderBottom: `1px solid ${tokens.colorBorderLight}`,
+      }}>
         <TextField
           size="small"
           placeholder={strings.kpiPanel.searchPlaceholder}
           value={search}
           onChange={(e) => handleSearchChange(e.target.value)}
+          inputProps={{ 'aria-label': strings.kpiPanel.searchPlaceholder }}
           InputProps={{
             startAdornment: (
-              <InputAdornment position="start">
+              <InputAdornment position="start" sx={{ mr: 0.5 }}>
                 <SearchOutlined sx={{ fontSize: 14, color: tokens.colorTextSecondary }} />
               </InputAdornment>
             ),
             sx: { fontSize: 11, height: 24, px: 0.75 },
           }}
-          sx={{ flex: 1, '& .MuiOutlinedInput-root': { borderRadius: 1 } }}
+          sx={{
+            flex: 1,
+            minWidth: 0,
+            '& .MuiOutlinedInput-root': { borderRadius: 0.5 },
+          }}
         />
+        <Box
+          component="label"
+          title={strings.kpiPanel.filterCertified}
+          sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0, cursor: 'pointer' }}
+        >
+          <Checkbox
+            checked={filter === 'certified'}
+            onChange={(event) => setFilter(event.target.checked ? 'certified' : 'all')}
+            inputProps={{ 'aria-label': strings.kpiPanel.filterCertified }}
+            sx={{
+              p: 0,
+              width: 13,
+              height: 13,
+              '& .MuiSvgIcon-root': { fontSize: 14 },
+            }}
+          />
+          <Typography component="span" sx={{ fontSize: 11, color: tokens.colorTextSecondary, whiteSpace: 'nowrap' }}>
+            {strings.kpiPanel.filterCertified}
+          </Typography>
+        </Box>
+        <IconButton
+          size="small"
+          onClick={fetchData}
+          disabled={loading}
+          title={strings.kpiPanel.refreshKpis}
+          aria-label={strings.kpiPanel.refreshKpis}
+          sx={{
+            width: 24,
+            height: 24,
+            flexShrink: 0,
+            border: `1px solid ${tokens.colorBorder}`,
+            borderRadius: 0.5,
+          }}
+        >
+          <RefreshOutlined sx={{ fontSize: 15 }} />
+        </IconButton>
+        <IconButton
+          size="small"
+          onClick={handleInsertAllScorecard}
+          disabled={loading || Boolean(error) || kpis.length === 0}
+          title={strings.kpiPanel.insertAllScorecard}
+          aria-label={strings.kpiPanel.insertAllScorecard}
+          sx={{
+            width: 24,
+            height: 24,
+            flexShrink: 0,
+            borderRadius: 0.5,
+            color: tokens.colorWhite,
+            bgcolor: tokens.colorPrimary,
+            '&:hover': { bgcolor: tokens.colorPrimaryDark },
+            '&.Mui-disabled': { color: tokens.colorWhite, bgcolor: tokens.colorPrimary, opacity: 0.45 },
+          }}
+        >
+          <DashboardOutlined sx={{ fontSize: 15 }} />
+        </IconButton>
       </Box>
 
-      {/* KPI list */}
-      <Box sx={{ flex: 1, overflow: 'auto', px: 1, py: 0.5 }}>
-        {filteredKpis.length === 0 ? (
-          <Typography sx={{ fontSize: 12, color: tokens.colorTextSecondary, textAlign: 'center', py: 3 }}>
-            {strings.kpiPanel.noSearchMatch}
+      {/* Status strip: each pill is a filter, while the count remains the full list count. */}
+      <Box sx={{
+        minHeight: 26,
+        height: 26,
+        px: 1.25,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 0.75,
+        overflow: 'hidden',
+        borderBottom: `1px solid ${tokens.colorBorderLight}`,
+      }}>
+        <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, whiteSpace: 'nowrap' }}>
+          {templates.kpiPanel.kpiCount(kpis.length)}
+        </Typography>
+        <Box sx={{ width: '1px', height: 12, bgcolor: tokens.colorBorderLight, flexShrink: 0 }} />
+        {([
+          { status: 1 as const, count: statusCounts.good, label: strings.kpiPanel.good, color: '#2e7d32', background: 'rgba(46,125,50,0.08)' },
+          { status: 0 as const, count: statusCounts.warning, label: strings.kpiPanel.warning, color: '#ed6c02', background: 'rgba(237,108,2,0.08)' },
+          { status: -1 as const, count: statusCounts.poor, label: strings.kpiPanel.poor, color: '#d32f2f', background: 'rgba(211,47,47,0.08)' },
+        ]).filter(item => item.count > 0 || item.status === statusFilter).map(item => {
+          const selected = statusFilter === item.status;
+          return (
+            <Chip
+              key={item.status}
+              clickable
+              aria-pressed={selected}
+              onClick={() => setStatusFilter(selected ? null : item.status)}
+              label={`${templates.kpiPanel.statusCount(item.count, item.label)}${selected ? ' ×' : ''}`}
+              title={templates.kpiPanel.statusCount(item.count, item.label)}
+              size="small"
+              sx={{
+                height: 14,
+                borderRadius: 7,
+                fontSize: 9,
+                fontWeight: 600,
+                cursor: 'pointer',
+                color: selected ? tokens.colorWhite : item.color,
+                bgcolor: selected ? item.color : item.background,
+                '& .MuiChip-label': { px: 0.625 },
+              }}
+            />
+          );
+        })}
+        <Typography noWrap title={strings.kpiPanel.statusFilterHint} sx={{ fontSize: 10, color: tokens.colorTextSecondary, ml: 'auto', minWidth: 0 }}>{strings.kpiPanel.statusFilterHint}</Typography>
+      </Box>
+
+      {/* Evaluation error banner — list still renders, values unavailable (F-025-03). */}
+      {evalError && (
+        <Box sx={{ px: 1.25, py: 0.5, borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: 'rgba(237,108,2,0.06)' }}>
+          <Typography sx={{ fontSize: 10.5, lineHeight: 1.3, color: '#ed6c02' }}>
+            {evalError}
           </Typography>
-        ) : (
-          grouped.map((group, gi) => (
-            <Box key={gi} sx={{ mb: 1 }}>
-              {group.folder && (
-                <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', px: 0.5, py: 0.5 }}>
-                  {group.folder}
-                </Typography>
-              )}
-              {group.kpis.map(kpi => (
+        </Box>
+      )}
+
+      {loading ? (
+        <Box sx={{ p: 1.5, display: 'flex', flexDirection: 'column', gap: 1.25 }}>
+          {Array.from({ length: 6 }).map((_, index) => (
+            <Skeleton key={index} variant="rectangular" height={30} sx={{ borderRadius: 0.5 }} />
+          ))}
+        </Box>
+      ) : error ? (
+        <Box sx={{ p: '32px 20px', textAlign: 'center' }}>
+          <Typography sx={{ fontSize: 12, lineHeight: 1.4, color: tokens.colorRed, mb: 1.25 }}>
+            {error}
+          </Typography>
+          <Box
+            component="button"
+            type="button"
+            onClick={fetchData}
+            sx={{
+              height: 26,
+              px: 1.5,
+              fontSize: 12,
+              borderRadius: 0.5,
+              cursor: 'pointer',
+              border: `1px solid ${tokens.colorPrimary}`,
+              color: tokens.colorPrimary,
+              bgcolor: 'transparent',
+            }}
+          >
+            {strings.kpiPanel.tryAgain}
+          </Box>
+        </Box>
+      ) : kpis.length === 0 ? (
+        <Box sx={{ p: '36px 24px', textAlign: 'center' }}>
+          <Typography sx={{ fontSize: 14, fontWeight: 600, color: tokens.colorCharcoal, mb: 0.5 }}>
+            {strings.kpiPanel.noKpisTitle}
+          </Typography>
+          <Typography sx={{ fontSize: 12, lineHeight: 1.4, color: tokens.colorTextSecondary }}>
+            {strings.kpiPanel.noKpisDescription}
+          </Typography>
+        </Box>
+      ) : filteredKpis.length === 0 ? (
+        <Typography sx={{ p: '28px 20px', fontSize: 12, color: tokens.colorTextSecondary, textAlign: 'center' }}>
+          {strings.kpiPanel.noSearchMatch}
+        </Typography>
+      ) : (
+        <Box sx={{ borderTop: `2px solid ${tokens.colorPrimary}` }}>
+          {grouped.map((group, index) => {
+            if (!group.folder) {
+              return group.kpis.map(kpi => (
                 <KpiRow
                   key={kpi.id}
                   kpi={kpi}
@@ -412,11 +496,57 @@ export default function KpiPanel({
                   onInsertTable={() => handleInsertTable(kpi)}
                   onInsertChart={() => handleInsertChart(kpi)}
                 />
-              ))}
-            </Box>
-          ))
-        )}
-      </Box>
+              ));
+            }
+
+            const collapsed = collapsedFolders.has(group.folder);
+            return (
+              <Box key={group.folder || index}>
+                <Box
+                  component="button"
+                  type="button"
+                  onClick={() => toggleFolder(group.folder!)}
+                  aria-expanded={!collapsed}
+                  aria-label={group.folder}
+                  sx={{
+                    width: '100%',
+                    height: 24,
+                    minHeight: 24,
+                    p: '0 6px 0 10px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 0.625,
+                    border: 0,
+                    borderBottom: `1px solid ${tokens.colorBorderLight}`,
+                    bgcolor: tokens.colorSubtleFill,
+                    color: tokens.colorTextSecondary,
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    '&:hover': { bgcolor: tokens.colorPrimaryBg },
+                  }}
+                >
+                  <Typography component="span" sx={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {group.folder}
+                  </Typography>
+                  <Typography component="span" sx={{ ml: 'auto', fontSize: 10, fontWeight: 400 }}>
+                    {group.kpis.length}
+                  </Typography>
+                  {collapsed ? <ChevronRight sx={{ fontSize: 14 }} /> : <ExpandMore sx={{ fontSize: 14 }} />}
+                </Box>
+                {!collapsed && group.kpis.map(kpi => (
+                  <KpiRow
+                    key={kpi.id}
+                    kpi={kpi}
+                    result={results.get(kpi.id)}
+                    onInsertTable={() => handleInsertTable(kpi)}
+                    onInsertChart={() => handleInsertChart(kpi)}
+                  />
+                ))}
+              </Box>
+            );
+          })}
+        </Box>
+      )}
     </Box>
   );
 }
@@ -431,78 +561,123 @@ interface KpiRowProps {
 }
 
 function KpiRow({ kpi, result, onInsertTable, onInsertChart }: KpiRowProps) {
-  const statusColor = result?.status != null ? STATUS_COLORS[result.status] ?? tokens.colorTextSecondary : tokens.colorTextSecondary;
+  const statusColor = result?.status != null ? STATUS_COLORS[result.status] ?? tokens.colorTextSecondary : '#9a9a9a';
   const trendArrow = result?.trend_label ? TREND_ARROWS[result.trend_label.toLowerCase()] ?? '' : '';
   const trendColor = result?.trend_label ? TREND_COLORS[result.trend_label.toLowerCase()] ?? tokens.colorTextSecondary : tokens.colorTextSecondary;
   const chartAvailable = result != null && result.value != null && result.goal != null;
+  const chartTitle = chartAvailable ? strings.kpiPanel.insertChartTitle : strings.kpiPanel.evalError;
+  const displayName = kpi.display_name || kpi.name;
+  const isCertified = kpi.certification_status === 'certified';
+  const isDeprecated = kpi.certification_status === 'deprecated';
+  const hasValue = result?.value != null && Boolean(result.formatted_value);
 
   return (
     <Box sx={{
-      border: `1px solid ${tokens.colorBorderLight}`,
-      borderRadius: 1.5, mb: 0.75, p: 1, bgcolor: tokens.colorWhite,
-      '&:hover': { borderColor: tokens.colorPrimary, boxShadow: '0 1px 4px rgba(0,0,0,0.06)' },
+      minHeight: 30,
+      height: 30,
+      p: '0 4px 0 10px',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 0.75,
+      borderBottom: `1px solid ${tokens.colorBorderLight}`,
+      bgcolor: tokens.colorWhite,
+      fontSize: 12,
+      '&:hover': { bgcolor: tokens.colorPrimaryBg },
     }}>
-      {/* Top row: name + value + trend */}
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.5 }}>
-        <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: statusColor, flexShrink: 0 }} />
-        <Typography sx={{ fontSize: 12, fontWeight: 600, color: tokens.colorCharcoal, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {kpi.display_name || kpi.name}
+      <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: statusColor, flexShrink: 0 }} />
+      <Typography
+        title={displayName}
+        sx={{
+          minWidth: 0,
+          flex: 1,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          fontSize: 12,
+          fontWeight: 600,
+          color: isDeprecated ? tokens.colorTextSecondary : tokens.colorCharcoal,
+          textDecoration: isDeprecated ? 'line-through' : 'none',
+        }}
+      >
+        {displayName}
+      </Typography>
+      {isCertified && (
+        <Box component="span" sx={{
+          flexShrink: 0,
+          height: 14,
+          px: 0.625,
+          display: 'inline-flex',
+          alignItems: 'center',
+          borderRadius: 7,
+          bgcolor: 'rgba(46,125,50,0.08)',
+          color: '#2e7d32',
+          fontSize: 9,
+          fontWeight: 600,
+          whiteSpace: 'nowrap',
+        }}>
+          {strings.kpiCard.chipCertified}
+        </Box>
+      )}
+      {isDeprecated && (
+        <Box component="span" sx={{
+          flexShrink: 0,
+          height: 14,
+          px: 0.625,
+          display: 'inline-flex',
+          alignItems: 'center',
+          borderRadius: 7,
+          bgcolor: 'rgba(237,108,2,0.08)',
+          color: '#ed6c02',
+          fontSize: 9,
+          fontWeight: 600,
+          whiteSpace: 'nowrap',
+        }}>
+          {strings.kpiCard.chipDeprecated}
+        </Box>
+      )}
+      {hasValue ? (
+        <Typography sx={{ fontSize: 12, fontWeight: 700, color: statusColor, flexShrink: 0, whiteSpace: 'nowrap' }}>
+          {result?.formatted_value}
         </Typography>
-        {result?.formatted_value && (
-          <Typography sx={{ fontSize: 12, fontWeight: 700, color: statusColor, flexShrink: 0 }}>
-            {result.formatted_value}
-          </Typography>
-        )}
-        {trendArrow && (
-          <Typography sx={{ fontSize: 14, fontWeight: 700, color: trendColor, flexShrink: 0, lineHeight: 1 }}>
-            {trendArrow}
-          </Typography>
-        )}
-      </Box>
-
-      {/* Target line */}
+      ) : <Typography sx={{ fontSize: 11, color: '#9a9a9a' }}>{strings.kpiPanel.notEvaluated}</Typography>}
       {result?.formatted_goal && (
-        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, pl: 1.75, mb: 0.5 }}>
-          {strings.kpiPanel.targetPrefix} {result.formatted_goal}
+        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, flexShrink: 0, whiteSpace: 'nowrap' }}>
+          / {result.formatted_goal}
         </Typography>
       )}
-
-      {/* Action buttons */}
-      <Box sx={{ display: 'flex', gap: 0.75, pl: 1.75 }}>
-        <Box
-          component="button"
+      {trendArrow && (
+        <Typography sx={{ fontSize: 13, fontWeight: 700, color: trendColor, flexShrink: 0, lineHeight: 1 }}>
+          {trendArrow}
+        </Typography>
+      )}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.125, ml: 0.25, flexShrink: 0 }}>
+        <IconButton
+          size="small"
           onClick={onInsertTable}
           title={strings.kpiPanel.insertTableTitle}
-          sx={{
-            display: 'flex', alignItems: 'center', gap: 0.4,
-            fontSize: 10, fontWeight: 600, px: 0.75, py: 0.35,
-            borderRadius: 0.75, cursor: 'pointer',
-            border: `1px solid ${tokens.colorBorderLight}`, bgcolor: 'transparent',
-            color: tokens.colorTextSecondary,
-            '&:hover': { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary, borderColor: tokens.colorPrimary },
-          }}
+          aria-label={strings.kpiPanel.insertTableTitle}
+          sx={{ width: 22, height: 22, color: tokens.colorTextSecondary, borderRadius: 0.5, '&:hover': { color: tokens.colorPrimary, bgcolor: tokens.colorPrimaryBg } }}
         >
-          <TableChartOutlined sx={{ fontSize: 12 }} />
-          {strings.kpiPanel.insertTable}
-        </Box>
-        <Box
-          component="button"
-          onClick={chartAvailable ? onInsertChart : undefined}
-          disabled={!chartAvailable}
-          title={chartAvailable ? strings.kpiPanel.insertChartTitle : strings.kpiPanel.evalError}
-          sx={{
-            display: 'flex', alignItems: 'center', gap: 0.4,
-            fontSize: 10, fontWeight: 600, px: 0.75, py: 0.35,
-            borderRadius: 0.75,
-            cursor: chartAvailable ? 'pointer' : 'not-allowed',
-            border: `1px solid ${tokens.colorBorderLight}`, bgcolor: 'transparent',
-            color: tokens.colorTextSecondary,
-            opacity: chartAvailable ? 1 : 0.4,
-            '&:hover': chartAvailable ? { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary, borderColor: tokens.colorPrimary } : {},
-          }}
-        >
-          <BarChartOutlined sx={{ fontSize: 12 }} />
-          {strings.kpiPanel.insertChart}
+          <TableChartOutlined sx={{ fontSize: 15 }} />
+        </IconButton>
+        <Box component="span" title={chartTitle} sx={{ display: 'inline-flex' }}>
+          <IconButton
+            size="small"
+            onClick={chartAvailable ? onInsertChart : undefined}
+            disabled={!chartAvailable}
+            title={chartTitle}
+            aria-label={chartTitle}
+            sx={{
+              width: 22,
+              height: 22,
+              color: tokens.colorTextSecondary,
+              borderRadius: 0.5,
+              '&:hover': chartAvailable ? { color: tokens.colorPrimary, bgcolor: tokens.colorPrimaryBg } : {},
+              '&.Mui-disabled': { color: '#c4c4c4' },
+            }}
+          >
+            <BarChartOutlined sx={{ fontSize: 15 }} />
+          </IconButton>
         </Box>
       </Box>
     </Box>

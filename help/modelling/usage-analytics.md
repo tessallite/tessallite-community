@@ -7,6 +7,10 @@ updated: 2026-05-15
 
 ![Live Usage Analytics tab from Model Builder.](../assets/screencaps/usage-analytics-tab.png)
 
+## Routing categories
+
+Routing Breakdown has three exclusive categories: Source includes source and raw detail queries; Aggregation includes aggregate and pocket reads; Short memory cache means a previous query result was reused. Cache hits count only in Short memory cache. Metadata and discovery requests are excluded. Percentages use only the queries included in these three categories.
+
 ## What this covers
 
 Usage Analytics is a read-only Model Builder tab that shows how a deployed model is being queried. It helps modellers understand adoption, latency, aggregate hit rate, common measures, and query patterns that may deserve new aggregates or pockets.

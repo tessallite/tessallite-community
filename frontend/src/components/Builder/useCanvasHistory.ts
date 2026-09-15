@@ -6,6 +6,9 @@ import type {
   CanvasLayout,
   DimensionAttributeRelationshipCreate,
   DimensionAttributeRelationshipUpdate,
+  HierarchyCreate,
+  HierarchyLevelCreate,
+  HierarchyUpdate,
   JoinCreate,
   UserDefinedAttributeCreate,
   UserDefinedAttributeUpdate,
@@ -39,6 +42,7 @@ export type NodePositions = Record<string, { x: number; y: number }>;
 
 /** Per-edge layout entries (waypoints, anchor sides/ratios, pathing). */
 export type EdgeLayouts = NonNullable<CanvasLayout["edges"]>;
+export type TableLayouts = NonNullable<CanvasLayout["tables"]>;
 
 // ---------------------------------------------------------------------------
 // Drawer-edit undo/redo (Bug-8227 / G-026-01)
@@ -102,6 +106,12 @@ export type HistoryAction =
        *  table positions. Omitted for plain drags, which never touch edges. */
       beforeEdges?: EdgeLayouts;
       afterEdges?: EdgeLayouts;
+      /** Full table-layout snapshot before/after — populated for changes that
+       *  alter a table's presentation without moving it, notably pinning. The
+       *  spec allows extending the move action for exactly this rather than
+       *  adding a parallel history type. Omitted for plain drags. */
+      beforeTables?: TableLayouts;
+      afterTables?: TableLayouts;
     }
   | {
       type: "rename";
@@ -127,7 +137,12 @@ export interface CanvasActionEvent {
 
 /** Uniform CRUD surface used by command replay; adapters bridge parent scopes. */
 interface EntityApi {
-  create: (p: string, m: string, data: Record<string, unknown>) => Promise<unknown>;
+  create: (
+    p: string,
+    m: string,
+    data: Record<string, unknown>,
+    onReplayFailure?: () => void,
+  ) => Promise<unknown>;
   update: (p: string, m: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
   delete: (p: string, m: string, id: string, data?: Record<string, unknown>) => Promise<unknown>;
 }
@@ -211,6 +226,49 @@ const pocketEntityApi: EntityApi = {
   delete: (p, m, id) => pocketsApi.delete(p, m, id),
 };
 
+/**
+ * Bug-8314: hierarchies are the one drawer entity with child rows. A delete
+ * undo re-creates the header through hierarchiesApi.create, but drill levels
+ * are separate rows (hierarchiesApi.createLevel) that would be lost. The
+ * delete producer snapshots the levels into the `__levels` metadata key of the
+ * undo record (HierarchiesPanel deleteHierarchy); this adapter strips the key
+ * from the wire payload and replays the level creates in ordinal order after
+ * the header create, so undo restores the full hierarchy rather than a header
+ * shell. A create-undo (plain delete) cascades levels server-side and needs
+ * nothing here.
+ */
+const hierarchyEntityApi: EntityApi = {
+  create: async (p, m, data, onReplayFailure) => {
+    const levels = data.__levels;
+    const payload = withoutHistoryKeys(data, "__levels") as unknown as HierarchyCreate;
+    const created = await hierarchiesApi.create(p, m, payload);
+    const newId = (created as { id?: string })?.id;
+    if (newId && Array.isArray(levels) && levels.length > 0) {
+      const ordered = [...(levels as HierarchyLevelCreate[])].sort(
+        (a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0),
+      );
+      try {
+        for (const level of ordered) {
+          await hierarchiesApi.createLevel(p, m, newId, level);
+        }
+      } catch (levelErr) {
+        // B1 witness B: the composite replay is not atomic. Compensate by
+        // removing the freshly created header (its levels cascade server-side),
+        // invalidate the hierarchy query family, and rethrow so the generic
+        // catch restores the action and surfaces the failure — no partial
+        // hierarchy survives and the stack stays retryable.
+        await hierarchiesApi.delete(p, m, newId).catch(() => undefined);
+        onReplayFailure?.();
+        throw levelErr;
+      }
+    }
+    return created;
+  },
+  update: (p, m, id, data) =>
+    hierarchiesApi.update(p, m, id, data as unknown as HierarchyUpdate),
+  delete: (p, m, id) => hierarchiesApi.delete(p, m, id),
+};
+
 const calendarEntityApi: EntityApi = {
   create: (p, m, data) => {
     const payload = withoutHistoryKeys(data, "__source_id", "__calendar_flow", "__history_provenance");
@@ -261,7 +319,7 @@ const drillThroughSetEntityApi: EntityApi = {
 const DRAWER_ENTITY_APIS: Record<DrawerEntity, EntityApi> = {
   measure: measuresApi as unknown as EntityApi,
   dimension: dimensionsApi as unknown as EntityApi,
-  hierarchy: hierarchiesApi as unknown as EntityApi,
+  hierarchy: hierarchyEntityApi,
   persona: personasApi as unknown as EntityApi,
   kpi: kpisApi as unknown as EntityApi,
   namedSet: namedSetsApi as unknown as EntityApi,
@@ -382,6 +440,9 @@ export function useCanvasHistory(
   /** Restore an edge-layout snapshot applied by undo/redo of a layout-preset
    *  redraw (rewrite canvas_layout edges + live ReactFlow edge data + flush). */
   onApplyEdges?: (edges: EdgeLayouts) => void,
+  /** Restore a table-layout snapshot applied by undo/redo — pins and sizes,
+   *  which a position map alone does not carry. */
+  onApplyTables?: (tables: TableLayouts) => void,
   /** Surface an undo/redo apply failure to the user (F-026-19). Receives the
    *  caught error so the caller can extract an API message and toast it. */
   onError?: (err: unknown) => void,
@@ -480,21 +541,29 @@ export function useCanvasHistory(
    * (waypoints/anchors), which the redraw otherwise discards. When supplied,
    * the entry is recorded even if no table position changed (a redraw can
    * leave tables put while rewriting every edge anchor).
+   *
+   * `tableSnapshots` (optional) does the same for table presentation that is
+   * not a position — pinning. Supplying either snapshot is enough to record the
+   * entry, because both describe changes a position diff cannot see.
    */
   const recordMove = useCallback(
     (
       before: NodePositions,
       after: NodePositions,
       edgeSnapshots?: { before: EdgeLayouts; after: EdgeLayouts },
+      tableSnapshots?: { before: TableLayouts; after: TableLayouts },
     ) => {
       const diff = diffPositions(before, after);
-      if (!diff && !edgeSnapshots) return;
+      if (!diff && !edgeSnapshots && !tableSnapshots) return;
       pushAction({
         type: "move",
         before: diff?.before ?? {},
         after: diff?.after ?? {},
         ...(edgeSnapshots
           ? { beforeEdges: edgeSnapshots.before, afterEdges: edgeSnapshots.after }
+          : {}),
+        ...(tableSnapshots
+          ? { beforeTables: tableSnapshots.before, afterTables: tableSnapshots.after }
           : {}),
       });
     },
@@ -577,12 +646,37 @@ export function useCanvasHistory(
           const paired = reverse ? action.redo : action.undo;
           const registry = DRAWER_ENTITY_APIS[action.entity];
           if (op.kind === "create") {
-            const created = await registry.create(projectId, modelId, op.data ?? {});
+            const created = await registry.create(
+              projectId,
+              modelId,
+              op.data ?? {},
+              () => invalidateEntity(action.entity),
+            );
             const newId = (created as { id?: string })?.id;
             // The row was just re-created with a fresh id. The OPPOSITE op is the
             // one that will later act on this row (delete it, or update it), so
             // point it at the live id — mirrors the addLink id-writeback below.
-            if (newId) paired.id = newId;
+            if (newId) {
+              const staleId = paired.id;
+              paired.id = newId;
+              // Bug-8320: sibling entries for the SAME row still carry the old
+              // (now-deleted) id — e.g. an update recorded before the delete.
+              // Replaying one of them would 404 and permanently block the rest
+              // of the stack (F-026-19 catches it, but the stack stays stuck).
+              // Repoint every command op for this entity across both stacks so
+              // the whole history targets the live row.
+              if (staleId && staleId !== newId) {
+                for (const stack of [undoStack.current, redoStack.current]) {
+                  for (const entry of stack) {
+                    if (entry.type !== "command" || entry.entity !== action.entity) {
+                      continue;
+                    }
+                    if (entry.redo.id === staleId) entry.redo.id = newId;
+                    if (entry.undo.id === staleId) entry.undo.id = newId;
+                  }
+                }
+              }
+            }
           } else if (op.kind === "update") {
             if (!op.id) throw new Error("update command missing id");
             await registry.update(projectId, modelId, op.id, op.data ?? {});
@@ -613,6 +707,10 @@ export function useCanvasHistory(
           // (F-026-11 round 2 / review finding 2).
           const targetEdges = reverse ? action.beforeEdges : action.afterEdges;
           if (targetEdges) onApplyEdges?.(targetEdges);
+          // Pins (and card sizes) live in the table map, not in the position
+          // map, so undoing a pin needs its own restore.
+          const targetTables = reverse ? action.beforeTables : action.afterTables;
+          if (targetTables) onApplyTables?.(targetTables);
           break;
         }
         case "rename": {
@@ -659,7 +757,7 @@ export function useCanvasHistory(
         }
       }
     },
-    [projectId, modelId, setNodes, invalidateJoins, invalidateTables, invalidateEntity, onApplyMove, onApplyEdges],
+    [projectId, modelId, setNodes, invalidateJoins, invalidateTables, invalidateEntity, onApplyMove, onApplyEdges, onApplyTables],
   );
 
   const undo = useCallback(async () => {

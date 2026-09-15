@@ -28,6 +28,7 @@ import {
   Divider,
   FormControl,
   FormControlLabel,
+  Checkbox,
   IconButton,
   InputLabel,
   MenuItem,
@@ -588,7 +589,7 @@ function ModelInfoSection({ model }: { model: any }) {
     [t("modelHealth.aggregationsEnabled"), model.aggregations_enabled ? t("modelHealth.yes") : t("modelHealth.no")],
     // Bug-9409: all-measure aggregates are opt-in; an un-loaded value reads as
     // OFF, matching the backend default in shared/model_defaults.py.
-    [t("modelHealth.includeAllMeasures"), (model.include_all_measures ?? false) ? t("modelHealth.yes") : t("modelHealth.no")],
+    [t("modelHealth.includeAllMeasures"), (model.include_all_measures ?? true) ? t("modelHealth.yes") : t("modelHealth.no")],
   ];
   const technical: [string, string | null | undefined][] = [
     [t("modelHealth.modelId"), model.id],
@@ -1316,6 +1317,7 @@ export function SchemaDriftSection({
 }) {
   const t = useT();
   const qc = useQueryClient();
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   // Include acknowledged events so the section shows drift history with a
   // clear status, not only the unresolved backlog.
@@ -1352,6 +1354,27 @@ export function SchemaDriftSection({
   });
 
   const rows = events.data?.items ?? [];
+  const pendingIds = rows.filter((event) => !event.acknowledged_at).map((event) => event.id);
+  const selectedPending = pendingIds.filter((id) => selectedIds.includes(id));
+  const bulkAcknowledge = useMutation({
+    mutationFn: async (ids: string[]) => {
+      const failed: string[] = [];
+      for (const id of ids) {
+        try {
+          await schemaDriftApi.acknowledge(id);
+        } catch {
+          failed.push(id);
+        }
+      }
+      setSelectedIds(failed);
+      if (failed.length) throw new Error(t("modelHealth.bulkAcknowledgeFailed", { count: failed.length }));
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["schema-drift", modelId, "all"] });
+      qc.invalidateQueries({ queryKey: ["schema-drift-impact", projectId, modelId] });
+    },
+  });
+  const acknowledging = acknowledge.isPending || bulkAcknowledge.isPending;
 
   // Map event id -> its impact alert (title/detail describe the affected object).
   const impactByEvent = useMemo(() => {
@@ -1370,6 +1393,26 @@ export function SchemaDriftSection({
   return (
     <>
       <SectionHeader title={t("modelHealth.schemaDrift")} />
+      {pendingIds.length > 0 && (
+        <Stack direction="row" alignItems="center" spacing={1}>
+          <FormControlLabel
+            label={t("modelHealth.selectAllDrift")}
+            control={<Checkbox
+              checked={selectedPending.length === pendingIds.length}
+              indeterminate={selectedPending.length > 0 && selectedPending.length < pendingIds.length}
+              disabled={acknowledging}
+              onChange={(_, checked) => setSelectedIds(checked ? pendingIds : [])}
+            />}
+          />
+          <Button disabled={acknowledging || selectedPending.length === 0}
+            onClick={() => bulkAcknowledge.mutate(selectedPending)}>
+            {t("modelHealth.acknowledgeSelected", { count: selectedPending.length })}
+          </Button>
+        </Stack>
+      )}
+      {(bulkAcknowledge.isError || acknowledge.isError) && (
+        <Alert severity="error">{bulkAcknowledge.error?.message ?? t("modelHealth.acknowledgeFailed")}</Alert>
+      )}
       {events.isLoading ? (
         <CircularProgress size={18} />
       ) : events.isError ? (
@@ -1390,6 +1433,7 @@ export function SchemaDriftSection({
           <Table size="small">
             <TableHead>
               <TableRow sx={{ bgcolor: "grey.50" }}>
+                <TableCell padding="checkbox" />
                 <TableCell>{t("modelHealth.colDetected")}</TableCell>
                 <TableCell>{t("modelHealth.colTable")}</TableCell>
                 <TableCell>{t("modelHealth.colColumn")}</TableCell>
@@ -1406,6 +1450,14 @@ export function SchemaDriftSection({
                 const acknowledged = !!e.acknowledged_at;
                 return (
                   <TableRow key={e.id}>
+                    <TableCell padding="checkbox">
+                      {!acknowledged && <Checkbox
+                        inputProps={{ "aria-label": t("modelHealth.selectDriftEvent", { name: String(e.detail?.column_name ?? e.table_name ?? e.id) }) }}
+                        checked={selectedPending.includes(e.id)}
+                        disabled={acknowledging}
+                        onChange={(_, checked) => setSelectedIds((ids) => checked ? [...ids, e.id] : ids.filter((id) => id !== e.id))}
+                      />}
+                    </TableCell>
                     <TableCell sx={{ whiteSpace: "nowrap" }}>
                       <Typography variant="caption">
                         {new Date(e.detected_at).toLocaleString()}
@@ -1481,7 +1533,7 @@ export function SchemaDriftSection({
                           <IconButton
                             size="small"
                             onClick={() => acknowledge.mutate(e.id)}
-                            disabled={acknowledge.isPending}
+                            disabled={acknowledging}
                           >
                             <CheckCircleIcon fontSize="small" />
                           </IconButton>

@@ -64,7 +64,10 @@ export function recordUpdate(
   );
 }
 
-/** A deleted row: undo re-creates it from `priorData`, redo deletes it again. */
+/** A deleted row: undo re-creates it from `priorData`, redo deletes it again.
+ *  `priorData` may carry `__`-prefixed replay metadata for entities with child
+ *  rows (e.g. `__levels` for hierarchies — Bug-8314); the entity adapter in
+ *  useCanvasHistory strips it before the wire call and replays the children. */
 export function recordDelete(
   entity: DrawerEntity,
   id: string,

@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -123,28 +123,131 @@ describe('Excel manifest V1_0 runtime-contract guard (all plugin-root manifests)
  * is actually tracked by git; an ignored or generated artifact makes the suite
  * pass on the author's machine and fail collection everywhere else.
  */
+// Every raw-text specifier in a source, whatever the import form (static import,
+// dynamic import(), require()) or quote style (single or double). The 2026-09-09
+// ALEX verification proved the earlier single-quote `from` pattern let the
+// double-quoted and dynamic forms through, so the enumeration failed open on
+// exactly the shape the record describes. This file's own examples are built by
+// concatenation below so the scan of the test directory never matches itself.
+export function rawImportSpecifiers(source: string): string[] {
+  const found: string[] = [];
+  for (const match of source.matchAll(/(['"`])([^'"`\r\n]+)\?raw\1/g)) {
+    found.push(match[2]);
+  }
+  return found;
+}
+
+const rawImportAliases: Array<{ prefix: string; root: string }> = [
+  { prefix: '@tessallite/shared-ui', root: resolve(pluginRoot, '../shared-ui/src') },
+  { prefix: '@', root: resolve(pluginRoot, 'src') },
+];
+
+const SOURCE_FILE_PATTERN = /\.(?:[cm]?[jt]sx?)$/;
+
+export function isSourceFileName(name: string): boolean {
+  return SOURCE_FILE_PATTERN.test(name);
+}
+
+function walkSourceFiles(directory: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...walkSourceFiles(path));
+    } else if (isSourceFileName(entry.name)) {
+      files.push(path);
+    }
+  }
+  return files.sort();
+}
+
+export function resolveRawImportSpecifier(specifier: string, importerDirectory: string): string {
+  if (specifier.startsWith('.')) return resolve(importerDirectory, specifier);
+
+  const alias = rawImportAliases.find(
+    candidate => specifier === candidate.prefix || specifier.startsWith(`${candidate.prefix}/`),
+  );
+  if (alias) {
+    return resolve(alias.root, specifier.slice(alias.prefix.length).replace(/^\//, ''));
+  }
+
+  throw new Error(`Cannot resolve ?raw import specifier ${specifier}`);
+}
+
 describe('Bug-8811 — the suite never depends on an untracked file', () => {
   const testsDir = resolve(pluginRoot, 'src/__tests__');
 
-  it('every `?raw` import in the plugin test suite points at a tracked file', () => {
-    const tracked = new Set(
-      execFileSync('git', ['ls-files', '-z'], { cwd: pluginRoot, encoding: 'utf8' })
-        .split('\0')
-        .filter(Boolean)
-        .map((rel) => resolve(pluginRoot, rel)),
-    );
-    // Fail closed: an empty listing means git could not answer, which must not
-    // be mistaken for "no violations".
-    expect(tracked.size).toBeGreaterThan(0);
+  it('enumerates every `?raw` import form and quote style (fails closed on the guard itself)', () => {
+    const suffix = '?' + 'raw';
+    const sample = [
+      `import a from '../../sideload-catalog/one.xml${suffix}';`,
+      `import b from "../../sideload-catalog/two.xml${suffix}";`,
+      `const c = await import('../../sideload-catalog/three.xml${suffix}');`,
+      `const d = require("../../sideload-catalog/four.xml${suffix}");`,
+      `const e = import(\`../../sideload-catalog/five.xml${suffix}\`);`,
+      `import f from '@/functions.ts${suffix}';`,
+      "import e from './not-raw.xml';",
+    ].join('\n');
+    expect(rawImportSpecifiers(sample)).toEqual([
+      '../../sideload-catalog/one.xml',
+      '../../sideload-catalog/two.xml',
+      '../../sideload-catalog/three.xml',
+      '../../sideload-catalog/four.xml',
+      '../../sideload-catalog/five.xml',
+      '@/functions.ts',
+    ]);
+  });
 
+  it('resolves the Vite alias and fails closed for an unknown non-relative specifier', () => {
+    expect(resolveRawImportSpecifier('@/functions.ts', testsDir)).toBe(
+      resolve(pluginRoot, 'src/functions.ts'),
+    );
+    expect(() => resolveRawImportSpecifier('unmapped-package/fixture.xml', testsDir))
+      .toThrow('Cannot resolve ?raw import specifier unmapped-package/fixture.xml');
+  });
+
+  it('walks nested test directories', () => {
+    expect(walkSourceFiles(testsDir)).toContain(
+      resolve(testsDir, 'nested/rawImportFixture.test.ts'),
+    );
+  });
+
+  it('recognizes every Vitest/Vite JavaScript and TypeScript source extension', () => {
+    for (const extension of ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts']) {
+      expect(isSourceFileName(`raw-import-fixture${extension}`)).toBe(true);
+    }
+    expect(isSourceFileName('raw-import-fixture.css')).toBe(false);
+  });
+
+  function isTrackedPath(repositoryRoot: string, target: string): boolean {
+    const relativeTarget = relative(repositoryRoot, target);
+    if (!relativeTarget || relativeTarget.startsWith('..')) return false;
+    try {
+      const result = execFileSync(
+        'git',
+        ['ls-files', '--error-unmatch', '--', relativeTarget],
+        { cwd: repositoryRoot, encoding: 'utf8' },
+      );
+      return result.split('\n').filter(Boolean).includes(relativeTarget);
+    } catch {
+      return false;
+    }
+  }
+
+  it('every `?raw` import in the plugin test suite points at a tracked file', () => {
+    const repositoryRoot = resolve(
+      execFileSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: pluginRoot,
+        encoding: 'utf8',
+      }).trim(),
+    );
     const offenders: string[] = [];
-    for (const name of readdirSync(testsDir)) {
-      if (!/\.tsx?$/.test(name)) continue;
-      const source = readFileSync(join(testsDir, name), 'utf8');
-      for (const match of source.matchAll(/from\s+'(\.[^']+)\?raw'/g)) {
-        const target = resolve(testsDir, match[1]);
-        if (!tracked.has(target)) {
-          offenders.push(`${name} -> ${match[1]}`);
+    for (const sourcePath of walkSourceFiles(testsDir)) {
+      const source = readFileSync(sourcePath, 'utf8');
+      for (const specifier of rawImportSpecifiers(source)) {
+        const target = resolveRawImportSpecifier(specifier, dirname(sourcePath));
+        if (!isTrackedPath(repositoryRoot, target)) {
+          offenders.push(`${sourcePath} -> ${specifier}`);
         }
       }
     }

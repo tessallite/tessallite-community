@@ -44,7 +44,6 @@ WEBHOOK_EVENT_LABELS: dict[str, str] = {
     "access.revoked": "Access Revoked",
     "license.installed": "License Installed",
     "license.uninstalled": "License Uninstalled",
-    "tenant.deleted": "Tenant Deleted",
     "user.updated": "User Updated",
     "embed_token.created": "Embed Token Created",
     "embed_token.revoked": "Embed Token Revoked",

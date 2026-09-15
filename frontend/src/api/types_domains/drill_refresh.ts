@@ -96,6 +96,7 @@ export interface QueryRouterFieldCompatibilityFeedback {
 }
 export interface ValidateResponse {
   ok: boolean;
+  error_type?: "deployed_snapshot_unavailable" | null;
   errors: string[];
   warnings: string[];
   requested_measures: string[];

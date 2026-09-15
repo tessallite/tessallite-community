@@ -37,6 +37,8 @@ QUERY_LOG_CLIENT_KINDS: tuple[str, ...] = (
     "agent",           # conversational agent (agent-service exec)
     "mcp",             # MCP tool call (SQL over HTTP)
     "kpi",             # KPI evaluation bridge (model-service -> /execute)
+    "hierarchy_preview",  # hierarchy member preview (model-service -> /execute)
+    "maintenance",       # internal validate/refresh/security probes
 )
 
 # Runtime-constructed Literal so FastAPI/Pydantic validate exactly this domain.
@@ -53,6 +55,30 @@ REQUEST_DECLARABLE_CLIENT_KINDS: tuple[str, ...] = (
     "agent",
     "drill",
     "kpi",
+    "hierarchy_preview",
+    "maintenance",
 )
+
+# Optimizer workload evidence is restricted to successful analytical demand.
+# These explicit origins/routes are maintenance or metadata traffic. A NULL
+# client_kind remains eligible because JDBC/app callers historically omit the
+# optional label, including scheduled reports using a service account.
+OPTIMIZER_EXCLUDED_CLIENT_KINDS: frozenset[str] = frozenset({
+    "hierarchy_preview",
+    "maintenance",
+})
+OPTIMIZER_EXCLUDED_ROUTE_TYPES: frozenset[str] = frozenset({
+    "introspect",
+    "kpi_metadata",
+    "discover_members",
+})
+
+
+def is_optimizer_workload(*, client_kind: str | None, route_type: str | None) -> bool:
+    """Return whether explicit origin metadata permits workload evidence."""
+    return (
+        client_kind not in OPTIMIZER_EXCLUDED_CLIENT_KINDS
+        and route_type not in OPTIMIZER_EXCLUDED_ROUTE_TYPES
+    )
 
 RequestClientKindLiteral = Literal[REQUEST_DECLARABLE_CLIENT_KINDS]  # type: ignore[valid-type]

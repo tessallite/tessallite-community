@@ -157,7 +157,9 @@ class License:
         # Entitlement caps must be non-negative integers or null (unlimited).
         for cap_key in ("own_tenants", "models", "users"):
             cap = doc["entitlements"].get(cap_key)
-            if cap is not None and (not isinstance(cap, int) or cap < 0):
+            if cap is not None and (
+                isinstance(cap, bool) or not isinstance(cap, int) or cap < 0
+            ):
                 raise MalformedLicense(
                     f"entitlements.{cap_key} must be a non-negative integer or null"
                 )

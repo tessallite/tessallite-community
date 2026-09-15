@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -10,6 +10,7 @@ const useDownstreamAssetSummaryMock = vi.fn();
 const useGatewayQueryReferencesMock = vi.fn();
 const useColumnUsageMock = vi.fn();
 const createMock = vi.fn();
+const updateMock = vi.fn();
 const deleteMock = vi.fn();
 const scanMock = vi.fn();
 
@@ -25,6 +26,7 @@ vi.mock("../../api/hooks", () => ({
 vi.mock("../../api/client", () => ({
   downstreamAssetsApi: {
     create: (...args: unknown[]) => createMock(...args),
+    update: (...args: unknown[]) => updateMock(...args),
     delete: (...args: unknown[]) => deleteMock(...args),
   },
   impactScanApi: {
@@ -70,6 +72,7 @@ describe("ImpactPanel", () => {
       isError: false,
     });
     createMock.mockReset();
+    updateMock.mockReset();
     deleteMock.mockReset();
     scanMock.mockReset();
   });
@@ -152,6 +155,133 @@ describe("ImpactPanel", () => {
     await waitFor(() => {
       expect(screen.getByText("Add Downstream Asset")).toBeTruthy();
     });
+  });
+
+  // Bug-8937/R2-B01: createMut/updateMut had no onError at all, so a failed
+  // save closed the dialog silently with no error surfaced to the user.
+  it("shows the server's structured error when creating an asset fails", async () => {
+    useDownstreamAssetsMock.mockReturnValue({ data: [], isLoading: false });
+    useDownstreamAssetSummaryMock.mockReturnValue({
+      data: { total: 0, by_type: {} },
+    });
+    useGatewayQueryReferencesMock.mockReturnValue({ data: [], isLoading: false });
+    createMock.mockRejectedValue({
+      response: { data: { detail: { message: "asset_name already exists" } } },
+    });
+
+    renderPanel();
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Add Asset"));
+    await waitFor(() => {
+      expect(screen.getByText("Add Downstream Asset")).toBeTruthy();
+    });
+    const dialog = screen.getByRole("dialog");
+    await user.type(within(dialog).getByRole("textbox", { name: "Name" }), "Executive Dashboard");
+    await user.click(within(dialog).getByText("Create"));
+
+    expect(await screen.findByText("asset_name already exists")).toBeTruthy();
+    // The dialog must stay open on failure — a silent close on error was
+    // exactly the defect (the mutation had no onError to prevent it).
+    expect(screen.getByText("Add Downstream Asset")).toBeTruthy();
+  });
+
+  // R3 (round-3 external review): updateMut shares the exact same onError
+  // wiring as createMut, but no test exercised the edit/update path at all
+  // (success or failure) — updateMock was not even mocked in this file. This
+  // is the direct behavior test for the update side of Bug-8937's fix.
+  it("shows the server's structured error when updating an asset fails", async () => {
+    useDownstreamAssetsMock.mockReturnValue({
+      data: [
+        {
+          id: "a1",
+          model_id: "m1",
+          asset_type: "dashboard",
+          asset_name: "Sales Dashboard",
+          asset_url: null,
+          owner: "alice",
+          notes: null,
+          created_at: "2026-01-01",
+          updated_at: "2026-01-01",
+          column_ids: [],
+        },
+      ],
+      isLoading: false,
+    });
+    useDownstreamAssetSummaryMock.mockReturnValue({
+      data: { total: 1, by_type: { dashboard: 1 } },
+    });
+    useGatewayQueryReferencesMock.mockReturnValue({ data: [], isLoading: false });
+    updateMock.mockRejectedValue({
+      response: { data: { detail: { message: "asset_name already exists" } } },
+    });
+
+    renderPanel();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await waitFor(() => {
+      expect(screen.getByText("Edit Asset")).toBeTruthy();
+    });
+    const dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByText("Update"));
+
+    expect(await screen.findByText("asset_name already exists")).toBeTruthy();
+    // The dialog must stay open on failure, exactly like the create path.
+    expect(screen.getByText("Edit Asset")).toBeTruthy();
+    expect(updateMock).toHaveBeenCalledWith("proj-1", "model-1", "a1", expect.any(Object));
+  });
+
+  // Bug-9576 (R3-04, round-2 recheck): deleteMut had no onError — a failed
+  // delete removed nothing but gave the user no indication anything went
+  // wrong.
+  it("shows the server's error when deleting an asset fails", async () => {
+    useDownstreamAssetsMock.mockReturnValue({
+      data: [
+        {
+          id: "a1",
+          model_id: "m1",
+          asset_type: "dashboard",
+          asset_name: "Sales Dashboard",
+          asset_url: null,
+          owner: "alice",
+          notes: null,
+          created_at: "2026-01-01",
+          updated_at: "2026-01-01",
+          column_ids: [],
+        },
+      ],
+      isLoading: false,
+    });
+    useDownstreamAssetSummaryMock.mockReturnValue({
+      data: { total: 1, by_type: { dashboard: 1 } },
+    });
+    useGatewayQueryReferencesMock.mockReturnValue({ data: [], isLoading: false });
+    deleteMock.mockRejectedValue({
+      response: { data: { detail: { message: "asset is referenced elsewhere" } } },
+    });
+
+    renderPanel();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    await user.click(await screen.findByRole("button", { name: /delete/i }));
+
+    expect(await screen.findByText("asset is referenced elsewhere")).toBeTruthy();
+    // The asset must still be visible — the delete did not silently succeed.
+    expect(screen.getByText("Sales Dashboard")).toBeTruthy();
+  });
+
+  // Bug-9576 (R3-04, round-2 recheck): scanMut had no onError either.
+  it("shows the server's error when the usage scan fails", async () => {
+    mockEmptyPanel();
+    scanMock.mockRejectedValue({
+      response: { data: { detail: { message: "scan target unreachable" } } },
+    });
+
+    renderPanel();
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Query Usage"));
+    await user.click(screen.getByText("Run scan"));
+
+    expect(await screen.findByText("scan target unreachable")).toBeTruthy();
   });
 
   it("switches to Query Usage tab", async () => {

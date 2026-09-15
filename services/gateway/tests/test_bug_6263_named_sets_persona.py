@@ -106,3 +106,14 @@ async def test_deployed_only_is_always_requested(persona_id):
         "m1", "acme", "jwt", project_id="p1", persona_id=persona_id,
     )
     assert _FakeClient.captured["params"]["deployed_only"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_execute_reference_names_are_forwarded_for_exact_filtering():
+    await rc.get_model_named_sets(
+        "m1", "acme", "jwt", project_id="p1",
+        reference_names=["Top Customers", "Revenue"],
+    )
+    assert _FakeClient.captured["params"]["reference_name"] == [
+        "Top Customers", "Revenue",
+    ]

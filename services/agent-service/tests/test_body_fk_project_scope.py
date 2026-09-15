@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from .result_fakes import ScalarResult
 from fastapi import HTTPException
 
 from shared.db.models import (
@@ -69,7 +70,7 @@ class _Result:
         self._rows = list(rows)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def one_or_none(self):
         return self._rows[0] if self._rows else None

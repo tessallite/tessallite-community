@@ -8,6 +8,7 @@ POST /validate — parse + bind only, returns errors gracefully (200 OK).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import logging
 import re
@@ -71,7 +72,10 @@ from shared.middleware.internal_bypass import (
     INTERNAL_BYPASS_HEADER,
     is_internal_request_header,
 )
-from shared.query_log_client_kinds import RequestClientKindLiteral
+from shared.query_log_client_kinds import (
+    RequestClientKindLiteral,
+    is_optimizer_workload,
+)
 from shared.semantic.field_compatibility import (
     HIDDEN_FIELD_UNAVAILABLE,
     PERSONA_FIELD_UNAVAILABLE,
@@ -104,9 +108,13 @@ from src.ir.logical_query import (
 )
 from src.logging.query_logger import log_query, log_query_failure, log_query_miss
 from src.params.named_list_resolver import (
+    DYNAMIC_BUILDER_TYPES,
     expand_named_lists,
     invalidate_named_list_cache,
     load_named_lists,
+    named_lists_referenced,
+    refresh_probe_sql,
+    stored_membership_admissible,
 )
 from src.params.resolver import (
     ParameterError,
@@ -169,6 +177,7 @@ from src.routing.router import (
     route_query,
 )
 from src.security import CompiledPredicate, Principal, RowSecurityCompileError, compile_row_security, has_active_rules
+from src.security.named_query_visibility import visible_named_query_names
 from src.security.persona_gate import apply_persona_gate, enforce_persona_gate, load_persona, merge_default_filters, resolve_execution_persona
 from src.security.query_audit import (
     SecurityAuditError,
@@ -180,12 +189,17 @@ from src.semantic.binder import bind_query_to_model
 from src.semantic.snapshot_resolver import (
     SnapshotAuthority,
     resolve_serving_authority,
+    resolve_snapshot_authority,
 )
 
 from shared.audit.logger import audit
 from shared.cache.result_cache import ResultCache
 from shared.config.settings import get_settings as _get_settings
-from shared.error_sanitizer import sanitize_error_for_client
+from shared.error_sanitizer import (
+    CLIENT_MESSAGES,
+    SourceFault,
+    client_safe_error,
+)
 from shared.metrics import (
     MODEL_BYTES_PROCESSED,
     MODEL_QUERY_COUNT,
@@ -472,7 +486,7 @@ async def _security_audit_block(
         await db.commit()
     except Exception:
         logger.warning("Failed to persist security-audit-block audit event", exc_info=True)
-    return HTTPException(
+    mapped = HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail={
             "error_type": "security_audit_failure",
@@ -486,6 +500,11 @@ async def _security_audit_block(
             ),
         },
     )
+    # The helper has already persisted the failure. Callers that wrap a whole
+    # route (including discover-members) must not write a second pre-execution
+    # row for the same exception.
+    mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+    return mapped
 
 
 async def _check_failure_spike(
@@ -670,6 +689,29 @@ class ExecuteRequest(BaseModel):
     # router_client.execute_query) and consumer (this handler) MUST use the same
     # field name. Empty/None means the legacy behaviour (caption == key).
     caption_dimensions: Optional[list[str]] = None
+    # Bug-9864: rollup-lattice grouping sets. The XMLA gateway plans one grain
+    # query per rollup grain today; this field lets it ask for the whole lattice
+    # in ONE source operation. Each entry is a list of SEMANTIC dimension names
+    # that must be a subset of the bound query's GROUP BY grain; the source
+    # rewriter renders ``GROUP BY GROUPING SETS ((...), ...)`` plus one
+    # ``GROUPING(<expr>) AS "_grouping__<dim>"`` marker per grain column, which
+    # the gateway reads to map each row back to its grain.
+    #
+    # Deliberately structured rather than expressed in the raw SQL: a client
+    # ``GROUP BY GROUPING SETS`` is complex SQL and routes to passthrough, which
+    # never binds semantic names to physical columns and is refused for every
+    # persona-scoped caller. Carrying the lattice here keeps binding, the persona
+    # gate, default filters, CLS and RLS byte-identical to the per-grain queries
+    # this replaces, and layers the lattice on top of them at emission time.
+    #
+    # Requires ``force_route="source"``: an aggregate or pocket cannot serve a
+    # lattice exactly for every aggregation (rolling a stored aggregate up is
+    # exact for SUM/COUNT/MIN/MAX but NOT for COUNT_DISTINCT or AVG), so the
+    # request is refused rather than silently served from one. Aggregate serving
+    # of lattices is a later enhancement. Producer (gateway
+    # ``router_client.execute_query``) and consumer (this handler) MUST use the
+    # same field name.
+    grouping_sets: Optional[list[list[str]]] = None
     # CR-002 Finding 1: ``user_identity`` is no longer accepted on the
     # request body. It was client-controlled and defaulted to an empty
     # string from the gateway, which poisoned every audit-log line.
@@ -781,6 +823,19 @@ class ExecuteResponse(BaseModel):
     # Rule IDS ONLY — never predicate SQL or rule names, so the field discloses
     # that a policy applied, never what it filters on.
     security_rules_applied: list[str] = []
+    # Bug-9894 / persona-layering rule 4 (audit row A26): why the pre-aggregated
+    # ``$KPIs`` artifact (``kpi_latest``) could not serve THIS caller, or None
+    # when it did. ``kpi_latest`` holds one value per KPI computed over ALL
+    # rows, so it may only serve a persona whose own narrowing the artifact
+    # demonstrably carries. When it cannot, the handler serves NO artifact row
+    # and names the channel here -- ``rls_live`` (an active row-security rule
+    # without an authorised bypass) or ``default_filters_live`` (the persona
+    # carries mandatory default filters) -- so the caller recomputes the
+    # scorecard live on the persona path rather than reading an empty rowset as
+    # "this model has no KPIs". A reason ID, never predicate text: it discloses
+    # that a policy applied, never what it filters on. Only the ``$KPIs``
+    # handler ever sets it.
+    kpi_artifact_skip_reason: Optional[str] = None
     # Bug-8365 / Bug-8103: result-level freshness, derived from the artifact
     # that THIS route actually served. Source/raw routes are live. Accelerated
     # routes carry the persisted materialisation timestamp and current stale /
@@ -1270,6 +1325,7 @@ class ValidateResponse(BaseModel):
     was captured and the caller should display it; HTTP status stays 200."""
 
     ok: bool
+    error_type: Optional[Literal["deployed_snapshot_unavailable"]] = None
     errors: list[str] = []
     warnings: list[str] = []
     requested_measures: list[str] = []
@@ -1288,6 +1344,17 @@ class DiscoverMembersRequest(BaseModel):
     model_id: str
     dimension_name: str
     persona_id: Optional[str] = None
+    # Bug-9865: how many members the CALLER will actually emit. Member
+    # discovery always asked the source for MEMBER_DISCOVERY_LIMIT (100,000)
+    # distinct values even when the XMLA browse page cap meant the gateway
+    # would discard all but the first 10,000 — so an unrestricted
+    # MDSCHEMA_MEMBERS ran ~110 unbounded `SELECT DISTINCT ... ORDER BY`
+    # scans to throw most of the result away. A caller that knows its page
+    # size sends it here and the source query is bounded to it (top-N instead
+    # of a full sort + transfer). Always clamped to MEMBER_DISCOVERY_LIMIT,
+    # which remains the completeness ceiling; omitting it keeps the old
+    # behaviour, so every other caller is unchanged.
+    limit: Optional[int] = Field(default=None, ge=1)
 
 
 class DiscoverMembersResponse(BaseModel):
@@ -1366,6 +1433,7 @@ async def execute_query(
             )
     enforce_model_scope(current_user, body.model_id)
     _validate_force_route(body.force_route)
+    _validate_grouping_sets(body.grouping_sets, body.force_route)
     principal = resolve_principal(
         current_user, x_simulate_principal, x_simulate_roles,
         x_simulate_groups, x_simulate_claims,
@@ -1445,6 +1513,7 @@ async def explain_query(
 ) -> ExplainResponse:
     enforce_model_scope(current_user, body.model_id)
     _validate_force_route(body.force_route)
+    _validate_grouping_sets(body.grouping_sets, body.force_route)
     principal = resolve_principal(
         current_user, x_simulate_principal, x_simulate_roles,
         x_simulate_groups, x_simulate_claims,
@@ -1513,35 +1582,58 @@ async def discover_members(
     body: DiscoverMembersRequest,
     current_user: CurrentUser = Depends(require_capability("query")),
 ) -> DiscoverMembersResponse:
-    enforce_model_scope(current_user, body.model_id)
     async for db in get_tenant_db(current_user.tenant_id):
-        await load_authorized_model(
-            db, current_user, model_id=body.model_id, min_role="viewer"
-        )
-        effective_persona = await resolve_execution_persona(
-            db, current_user=current_user, model_id=body.model_id,
-            requested_persona_id=body.persona_id,
-        )
-        if effective_persona and effective_persona.included_dimension_ids:
-            dim_result = await db.execute(
-                select(Dimension).where(
-                    Dimension.model_id == body.model_id,
-                    Dimension.name == body.dimension_name,
-                )
+        # Bug-8529: this route has no BoundQuery until _handle_discover_members
+        # binds the synthetic request. Keep the same pre-execution logging
+        # contract as /execute, /headless/query, and /plugin/execute for
+        # authorization, persona, bind, and route-stage HTTP failures.
+        _preexec_start = time.monotonic()
+        effective_persona = None
+        try:
+            enforce_model_scope(current_user, body.model_id)
+            await load_authorized_model(
+                db, current_user, model_id=body.model_id, min_role="viewer"
             )
-            dim = dim_result.scalar_one_or_none()
-            if dim is None or str(dim.id) not in {
-                str(d) for d in effective_persona.included_dimension_ids
-            }:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Dimension not available for this persona",
+            effective_persona = await resolve_execution_persona(
+                db, current_user=current_user, model_id=body.model_id,
+                requested_persona_id=body.persona_id,
+            )
+            if effective_persona and effective_persona.included_dimension_ids:
+                dim_result = await db.execute(
+                    select(Dimension).where(
+                        Dimension.model_id == body.model_id,
+                        Dimension.name == body.dimension_name,
+                    )
                 )
-        return await _handle_discover_members(
-            body, db,
-            current_user=current_user,
-            persona=effective_persona,
-        )
+                dim = dim_result.scalar_one_or_none()
+                if dim is None or str(dim.id) not in {
+                    str(d) for d in effective_persona.included_dimension_ids
+                }:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Dimension not available for this persona",
+                    )
+            return await _handle_discover_members(
+                body, db,
+                current_user=current_user,
+                persona=effective_persona,
+            )
+        except HTTPException as _exc:
+            if not getattr(_exc, "_tessallite_failure_logged", False):
+                await _log_preexec_failure(
+                    db,
+                    current_user.email,
+                    current_user.tenant_id,
+                    f"DISCOVER_MEMBERS({body.dimension_name})",
+                    "discover_members",
+                    _exc,
+                    _preexec_start,
+                    persona_id=(
+                        effective_persona.id if effective_persona is not None else None
+                    ),
+                    client_kind="discover_members",
+                )
+            raise
 
 
 @router.get(
@@ -1550,6 +1642,7 @@ async def discover_members(
 )
 async def list_deployed_named_objects(
     model_id: str,
+    persona_id: Optional[str] = Query(default=None),
     current_user: CurrentUser = Depends(
         require_capability_or_service_scope("query", SCOPE_POCKET_REFRESH)
     ),
@@ -1565,6 +1658,15 @@ async def list_deployed_named_objects(
     returns empty lists (nothing is resolvable, which is the truth); a deployed
     model whose snapshot cannot be read returns 503 rather than an empty
     catalogue that reads like "this model has no parameters".
+
+    Bug-9186 / audit row A17: the Named Query half of the catalogue is scoped
+    to the CALLER'S EFFECTIVE PERSONA — advertised iff the definition binds
+    over that persona's model query (rule 4). It used to apply no persona
+    filter at all, so this route (which an embed token reaches) offered every
+    deployed Named Query to every persona, including the ones the executor
+    then refused. ``persona_id`` lets a privileged caller ask for the view a
+    particular persona variant gets; ``resolve_execution_persona`` refuses the
+    request when the caller may not adopt that persona.
     """
     enforce_model_scope(current_user, model_id)
     async for db in get_tenant_db(current_user.tenant_id):
@@ -1572,7 +1674,13 @@ async def list_deployed_named_objects(
             db, current_user, model_id=model_id, min_role="viewer",
             service_scope_verified=True,
         )
-        return await _build_deployed_named_objects(model_id, db)
+        effective_persona = await resolve_execution_persona(
+            db, current_user=current_user, model_id=model_id,
+            requested_persona_id=persona_id,
+        )
+        return await _build_deployed_named_objects(
+            model_id, db, persona=effective_persona,
+        )
 
 
 def _named_query_output_columns(raw: Any) -> list[DeployedNamedQueryOutputColumn]:
@@ -1598,8 +1706,53 @@ def _named_query_output_columns(raw: Any) -> list[DeployedNamedQueryOutputColumn
     return out
 
 
+async def _named_query_binds_for_persona(
+    model_id: str, db: AsyncSession, persona: Any, definition_sql: str,
+) -> bool:
+    """Does *definition_sql* bind over *persona*'s model query? (Bug-9186)
+
+    The rule-4 "equivalent by construction" re-entry: the deployed definition
+    is planned through ``_handle_explain`` under the persona, which parses,
+    binds, applies ``enforce_persona_gate``, merges the persona's default
+    filters and routes through ``route_query`` (column-level security,
+    row-security compilation) without executing anything. Any refusal — a
+    persona denial, an unresolvable object, a parse failure — is NOT a bind,
+    and neither is an unexpected fault: this decides what a catalogue
+    advertises, so it fails CLOSED.
+    """
+    probe = ExecuteRequest(
+        model_id=model_id,
+        raw_query=definition_sql,
+        protocol=NQ_CANONICAL_PROTOCOL,
+        dialect=NQ_CANONICAL_DIALECT,
+        include_hidden=NQ_CANONICAL_INCLUDE_HIDDEN,
+        force_route=NQ_CANONICAL_FORCE_ROUTE,
+        persona_id=str(persona.id),
+    )
+    try:
+        await _handle_explain(
+            probe, db, principal=None,
+            persona_id=str(persona.id), persona=persona,
+        )
+    except HTTPException as exc:
+        logger.debug(
+            "Bug-9186: Named Query definition does not bind for persona %s on "
+            "model %s (HTTP %s); withholding it from the catalogue.",
+            persona.id, model_id, exc.status_code,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 - fail closed on any fault
+        logger.warning(
+            "Bug-9186: Named Query bind probe failed for persona %s on model "
+            "%s; withholding it from the catalogue (fail closed): %s",
+            persona.id, model_id, exc,
+        )
+        return False
+    return True
+
+
 async def _build_deployed_named_objects(
-    model_id: str, db: AsyncSession,
+    model_id: str, db: AsyncSession, *, persona: Any | None = None,
 ) -> DeployedNamedObjectsResponse:
     """Assemble the deployed ``@``-object catalogue. See the route above."""
     try:
@@ -1726,8 +1879,25 @@ async def _build_deployed_named_objects(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_DEPLOY_AUTHORITY_CATALOGUE_UNAVAILABLE_DETAIL,
         )
+    # Bug-9186 / rule 4: advertise a Named Query to this persona iff its
+    # deployed definition BINDS over that persona's model query. The verdict
+    # is the router's own plan path, so the catalogue and the executor cannot
+    # disagree by construction. ``persona is None`` means nothing narrows this
+    # caller and the whole model surface applies.
+    _visible: set[str] | None = None
+    if persona is not None:
+        _visible = await visible_named_query_names(
+            list(_nq_defs.values()),
+            model_id=str(model_id),
+            persona=persona,
+            probe=lambda sql: _named_query_binds_for_persona(
+                str(model_id), db, persona, sql,
+            ),
+        )
     for nq in _nq_defs.values():
         has_definition = bool((nq.definition_sql or "").strip())
+        if _visible is not None and str(nq.name or "").lower() not in _visible:
+            continue
         named_queries.append(
             DeployedNamedQueryInfo(
                 name=nq.name,
@@ -1802,10 +1972,7 @@ async def evict_model_cache(model_id: str) -> None:
     # They are keyed by (model_id, deployed_version_id) so they self-invalidate
     # on the next query after a deploy, but evicting here drops the stale entry
     # on the calling replica immediately (matches the join-graph cache contract).
-    from src.semantic.snapshot_resolver import (
-        invalidate as _invalidate_snapshot_cache,
-        invalidate_live_metadata as _invalidate_live_metadata_cache,
-    )
+    from src.semantic.snapshot_resolver import invalidate as _invalidate_snapshot_cache
     from src.routing.aggregate_matcher import invalidate_canonical_dim_cache
     from src.routing.aggregate_population import (
         invalidate_aggregate_population_cache,
@@ -1815,7 +1982,6 @@ async def evict_model_cache(model_id: str) -> None:
         invalidate_model_table_cache,
     )
     _invalidate_snapshot_cache(model_id)
-    _invalidate_live_metadata_cache(model_id)
     invalidate_canonical_dim_cache(model_id)
     # Bug-7000: evict the pocket model-table identifier cache so a
     # deploy that changes tables/aliases is reflected immediately.
@@ -1848,6 +2014,14 @@ async def evict_model_cache(model_id: str) -> None:
     # does not recognise fails the suite rather than being skipped.
     invalidate_named_list_cache(model_id)
     invalidate_named_query_cache(model_id)
+    # Bug-9885: the per-model aggregate inventory. Unlike the caches above it
+    # is not keyed on the deploy pointer — aggregates are LIVE state — so it
+    # re-reads a cheap identity on every load and rehydrates on any change,
+    # including a deploy or revert. Evicting here advances the plain
+    # process-local invalidation epoch; each request session then misses its
+    # own entry on the next load.
+    from src.semantic.binder import invalidate_aggregate_inventory
+    invalidate_aggregate_inventory(model_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1951,10 +2125,270 @@ def _validate_force_route(value: Optional[str]) -> None:
         )
 
 
+# Bug-9864: the marker column the source rewriter projects for grain column
+# ``d`` so the caller can tell "aggregated away (this is the All row)" from
+# "grouped, and the member's value happens to be NULL". Producer
+# (rewrite/source_sql.py) and consumer (the gateway's subtotal_engine) MUST
+# derive the name the same way, so it is defined once, here.
+GROUPING_MARKER_PREFIX = "_grouping__"
+
+
+def grouping_marker_name(dimension_name: str) -> str:
+    """Marker column name projected for grain column *dimension_name*."""
+    return f"{GROUPING_MARKER_PREFIX}{dimension_name}"
+
+
+def _validate_grouping_sets(
+    grouping_sets: Optional[list[list[str]]],
+    force_route: Optional[str],
+) -> None:
+    """Reject a malformed or unroutable grouping-sets request at the boundary.
+
+    Shape only -- the subset-of-grain check needs the bound query and runs in
+    :func:`_apply_grouping_sets`. Refusing here keeps an unroutable request from
+    reaching the binder at all.
+    """
+    if grouping_sets is None:
+        return
+    if force_route != "source":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "message": (
+                    "grouping_sets requires force_route='source'. A stored "
+                    "aggregate or pocket cannot serve a rollup lattice exactly "
+                    "for every aggregation (COUNT_DISTINCT and AVG do not roll "
+                    "up), so the request is refused rather than served from one."
+                ),
+                "error_type": "grouping_sets_requires_source",
+            },
+        )
+    if not grouping_sets:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "message": "grouping_sets must name at least one grouping set.",
+                "error_type": "grouping_sets_invalid",
+            },
+        )
+    for gs in grouping_sets:
+        if not isinstance(gs, list) or any(not isinstance(n, str) for n in gs):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "message": (
+                        "Each grouping set must be a list of semantic "
+                        "dimension names."
+                    ),
+                    "error_type": "grouping_sets_invalid",
+                },
+            )
+
+
+def _apply_grouping_sets(body: "ExecuteRequest", bound: Any) -> None:
+    """Attach a validated grouping-sets lattice to the bound logical query.
+
+    Every name must be a dimension in the BOUND query's GROUP BY grain. A name
+    outside it is refused with a typed 422 rather than dropped: a silently
+    ignored grouping set is a whole missing subtotal family in the client's
+    pivot, and a name the binder never resolved has no physical column to render
+    and was never checked against the persona's allow list.
+    """
+    if body.grouping_sets is None:
+        return
+    lq = bound.logical_query
+    grain_by_lower = {g.lower(): g for g in (lq.grain or [])}
+    normalised: list[list[str]] = []
+    for gs in body.grouping_sets:
+        resolved: list[str] = []
+        for name in gs:
+            canonical = grain_by_lower.get(name.lower())
+            if canonical is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={
+                        "message": (
+                            f"grouping_sets names {name!r}, which is not in "
+                            "this query's GROUP BY grain. Every grouping set "
+                            "must be a subset of the grain."
+                        ),
+                        "error_type": "grouping_sets_not_in_grain",
+                    },
+                )
+            if canonical not in resolved:
+                resolved.append(canonical)
+        normalised.append(resolved)
+    lq.grouping_sets = normalised
+
+
+# Bug-9893: depth guard for the live re-evaluation of a named list. The
+# re-evaluation re-enters ``_handle_execute``, which resolves named lists again;
+# a list whose own definition referenced a named list would otherwise recurse.
+# One level is all the feature needs, so the inner pass refuses instead.
+_named_list_live_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "named_list_live_depth", default=0,
+)
+
+
+async def _named_list_member_overrides(
+    body: ExecuteRequest,
+    db: AsyncSession,
+    *,
+    named_lists: dict,
+    persona: Any | None,
+    persona_id: Optional[str],
+    principal: Principal | None,
+    user_identity: str,
+    tenant_id: str,
+    allow_live_evaluation: bool = True,
+) -> dict[str, list] | None:
+    """Live memberships for the named lists this caller may not be served stored.
+
+    Bug-9893 / audit row R6. A Tessallite Named List of a DYNAMIC type
+    (``topN`` / ``filter`` / ``sql_query``) carries a materialised membership
+    computed by ``model-service`` ``refresh_named_list`` under the refreshing
+    caller's context. Expanding that membership into another persona's query
+    serves an artifact whose row-security filters were never that persona's —
+    the materialisation clause of SQL generation rule 4.
+
+    So: if row security narrows THIS caller and the stored membership was not
+    produced under this caller's own context, the list is recomputed here by
+    re-entering ``_handle_execute`` with this caller's persona and principal
+    (equivalent by construction; call site named below), and the result is
+    handed to ``expand_named_lists`` in place of the stored members.
+
+    Returns ``None`` when nothing needs overriding.
+    """
+    referenced = named_lists_referenced(body.raw_query, named_lists, "postgres")
+    dynamic = [
+        nl for nl in referenced
+        if nl.list_type == "sql_fixed" and nl.builder_type in DYNAMIC_BUILDER_TYPES
+    ]
+    if not dynamic:
+        return None
+
+    # Does row security narrow this caller at all? Mirrors the $KPIs gate.
+    row_security_active = False
+    if principal is not None and not (
+        persona is not None and getattr(persona, "bypass_row_security", False)
+    ):
+        try:
+            _compiled = await compile_row_security(body.model_id, principal, db)
+        except RowSecurityCompileError:
+            # Cannot evaluate this caller's row security — fail closed and
+            # treat the caller as narrowed, so no stored membership is served.
+            row_security_active = True
+        else:
+            row_security_active = has_active_rules(_compiled)
+    if not row_security_active:
+        return None
+
+    overrides: dict[str, list] = {}
+    for nlist in dynamic:
+        admissible, reason = stored_membership_admissible(
+            nlist,
+            persona_id=persona_id,
+            principal_identity=getattr(principal, "user_identity", None),
+            row_security_active=True,
+        )
+        if admissible:
+            continue
+        if not allow_live_evaluation:
+            # /explain is a plan surface: it must not execute, and it must not
+            # print a stored membership this caller may not be served (the
+            # rewritten query it returns carries the member literals).
+            raise ParameterError(
+                f"Named list '{nlist.name}' cannot be planned for you: its "
+                f"stored members were computed under a different row-security "
+                f"context, so they are evaluated for you only when the query "
+                f"actually runs."
+            )
+        probe_sql = refresh_probe_sql(nlist)
+        if not probe_sql:
+            raise ParameterError(
+                f"Named list '{nlist.name}' cannot be served to you: its stored "
+                f"members were computed under a different row-security context "
+                f"and the model does not record how to recompute them. Ask a "
+                f"modeller to open the model builder, click Refresh on this "
+                f"list, and redeploy the model."
+            )
+        if _named_list_live_depth.get() > 0:
+            raise ParameterError(
+                f"Named list '{nlist.name}' cannot be evaluated here: a named "
+                f"list definition may not itself depend on another named list "
+                f"that has to be evaluated for your row-security context."
+            )
+        logger.info(
+            "Named list %s re-evaluated live for persona %s (stored membership "
+            "inadmissible: %s) — Bug-9893.",
+            nlist.name, persona_id, reason,
+        )
+        inner = ExecuteRequest(
+            model_id=body.model_id,
+            raw_query=probe_sql,
+            protocol="jdbc",
+            persona_id=persona_id,
+            # A sql_query list may itself reference declared model parameters,
+            # so the caller's session variables must reach the inner resolve.
+            session_vars=body.session_vars,
+        )
+        token = _named_list_live_depth.set(_named_list_live_depth.get() + 1)
+        try:
+            # Rule-4 re-entry call site: the list is recomputed by the SAME
+            # execute path this request is on, with this request's persona and
+            # principal, so the persona surface is applied by the one authority.
+            result = await _handle_execute(
+                inner, db,
+                user_identity=user_identity,
+                principal=principal,
+                persona_id=persona_id,
+                persona=persona,
+                tenant_id=tenant_id,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Live evaluation of named list %s failed for persona %s: %s",
+                nlist.name, persona_id, exc,
+            )
+            raise ParameterError(
+                f"Named list '{nlist.name}' could not be evaluated for your "
+                f"row-security context. The query was not run."
+            )
+        finally:
+            _named_list_live_depth.reset(token)
+
+        members: list = []
+        seen: set[str] = set()
+        for row in getattr(result, "rows", None) or []:
+            if isinstance(row, dict):
+                value = next(iter(row.values()), None)
+            elif isinstance(row, (list, tuple)) and row:
+                value = row[0]
+            else:
+                value = None
+            if value is None:
+                continue
+            key = str(value)
+            if key not in seen:
+                seen.add(key)
+                members.append(value)
+        overrides[f"@{nlist.name}".lower()] = members
+
+    return overrides or None
+
+
 async def _bind_query_parameters(
     body: ExecuteRequest,
     db: AsyncSession,
     persona_id: Optional[str],
+    *,
+    persona: Any | None = None,
+    principal: Principal | None = None,
+    user_identity: str = "",
+    tenant_id: str = "",
+    allow_live_named_list_evaluation: bool = True,
 ) -> None:
     """Resolve and bind model parameters and named lists into
     ``body.raw_query`` in place.
@@ -2161,12 +2595,30 @@ async def _bind_query_parameters(
     # deployed sql_fixed named lists are expanded to typed IN-list literals.
     # declared_param_names is already loaded above (Law 6 collision check).
     if "@" in body.raw_query and named_lists:
+        # Bug-9893: a DYNAMIC list's stored membership was materialised under
+        # whoever last pressed Refresh. Serve it to this caller only where that
+        # caller's filters demonstrably apply; otherwise evaluate the list live
+        # over this caller's own persona model query.
+        try:
+            _member_overrides = await _named_list_member_overrides(
+                body, db,
+                named_lists=named_lists,
+                persona=persona,
+                persona_id=persona_id,
+                principal=principal,
+                user_identity=user_identity,
+                tenant_id=tenant_id,
+                allow_live_evaluation=allow_live_named_list_evaluation,
+            )
+        except ParameterError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
             body.raw_query, audit_entries = expand_named_lists(
                 body.raw_query,
                 named_lists,
                 dialect="postgres",
                 declared_param_names=declared_param_names,
+                member_overrides=_member_overrides,
             )
             if audit_entries:
                 logger.info(
@@ -2378,7 +2830,10 @@ async def _load_field_compatibility_metadata(
     aggregates = (
         await db.execute(
             select(AggregateDefinition)
-            .where(AggregateDefinition.model_id == model_id)
+            .where(
+                AggregateDefinition.model_id == model_id,
+                AggregateDefinition.status.in_(("active", "ready")),
+            )
         )
     ).scalars().all()
     aggregate_ids = [
@@ -2413,6 +2868,7 @@ async def _evaluate_bound_field_compatibility(
     *,
     persona: Any | None,
     include_hidden: bool,
+    force_route: str | None = None,
 ) -> FieldCompatibilityFeedback | None:
     logical_query = bound.logical_query
     if getattr(logical_query, "has_complex_sql", False):
@@ -2496,8 +2952,11 @@ async def _evaluate_bound_field_compatibility(
         columns=columns,
         joins=joins,
         user_defined_attributes=user_defined_attributes,
-        aggregate_definitions=aggregates,
-        aggregate_columns=aggregate_columns,
+        # Bug-10009: source builds cannot require the aggregate they are
+        # creating or refreshing to be available already. Model relationships,
+        # measure dependencies and access policy are still evaluated below.
+        aggregate_definitions=[] if force_route == "source" else aggregates,
+        aggregate_columns=[] if force_route == "source" else aggregate_columns,
         policy=policy,
         selected_measure_ids=selected_measure_ids,
         selected_dimension_ids=selected_dimension_ids,
@@ -2628,9 +3087,14 @@ async def _handle_execute(
     drill_join_path_ids: Optional[list[str]] = None,
     named_query_id: uuid.UUID | None = None,
     named_query_fallback_reason: str | None = None,
+    star_expanded_projection: bool = False,
 ) -> ExecuteResponse:
     # 0. Bind model parameters into the SQL before parse (F-029-01).
-    await _bind_query_parameters(body, db, persona_id)
+    await _bind_query_parameters(
+        body, db, persona_id,
+        persona=persona, principal=principal,
+        user_identity=user_identity, tenant_id=tenant_id,
+    )
 
     # 1. Parse to IR
     try:
@@ -2672,6 +3136,11 @@ async def _handle_execute(
         logical_query.drill_join_path_ids = [
             str(join_id) for join_id in drill_join_path_ids if join_id
         ]
+    # Bug-9899: the caller (never parsed SQL) says this explicit projection was
+    # expanded from a ``SELECT *`` over the model, so the persona allow-list
+    # gate and the column-level-security gate narrow it instead of denying it.
+    if star_expanded_projection:
+        logical_query.star_expanded = True
 
     # 1.2 Row-limit clamp (F-027-02): the smaller of the query's own
     # LIMIT and the caller's row_limit wins. Applied before the cache
@@ -2832,6 +3301,7 @@ async def _handle_execute(
                 db,
                 persona=persona,
                 include_hidden=body.include_hidden,
+                force_route=body.force_route,
             )
             if field_compatibility is not None and field_compatibility.status == "incompatible":
                 raise HTTPException(
@@ -2852,6 +3322,7 @@ async def _handle_execute(
             db,
             persona=persona,
             include_hidden=body.include_hidden,
+            force_route=body.force_route,
         )
         if field_compatibility is not None and field_compatibility.status == "incompatible":
             raise HTTPException(
@@ -2869,6 +3340,15 @@ async def _handle_execute(
         await _augment_execute_with_caption_columns(
             bound, db, body.caption_dimensions
         )
+
+    # 2.57 Bug-9864: rollup-lattice grouping sets. Runs AFTER the persona gate
+    # and the field-compatibility check -- every name must already have survived
+    # binding and the persona allow list as an ordinary grain column -- and
+    # BEFORE the cache lookup, so the lattice is part of the cached query shape.
+    # Without that ordering a plain GROUP BY result cached under the same SQL
+    # would be replayed for a lattice request, silently returning one grain
+    # instead of the whole lattice.
+    _apply_grouping_sets(body, bound)
 
     # 2.55 Pre-compile row security BEFORE cache lookup (Bug-7038).
     # The RLS policy hash must be part of the cache key so that tightening a
@@ -3184,7 +3664,7 @@ async def _handle_execute(
         )
         _mapped = HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=sanitize_error_for_client(e),
+            detail=client_safe_error(e),
         )
         # Bug-7674: already persisted above — mark so the pre-execution
         # failure wrapper does not double-log this row.
@@ -3286,13 +3766,60 @@ def _extract_missing_relation_name(exc: Exception) -> str | None:
     return None
 
 
-def _missing_source_table_detail(relation_name: str) -> str:
-    return (
-        f"Source table '{relation_name}' is no longer accessible by the "
-        f"model. The table may have been dropped, renamed, or the connection "
-        f"may point to a different database. Check the model's source "
-        f"connection and verify the table exists."
-    )
+def _is_missing_column_error(exc: Exception) -> bool:
+    """True for a source error reporting an unknown COLUMN.
+
+    Mirrors ``_is_missing_relation_error`` for the column case.
+    """
+    text = str(exc).lower()
+    return 'column "' in text and '" does not exist' in text
+
+
+_MISSING_COLUMN_RE = re.compile(r'column "([^"]+)" does not exist', re.IGNORECASE)
+
+
+def _extract_missing_column_name(exc: Exception) -> str | None:
+    """Extract the column name from a missing-column source error."""
+    match = _MISSING_COLUMN_RE.search(str(exc))
+    if not match:
+        return None
+    name = match.group(1).strip()
+    # PostgreSQL may qualify it (``t.region_code``); the security predicate
+    # records the bare column, so compare on the last segment.
+    return name.rsplit(".", 1)[-1] if name else None
+
+
+def _rls_column_disclosure_guard(
+    exc: Exception, compiled_rls: "CompiledPredicate | None",
+) -> bool:
+    """True when a source error would disclose a ROW-SECURITY column (Bug-9745).
+
+    A row-security rule whose ``dimension_path`` names a column the source does
+    not have compiles cleanly — ``_path_to_column`` validates the SHAPE of the
+    path, never its existence — so the predicate reaches the database and comes
+    back as ``column "nonexistent_dimension_xyz" does not exist``. Returned
+    verbatim, that hands any caller the internal name from a SECURITY rule.
+    Live-reproduced as a 502 whose body was exactly that driver text.
+
+    This is no longer what stops the disclosure — ``client_safe_error`` returns
+    a fixed message for every source fault, so no column name reaches a caller
+    by any route. What this guard still decides is WHICH fault the caller is
+    told about: a broken row-security rule is a 422 with the misconfiguration
+    contract and a remedy an administrator can act on, not a generic 502 that
+    reads like the source is down. It is deliberately narrow, matching only the
+    compiled predicate's own security columns.
+    """
+    if compiled_rls is None or not has_active_rules(compiled_rls):
+        return False
+    if not _is_missing_column_error(exc):
+        return False
+    missing = (_extract_missing_column_name(exc) or "").lower()
+    if not missing:
+        return False
+    return missing in {
+        str(c).rsplit(".", 1)[-1].lower()
+        for c in (getattr(compiled_rls, "security_dimension_columns", ()) or ())
+    }
 
 
 async def record_query_success(
@@ -3397,7 +3924,14 @@ async def record_query_success(
     # miss (the source execution already ran and logged its miss when the row
     # was first cached); ``log_miss=False`` suppresses a spurious miss row on
     # the cache-hit path (F-030-03) without re-classifying the route.
-    if log_miss and decision.route_type == "source":
+    if (
+        log_miss
+        and decision.route_type == "source"
+        and is_optimizer_workload(
+            client_kind=client_kind,
+            route_type=decision.route_type,
+        )
+    ):
         miss_reason = decision.reason
         # G4: this is a population-proof refusal, not generic build evidence.
         # The matcher parks the candidate as ineligible; retain the exact
@@ -3539,6 +4073,12 @@ async def execute_with_observation(
     Shared by /execute, /headless/query and /plugin/execute (F-030-01):
     logging and the security guardrails cannot be skipped by any of the
     consumer API seams.
+
+    Bug-9745: a missing-column source error is checked against the compiled
+    row-security predicate carried on ``decision.security_compiled`` (Bug-7033)
+    before its text is returned, so a security rule's internal column name is
+    never disclosed. Reading it off the decision covers all three seams without
+    each caller having to pass it.
     """
     persona_uuid = persona.id if persona is not None else None
     start_ms = time.monotonic()
@@ -3858,7 +4398,7 @@ async def execute_with_observation(
                     )
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail=_missing_source_table_detail(_mn),
+                        detail=CLIENT_MESSAGES[SourceFault.OBJECT_MISSING],
                     )
                 logger.error("Source query failed (fallback): %s", inner, exc_info=True)
                 await _log_query_failure(
@@ -3867,9 +4407,21 @@ async def execute_with_observation(
                     client_kind=client_kind, named_query_id=named_query_id,
                     named_query_fallback_reason=named_query_fallback_reason,
                 )
+                if _rls_column_disclosure_guard(inner, getattr(decision, "security_compiled", None)):
+                    # Bug-9745: the failing column belongs to the row-security
+                    # predicate, so the raw text would disclose a security
+                    # rule's internal name. Reuse the typed non-disclosing
+                    # contract (Bug-8809): the caller gets the fact and the
+                    # remedy, the operator gets the specifics in the log.
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail=row_security_misconfigured_detail(
+                            inner, surface="/execute",
+                        ),
+                    )
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=sanitize_error_for_client(inner),
+                    detail=client_safe_error(inner),
                 )
         elif _is_missing_relation_error(e):
             _missing_name = _extract_missing_relation_name(e) or "unknown"
@@ -3886,7 +4438,7 @@ async def execute_with_observation(
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=_missing_source_table_detail(_missing_name),
+                detail=CLIENT_MESSAGES[SourceFault.OBJECT_MISSING],
             )
         else:
             logger.error("Source query failed: %s", e, exc_info=True)
@@ -3896,7 +4448,13 @@ async def execute_with_observation(
                 client_kind=client_kind, named_query_id=named_query_id,
                 named_query_fallback_reason=named_query_fallback_reason,
             )
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=sanitize_error_for_client(e))
+            if _rls_column_disclosure_guard(e, getattr(decision, "security_compiled", None)):
+                # Bug-9745: see the fallback branch above.
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=row_security_misconfigured_detail(e, surface="/execute"),
+                )
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=client_safe_error(e))
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
 
     # Security guardrail — verify result columns are authorised.
@@ -3921,7 +4479,10 @@ async def execute_with_observation(
     # /plugin/execute and /headless/query) guarantees exactly-once
     # crediting — no credit on failure, no double-count.
     _pending_credit = getattr(decision, "pending_hit_credit", None)
-    if _pending_credit is not None:
+    if _pending_credit is not None and is_optimizer_workload(
+        client_kind=client_kind,
+        route_type=decision.route_type,
+    ):
         await record_aggregate_hit(_pending_credit, db)
 
     await record_query_success(
@@ -3956,7 +4517,13 @@ async def _handle_explain(
     persona: Any | None = None,
 ) -> ExplainResponse:
     # Bind model parameters before parse (F-029-01), same as execute.
-    await _bind_query_parameters(body, db, persona_id)
+    await _bind_query_parameters(
+        body, db, persona_id, persona=persona, principal=principal,
+        # Bug-9893: /explain plans, it never executes — so a named list whose
+        # stored membership is inadmissible for this caller is refused here
+        # rather than re-evaluated (and never printed into the plan).
+        allow_live_named_list_evaluation=False,
+    )
 
     try:
         logical_query = _parse(body)
@@ -4032,6 +4599,7 @@ async def _handle_explain(
                 db,
                 persona=persona,
                 include_hidden=body.include_hidden,
+                force_route=body.force_route,
             )
             if field_compatibility is not None and field_compatibility.status == "incompatible":
                 raise HTTPException(
@@ -4041,6 +4609,12 @@ async def _handle_explain(
         raise
     if persona is not None:
         merge_default_filters(persona, bound)
+
+    # Bug-9864: explain is the route-PLAN surface, so it must plan the same
+    # query execute would run. Without this the rendered SQL shown for a
+    # grouping-sets request is a plain GROUP BY -- an explain that contradicts
+    # the executor is worse than no explain at all.
+    _apply_grouping_sets(body, bound)
 
     # Bug-5877: must be pre-initialized — the gate below is skipped for
     # force_route="raw" (the JDBC gateway always sends it) but the response
@@ -4052,6 +4626,7 @@ async def _handle_explain(
             db,
             persona=persona,
             include_hidden=body.include_hidden,
+            force_route=body.force_route,
         )
         if field_compatibility is not None and field_compatibility.status == "incompatible":
             raise HTTPException(
@@ -4135,7 +4710,9 @@ async def _handle_validate(
     # Bind model parameters before parse (F-029-01). A parameter resolution
     # failure is a validation error, surfaced gracefully (no raise).
     try:
-        await _bind_query_parameters(body, db, persona_id)
+        await _bind_query_parameters(
+            body, db, persona_id, persona=persona,
+        )
     except HTTPException as e:
         return ValidateResponse(ok=False, errors=[str(e.detail)])
 
@@ -4157,6 +4734,17 @@ async def _handle_validate(
     try:
         bound = await bind_query_to_model(
             logical_query, db, include_hidden=body.include_hidden
+        )
+    except DeployedSnapshotUnavailableError as e:
+        # Bug-8530: /validate deliberately remains an HTTP-200 response, but a
+        # broken deployed snapshot is not a query-authoring error. Keep the
+        # existing errors payload and add the one approved deployment-state
+        # discriminator for the Query Panel consumer.
+        return ValidateResponse(
+            ok=False,
+            error_type="deployed_snapshot_unavailable",
+            errors=[str(e)],
+            warnings=warnings,
         )
     except SemanticBindingError as e:
         return ValidateResponse(ok=False, errors=[str(e)], warnings=warnings)
@@ -4192,6 +4780,7 @@ async def _handle_validate(
                     db,
                     persona=persona,
                     include_hidden=body.include_hidden,
+                    force_route=body.force_route,
                 )
                 if (
                     field_compatibility is not None
@@ -4234,6 +4823,7 @@ async def _handle_validate(
             db,
             persona=persona,
             include_hidden=body.include_hidden,
+            force_route=body.force_route,
         )
         if field_compatibility is not None and field_compatibility.status == "incompatible":
             requested_measures, requested_dimensions = _safe_requested_field_names(
@@ -4745,6 +5335,7 @@ def _kpi_allowed_by_persona(
 
 async def _kpi_cls_blocked_measure_ids(
     db: AsyncSession, model_id: str, persona: Any | None,
+    deployed_shape: Any = None,
 ) -> frozenset[str]:
     """Measure ids whose column closure reaches a persona-CLS-restricted column.
 
@@ -4754,6 +5345,14 @@ async def _kpi_cls_blocked_measure_ids(
     engine the runtime CLS gate uses (``router._touches_restricted_columns``),
     so ``$KPIs`` withholding stays consistent with the base-table CLS gate. An
     empty set means no CLS restriction is in force (serve as before).
+
+    Bug-9490: ``deployed_shape`` is the caller's PINNED authority. When present
+    the measure universe and UDA lineage come from it rather than from live
+    draft rows, so a draft edit cannot change what the deployed scorecard is
+    checked against. The caller resolves it once and passes the SAME shape it
+    uses to build ``measure_name_to_id`` — if the blocked set and the name map
+    came from different universes, a measure present live but not deployed would
+    resolve to an id absent from the blocked set and be served.
     """
     if persona is None:
         return frozenset()
@@ -4782,24 +5381,53 @@ async def _kpi_cls_blocked_measure_ids(
         return frozenset()
     restricted_ids = {str(c) for c in restricted_col_rows}
 
-    meas_rows = (
-        await db.execute(select(Measure).where(Measure.model_id == model_id))
-    ).scalars().all()
-
     ctx = _ClsClosure()
-    for m in meas_rows:
-        ctx.measures_by_id[str(m.id)] = m
-        ctx.measures_by_name[m.name] = m
-    uda_rows = (
-        await db.execute(
-            select(UserDefinedAttributeColumnRef.attribute_id)
-            .where(UserDefinedAttributeColumnRef.column_id.in_(list(restricted_col_rows)))
+    if deployed_shape is not None:
+        # Bug-9490: pinned lineage, live restriction policy. ``meas_rows`` is
+        # the universe the blocked set below is computed over, so it must come
+        # from the same authority as the closure context.
+        meas_rows = list(getattr(deployed_shape, "measures", None) or [])
+        for m in meas_rows:
+            _mid = getattr(m, "id", None)
+            _mname = getattr(m, "name", None)
+            if _mid is not None:
+                ctx.measures_by_id[str(_mid)] = m
+            if _mname:
+                ctx.measures_by_name[_mname] = m
+        ctx.restricted_uda_ids = {
+            str(r.get("attribute_id"))
+            for r in (getattr(deployed_shape, "uda_column_ref_rows", None) or [])
+            if r.get("attribute_id") is not None
+            and str(r.get("column_id")) in restricted_ids
+        }
+        ctx.restricted_physical_names = {
+            str(c["column_name"]).lower()
+            for cid, c in (
+                getattr(deployed_shape, "columns_by_id", None) or {}
+            ).items()
+            if str(cid) in restricted_ids and c.get("column_name")
+        }
+    else:
+        meas_rows = (
+            await db.execute(select(Measure).where(Measure.model_id == model_id))
+        ).scalars().all()
+        for m in meas_rows:
+            ctx.measures_by_id[str(m.id)] = m
+            ctx.measures_by_name[m.name] = m
+        uda_rows = (
+            await db.execute(
+                select(UserDefinedAttributeColumnRef.attribute_id)
+                .where(
+                    UserDefinedAttributeColumnRef.column_id.in_(
+                        list(restricted_col_rows)
+                    )
+                )
+            )
+        ).scalars().all()
+        ctx.restricted_uda_ids = {str(a) for a in uda_rows}
+        ctx.restricted_physical_names = await _restricted_physical_names(
+            list(restricted_col_rows), db,
         )
-    ).scalars().all()
-    ctx.restricted_uda_ids = {str(a) for a in uda_rows}
-    ctx.restricted_physical_names = await _restricted_physical_names(
-        list(restricted_col_rows), db,
-    )
 
     blocked = {
         str(m.id)
@@ -4807,246 +5435,6 @@ async def _kpi_cls_blocked_measure_ids(
         if _touches_restricted_columns(m, restricted_ids, ctx)
     }
     return frozenset(blocked)
-
-
-def _named_query_excluded_level_attrs(
-    snapshot: dict, allowed_dim_ids: set[str],
-) -> set[str] | None:
-    """Mirror ``persona_gate._get_excluded_level_attribute_ids`` over the
-    deployed snapshot's own dimension rows (same rows, no DB round-trip).
-
-    When ``included_dimension_ids`` is populated, any hierarchy level whose
-    key attribute backs an excluded dimension is hidden.
-    """
-    if not allowed_dim_ids:
-        return None
-    excluded: set[str] = set()
-    for dim in snapshot.get("dimensions") or []:
-        if not isinstance(dim, dict):
-            continue
-        if str(dim.get("id")) in allowed_dim_ids:
-            continue
-        src = dim.get("source_column_id")
-        if src is not None:
-            excluded.add(str(src))
-        uda = dim.get("user_defined_attribute_id")
-        if uda is not None:
-            excluded.add(str(uda))
-    return excluded
-
-
-def _named_query_cls_closure_from_snapshot(
-    snapshot: dict, restricted_column_ids: set[str],
-):
-    """The shared CLS closure lookups, populated from the deployed snapshot.
-
-    The SAME authority the star expansion enumerates — so the NQ narrowing's
-    closure check can never drift from the field set it filters, and it needs
-    no extra DB reads beyond the two restriction-id queries.
-    """
-    import types as _types
-
-    from shared.security.restricted_column_closure import ClosureContext
-
-    columns = [
-        c for c in snapshot.get("columns") or [] if isinstance(c, dict)
-    ]
-    restricted_phys = {
-        str(c["column_name"]).lower()
-        for c in columns
-        if str(c.get("id")) in restricted_column_ids and c.get("column_name")
-    }
-    known_phys = {
-        str(c["column_name"]).lower() for c in columns if c.get("column_name")
-    }
-    tables = [
-        t for t in snapshot.get("tables") or [] if isinstance(t, dict)
-    ]
-    table_identifiers: set[str] = set()
-    for t in tables:
-        if t.get("physical_name"):
-            table_identifiers.add(str(t["physical_name"]).lower())
-        if t.get("alias"):
-            table_identifiers.add(str(t["alias"]).lower())
-    refs = [
-        r for r in snapshot.get("uda_column_refs") or []
-        if isinstance(r, dict)
-    ]
-    restricted_uda_ids = {
-        str(r["attribute_id"])
-        for r in refs
-        if r.get("attribute_id") is not None
-        and str(r.get("column_id")) in restricted_column_ids
-    }
-    measures = [
-        m for m in snapshot.get("measures") or [] if isinstance(m, dict)
-    ]
-    return ClosureContext(
-        restricted_uda_ids=restricted_uda_ids,
-        measures_by_id={
-            str(m["id"]): _types.SimpleNamespace(**m)
-            for m in measures if m.get("id") is not None
-        },
-        measures_by_name={
-            str(m["name"]): _types.SimpleNamespace(**m)
-            for m in measures if m.get("name")
-        },
-        restricted_physical_names=restricted_phys,
-        known_physical_names=known_phys,
-        table_identifiers=table_identifiers,
-    )
-
-
-def _named_query_allowed_star_fields(
-    *,
-    persona: Any,
-    snapshot: dict,
-    persona_allow_lists: bool,
-    restricted_column_ids: set[str] | None,
-) -> set[str]:
-    """The persona/CLS-PERMITTED subset of the exposed star field set (NQ2C-F1).
-
-    The expansion erases ``select_star`` — the flag persona_gate and the CLS
-    gate use to choose NARROW-mode over DENY-mode — so the expanded explicit
-    projection would hit their deny branches (403) for every disallowed field.
-    This mirrors the STAR-mode narrowing of both gates over the SAME exposed
-    field rows the expansion enumerates (``exposed_star_fields_by_kind``), so
-    the NQ serve handler can pass the result as ``allowed_fields`` and the
-    live compile under a restricted principal NARROWS instead of 403-ing.
-
-    * Persona allow-lists: READ-ONLY mirror of
-      ``persona_gate.enforce_persona``'s branches over the SAME rows the
-      expansion enumerates. A plain measure is admitted only if it survives
-      BOTH branches: the STAR branch (the measure id allow-list — what a raw
-      star would hide) AND the explicit DENY branch (the dimension id
-      allow-list — a projected plain measure binds as a measure-as-dimension
-      and is checked by ``_dim_allowed``, so a measure whose id is not in the
-      dimension allow-list would 403). The intersection can never 403 and
-      never includes a field the star narrowing would have hidden.
-    * CLS data tags: the shared closure module
-      (``shared.security.restricted_column_closure`` — the SAME algorithm the
-      runtime CLS gate uses) over snapshot-row namespaces, with lookups built
-      from the snapshot itself.
-
-    The build never narrows; restricted principals can never reach the
-    materialised path (the serve gate refuses them), so live-only narrowing
-    cannot break build == live for any servable artifact.
-    """
-    import types as _types
-
-    from shared.named_query.star_expansion import exposed_star_fields_by_kind
-    from shared.security.restricted_column_closure import (
-        object_touches_restricted,
-    )
-
-    dim_fields, meas_fields = exposed_star_fields_by_kind(snapshot)
-    if restricted_column_ids is None:
-        # Fail closed (Bug-9019 parity): the restriction set could not be
-        # enumerated (genuine DB error) -> no field can be proven permitted.
-        return set()
-    allowed: set[str] = set()
-
-    def _admit(field: dict) -> None:
-        name = field.get("name")
-        if name:
-            allowed.add(str(name))
-
-    if persona_allow_lists:
-        measure_allow = {
-            str(v) for v in (persona.included_measure_ids or []) if v is not None
-        }
-        dimension_allow = {
-            str(v) for v in (persona.included_dimension_ids or [])
-            if v is not None
-        }
-        hierarchy_allow = {
-            str(v) for v in (persona.included_hierarchy_ids or [])
-            if v is not None
-        }
-        excluded_level_attrs = _named_query_excluded_level_attrs(
-            snapshot, dimension_allow,
-        )
-
-        def _dim_allowed(d: dict) -> bool:
-            # Mirror persona_gate.enforce_persona._dim_allowed verbatim.
-            if str(d.get("id")) in dimension_allow:
-                return True
-            hid = d.get("hierarchy_id")
-            if hid is not None:
-                if excluded_level_attrs is not None:
-                    src = d.get("source_column_id")
-                    uda = d.get("user_defined_attribute_id")
-                    if (src is not None and str(src) in excluded_level_attrs) or \
-                       (uda is not None and str(uda) in excluded_level_attrs):
-                        return False
-                if hierarchy_allow:
-                    return str(hid) in hierarchy_allow
-                return True
-            return False
-
-        for d in dim_fields:
-            if dimension_allow and not _dim_allowed(d):
-                continue
-            if hierarchy_allow:
-                hid = d.get("hierarchy_id")
-                if hid is not None and str(hid) not in hierarchy_allow:
-                    continue
-            _admit(d)
-        for m in meas_fields:
-            # Star branch: the measure id allow-list filters resolved_measures.
-            if measure_allow and str(m.get("id")) not in measure_allow:
-                continue
-            # Deny branch: a projected plain measure binds as a
-            # measure-as-dimension and is checked by the DIMENSION allow-list
-            # (_dim_allowed requires the id or an allowed hierarchy — measures
-            # have no hierarchy), so admit only when its id is allowed.
-            if dimension_allow and str(m.get("id")) not in dimension_allow:
-                continue
-            _admit(m)
-    else:
-        for d in dim_fields:
-            _admit(d)
-        for m in meas_fields:
-            _admit(m)
-
-    if restricted_column_ids:
-        ctx = _named_query_cls_closure_from_snapshot(
-            snapshot, restricted_column_ids,
-        )
-        cls_allowed: set[str] = set()
-        for field in [*dim_fields, *meas_fields]:
-            name = field.get("name")
-            if not name or str(name) not in allowed:
-                continue
-            obj = _types.SimpleNamespace(**field)
-            if not object_touches_restricted(
-                obj, restricted_column_ids, ctx,
-            ):
-                cls_allowed.add(str(name))
-        allowed = cls_allowed
-    return allowed
-
-
-async def _named_query_persona_restricted_column_ids(
-    db: AsyncSession, persona: Any,
-) -> set[str]:
-    """The persona's CLS-restricted model-column ids (mirror of
-    ``router._persona_restricted_column_ids`` — the same two queries)."""
-    restriction_rows = (
-        await db.execute(
-            select(PersonaTagRestriction.data_tag_id)
-            .where(PersonaTagRestriction.persona_id == persona.id)
-        )
-    ).scalars().all()
-    if not restriction_rows:
-        return set()
-    restricted_col_rows = (
-        await db.execute(
-            select(data_tag_columns.c.model_column_id)
-            .where(data_tag_columns.c.tag_id.in_(restriction_rows))
-        )
-    ).scalars().all()
-    return {str(c) for c in restricted_col_rows}
 
 
 def _named_query_row_window(reference: Any) -> tuple[int, Optional[int], bool]:
@@ -5372,84 +5760,34 @@ async def _handle_named_query_reference(
                 f"querying named objects."
             )),
         )
-    # --- NQ2C-F1: narrow BEFORE expanding for restricted principals. ---
-    # ``select_star`` is not merely a projection shape: it is the flag the
-    # persona allow-list gate (persona_gate.enforce_persona) and the CLS
-    # data-tag gate (router._check_column_restrictions) use to choose
-    # NARROW-mode over DENY-mode. Expanding the star erases the flag, so the
-    # expanded explicit projection would hit their DENY branches and a
-    # restricted reader would get 403 instead of a narrowed result. Build the
-    # expansion from the persona/CLS-PERMITTED SUBSET of the exposed fields
-    # instead (mirroring both gates' star-mode narrowing over the SAME
-    # snapshot rows the expansion enumerates). The materialised path is
-    # ALREADY refused for these principals below (cls_or_default_filters_live
-    # / persona_allow_list_live), so live-only narrowing cannot break
-    # build == live for any servable artifact.
-    _allowed_nq_fields: set[str] | None = None
-    if _persona_allow_lists or _cls_active:
-        _nq_restricted_ids: set[str] | None = set()
-        if _cls_active:
-            try:
-                _nq_restricted_ids = await _named_query_persona_restricted_column_ids(
-                    db, persona,
-                )
-            except SQLAlchemyError:
-                # Bug-9019 parity: a genuine DB/operational error fails CLOSED.
-                # For the narrowing that means "no field can be proven
-                # permitted" -> the CLS-style 403 below (the live CLS check
-                # would hit the same error, so this converts an unclassified
-                # 500 into the existing typed refusal). Coding errors surface.
-                _nq_restricted_ids = None
-        _allowed_nq_fields = _named_query_allowed_star_fields(
-            persona=persona,
-            snapshot=_deployed_snapshot,
-            persona_allow_lists=_persona_allow_lists,
-            restricted_column_ids=_nq_restricted_ids,
-        )
-        if (
-            is_expandable_star_definition(nq.definition_sql)
-            and not _allowed_nq_fields
-        ):
-            # The empty-narrowed case reproduces the EXISTING CLS 403
-            # (router's star-fully-restricted shape: a raw SELECT * would
-            # fall back to a full-star source scan and be blocked only AFTER
-            # the restricted values were read) — NOT the expansion's
-            # ValueError, which would read as a definition error.
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "error_code": "OBJECT_NOT_AVAILABLE",
-                    "message": (
-                        "No columns are available to return for this query "
-                        "with your current access."
-                    ),
-                },
-            )
+    # --- Expand a row-preserving ``SELECT *`` definition ONCE, unnarrowed. ---
+    # Bug-9899 / audit row A13: this used to build a SECOND, NQ-local copy of
+    # the persona allow-list and column-level-security star narrowing, over
+    # snapshot rows, and expand only the permitted subset. It existed for one
+    # reason: expanding a star erases ``select_star``, the flag both gates read
+    # to choose NARROW-mode over DENY-mode, so the expanded projection would
+    # hit their deny branches and 403 a restricted reader. The expansion is
+    # now marked as what it is (``star_expanded``, threaded to ``_parse``'s
+    # output by ``_handle_execute``) and BOTH gates narrow it themselves. One
+    # implementation of the narrowing, in the gates that own it, so the serve
+    # path cannot drift from the gate it was mirroring. One expansion also
+    # means the live dispatch body and the population-contract definition are
+    # the same string again -- the build never narrowed, and now neither does
+    # the live compile's input.
     try:
         _expanded_definition = expand_named_query_star_definition(
             nq.definition_sql, _deployed_snapshot,
-            allowed_fields=_allowed_nq_fields,
         )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
         )
-    # The population fingerprint names the artifact's FULL population — the
-    # build never narrows. The narrowed definition above is the LIVE dispatch
-    # body only; restricted principals never reach the materialised gate, so
-    # a narrowed fingerprint would only mislabel the skip reason.
-    if _allowed_nq_fields is not None:
-        _contract_definition = expand_named_query_star_definition(
-            nq.definition_sql, _deployed_snapshot,
-        )
-    else:
-        _contract_definition = _expanded_definition
     _expected_population_fingerprint = named_query_population_fingerprint(
         model_id=body.model_id,
         named_query_id=nq.id,
         deployed_version_id=getattr(model, "deployed_version_id", None),
         deploy_epoch=getattr(model, "deploy_epoch", 0),
-        definition_sql=_contract_definition,
+        definition_sql=_expanded_definition,
     )
 
     # --- Materialised-vs-live decision ---
@@ -5731,7 +6069,7 @@ async def _handle_named_query_reference(
                     status.HTTP_408_REQUEST_TIMEOUT,
                     status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 )
-                else sanitize_error_for_client(exc)
+                else client_safe_error(exc)
             ),
         )
         _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
@@ -5935,6 +6273,16 @@ async def _execute_named_query_live(
             tenant_id=tenant_id,
             named_query_id=_live_named_query_id,
             named_query_fallback_reason=skip_reason,
+            # Bug-9899: a row-preserving ``SELECT * FROM model`` definition was
+            # expanded to its explicit exposed-field projection before this
+            # dispatch. Nobody NAMED those fields, so the persona allow-list
+            # gate and the column-level-security gate must narrow the
+            # projection rather than deny it -- the same choice they make for a
+            # literal star. This one flag replaces the NQ-local copy of both
+            # gates' narrowing that used to pre-trim the expansion.
+            star_expanded_projection=is_expandable_star_definition(
+                nq.definition_sql
+            ),
         )
     except HTTPException as exc:
         # The outer /execute wrapper cannot see the Named Query context when a
@@ -6062,6 +6410,26 @@ async def _handle_kpi_table_query(
     Selective per-KPI serving would require a proven RLS-safe lineage recompute;
     until that exists, withholding all is the only sound fail-closed behaviour.
     An unrestricted principal (no active rules) is unaffected.
+
+    Bug-9894 (persona-layering rule 4, audit row A26) -- DEFAULT FILTERS. Row
+    security was only half of the same proof. ``persona.default_filters`` is a
+    mandatory, non-overridable security scope (``merge_default_filters``, the
+    F-008-01 contract): a persona that carries one is entitled to the value
+    over ITS rows, never over all of them. ``kpi_latest`` was built without
+    that filter, so it cannot be served to such a persona either.
+
+    Both channels are now ONE admissibility proof over the whole persona
+    surface, stated in the vocabulary the Named Query materialised gate uses
+    (``_handle_named_query_reference``): ``_kpi_artifact_skip_reason`` names why
+    the pre-aggregated artifact could not serve THIS caller. No artifact row is
+    served when it is set, and the reason is published on the response so the
+    caller can recompute the scorecard live on the persona path (the gateway
+    JDBC ``$KPIs`` seam does exactly that through ``evaluate_kpi_batch``, the
+    same live evaluation the XMLA KPI members already use).
+
+    The persona ALLOW-LIST and CLS channels stay per-KPI withholds below. They
+    decide WHICH KPIs a persona may see, not which rows the value is computed
+    over, so the global value remains honest for every KPI that survives them.
     """
     from shared.db.models import KPI, KPILatest
 
@@ -6074,6 +6442,11 @@ async def _handle_kpi_table_query(
     # global value cannot be re-filtered per-row at serve time. The empty
     # scorecard still flows through the normal observation/audit tail below.
     withhold_all_rls = False
+    # Bug-9894: the ONE reason the pre-aggregated artifact could not serve this
+    # caller, or None when it can. Same vocabulary as the Named Query
+    # materialised gate's ``_skip_reason``; published on the response so the
+    # caller recomputes live instead of guessing from an empty rowset.
+    _kpi_artifact_skip_reason: str | None = None
     # Bug-8449: the rule ids behind a withhold, surfaced on the response so a
     # $KPIs consumer can tell "your row-security policy withheld the scorecard"
     # from "this model has no deployed KPIs". Empty when nothing was withheld.
@@ -6105,33 +6478,122 @@ async def _handle_kpi_table_query(
                     if rid
                 ] or [DENY_ALL_RULE_ID]
         if withhold_all_rls:
+            _kpi_artifact_skip_reason = "rls_live"
             logger.info(
                 "Bug-6930: withholding all $KPIs rows for row-restricted principal "
                 "user=%s model=%s (kpi_latest is pre-aggregated global data).",
                 user_identity, model_id,
             )
+
+    # Bug-9894 / audit row A26: persona DEFAULT FILTERS are the second half of
+    # the same proof. ``merge_default_filters`` appends them to every live
+    # query as a mandatory security scope (F-008-01), so a persona that carries
+    # one must be served the value over ITS rows. ``kpi_latest`` was built
+    # without them and cannot be re-filtered at read time, exactly as the
+    # Named Query materialised gate refuses this case
+    # (``_skip_reason = "cls_or_default_filters_live"``). Read through the same
+    # truthiness the merge uses, so an empty dict is correctly "no filters".
+    _kpi_persona_default_filters = bool(
+        persona is not None and (getattr(persona, "default_filters", None) or {})
+    )
+    if _kpi_persona_default_filters and _kpi_artifact_skip_reason is None:
+        _kpi_artifact_skip_reason = "default_filters_live"
+        logger.info(
+            "Bug-9894: withholding all $KPIs artifact rows for a persona with "
+            "default filters user=%s model=%s persona=%s (kpi_latest is "
+            "pre-aggregated over ALL rows; the caller must recompute live).",
+            user_identity, model_id, getattr(persona, "id", None),
+        )
+
+    # ONE gate from here down. ``withhold_all_rls`` keeps its narrow meaning
+    # where it drives the Bug-8449 rule-id reporting above; every branch below
+    # reads the ARTIFACT-level decision, so a channel added to one cannot be
+    # forgotten in the other.
+    _kpi_artifact_withheld = _kpi_artifact_skip_reason is not None
+    # Consolidation (review 1B/1C): ONE deployment authority for the whole
+    # request, captured before anything reads deployment state.
+    #
+    # This handler used to decide deployment three separate times — the value
+    # query joined live ``Model.deploy_epoch``, the security shape was resolved
+    # only when a persona existed, and the display names came from an
+    # independent ``ModelVersion`` reload. Nothing tied them to one moment, so a
+    # deploy landing mid-request could pair a value evaluated under the NEW
+    # definition with lineage and metadata from the OLD one, and a request with
+    # no persona never validated the snapshot at all.
+    #
+    # Load the model once, capture its deployment identity, and resolve the
+    # shape from THAT object. Everything below reads the captured values. An
+    # in-flight request may finish against the older deployment after a newer
+    # one lands; it simply stays on that one end to end.
+    from sqlalchemy.orm import selectinload
+
+    _kpi_model = (
+        await db.execute(
+            select(Model)
+            .where(Model.id == uuid.UUID(model_id))
+            .options(selectinload(Model.project))
+        )
+    ).scalar_one_or_none()
+    if _kpi_model is None:
+        # Bug-5413: a since-deleted model fails closed rather than silently
+        # skipping observation.
+        logger.warning(
+            "$KPIs query for deleted model %s by user=%s — returning 404",
+            model_id, user_identity,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model {model_id} not found.",
+        )
+    _captured_version_id = getattr(_kpi_model, "deployed_version_id", None)
+    _captured_epoch = getattr(_kpi_model, "deploy_epoch", None)
+
+    _kpi_authority_shape = None
+    if not _kpi_artifact_withheld:
+        # Resolved for EVERY row-serving caller, not only when a persona is
+        # bound: "the snapshot cannot be read" is not "the model is undeployed",
+        # and a scorecard must not be served from an unreadable deployment even
+        # when the result would otherwise be empty.
+        _kpi_authority, _kpi_authority_shape = await resolve_snapshot_authority(
+            _kpi_model, db,
+        )
+        if _kpi_authority is SnapshotAuthority.DEPLOYED_SNAPSHOT_INVALID:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_DEPLOY_AUTHORITY_UNAVAILABLE_DETAIL,
+            )
+
     # F-017-05: $KPIs only exposes deployed KPIs. kpi_latest is upserted for
     # every evaluated KPI (incl. undeployed drafts opened in the scorecard), so
     # join to the KPI row and filter on is_deployed — an undeployed KPI is
     # absent from the JDBC $KPIs virtual table while remaining editable in the
     # builder.
-    if withhold_all_rls:
-        # Bug-6930: a row-restricted principal gets an empty scorecard. Skip the
+    if _kpi_artifact_withheld:
+        # Bug-6930 / Bug-9894: a caller the artifact cannot serve gets an empty
+        # artifact read. Skip the
         # kpi_latest fetch and the persona/CLS gating entirely; the observation
         # tail below still records the (zero-row) $KPIs read for audit.
         kpi_pairs: list = []
+    elif _captured_version_id is None or _captured_epoch is None:
+        # F-017-01 (Fable R1): the MODEL must be deployed. After an undeploy,
+        # ``deployed_version_id`` is NULL but ``KPI.is_deployed`` stays True and
+        # the ``kpi_latest`` rows survive, so without this those frozen-stale
+        # rows would be served indefinitely.
+        #
+        # A missing epoch is refused for the same reason. ``Model.deploy_epoch``
+        # is NOT NULL in the schema, so this is unreachable from real data — but
+        # the predicate below compares the CAPTURED value rather than joining the
+        # column, and ``column == None`` compiles to ``IS NULL``, which would
+        # MATCH every unstamped legacy row instead of rejecting it. The old join
+        # failed closed here because SQL ``NULL = NULL`` is not true; the capture
+        # has to say so explicitly rather than inherit it.
+        kpi_pairs = []
     else:
-        # F-017-01 (Fable R1): also require the MODEL to be deployed. After
-        # undeploy, deployed_version_id is NULL but KPI.is_deployed remains True
-        # and kpi_latest rows survive — without this join predicate those
-        # frozen-stale rows would be served indefinitely.
         result = await db.execute(
             select(KPILatest, KPI)
             .join(KPI, KPI.id == KPILatest.kpi_id)
-            .join(Model, Model.id == KPI.model_id)
             .where(KPILatest.model_id == model_id)
             .where(KPI.is_deployed.is_(True))
-            .where(Model.deployed_version_id.is_not(None))
             # Bug-7982 residual 2: serve a cached value ONLY when it was evaluated
             # for the model's CURRENT deploy epoch. A definition-changing revert
             # bumps ``deploy_epoch`` (Bug-7140), so a stale value computed under the
@@ -6139,7 +6601,13 @@ async def _handle_kpi_table_query(
             # the next evaluation repopulates kpi_latest under the new epoch —
             # never a mixed-version wrong number. A NULL epoch (legacy/unstamped
             # row) also fails this predicate, which is the intended fail-closed.
-            .where(KPILatest.evaluated_for_epoch == Model.deploy_epoch)
+            #
+            # Consolidation: matched against the epoch CAPTURED above rather
+            # than a fresh join to mutable ``Model.deploy_epoch``. The join
+            # re-read deployment state at statement time, so a deploy landing
+            # between the two reads could hand back a value from one deployment
+            # to be authorised against another's lineage.
+            .where(KPILatest.evaluated_for_epoch == _captured_epoch)
         )
         kpi_pairs = list(result.all())
 
@@ -6151,35 +6619,67 @@ async def _handle_kpi_table_query(
     # measure lineage reaches a persona-restricted column is withheld.
     # Bug-6930: when withholding all rows for RLS there is nothing to gate, so
     # skip the CLS closure resolution too.
+    # The authority was captured once at the top of this handler; the CLS
+    # blocked set, the measure name map, the KPI definitions and the display
+    # names all read that same shape, so none of them can disagree.
     cls_blocked_measure_ids = (
-        frozenset() if withhold_all_rls
-        else await _kpi_cls_blocked_measure_ids(db, model_id, persona)
+        frozenset() if _kpi_artifact_withheld
+        else await _kpi_cls_blocked_measure_ids(
+            db, model_id, persona, deployed_shape=_kpi_authority_shape,
+        )
     )
     measure_name_to_id: dict[str, str] = {}
     kpi_by_name: dict[str, Any] = {}
     children_by_parent: dict[str, list[Any]] = {}
-    if not withhold_all_rls and (allowed_measure_ids is not None or cls_blocked_measure_ids):
-        meas_result = await db.execute(
-            select(Measure.name, Measure.id).where(Measure.model_id == model_id)
-        )
-        measure_name_to_id = {name: str(mid) for name, mid in meas_result.all()}
-        # Bug-6139: nested ``kpi()`` lineage may reference ANY KPI on the model,
-        # including undeployed drafts, so build the name map from ALL KPIs (not
-        # only the deployed rows served here). Exact and lower-cased keys mirror
-        # the DSL's case handling; an unresolvable nested name fails closed.
-        all_kpis = (
-            await db.execute(select(KPI).where(KPI.model_id == model_id))
-        ).scalars().all()
-        for k in all_kpis:
-            if k.name:
-                kpi_by_name.setdefault(k.name, k)
-                kpi_by_name.setdefault(k.name.lower(), k)
-            # Bug-6139 R1: composite KPIs derive their served value from children
-            # bound via parent_kpi_id (not their own expression), so index the
-            # children so the lineage gate can fold in each child's lineage.
-            pkid = getattr(k, "parent_kpi_id", None)
-            if pkid is not None:
-                children_by_parent.setdefault(str(pkid), []).append(k)
+    # Bug-9490 (review F1): deployed KPI definitions keyed by id, used to
+    # authorise each served row against the definition its value came from.
+    _deployed_kpis_by_id: dict[str, Any] = {}
+    # Bug-9490 (review 1A): the deployed KPI graph is built whenever a shape
+    # exists, INDEPENDENT of whether a lineage gate runs. Building it only
+    # under the gate while the row loop below demanded an entry from it meant
+    # an unrestricted persona — an empty allow-list is unrestricted, and a
+    # dimension-only or RLS-bypass persona is too — matched no entry and had
+    # EVERY row discarded. The expensive part is the lineage walk, not this
+    # index, so gating the index bought nothing and blanked scorecards.
+    if _kpi_authority_shape is not None:
+        for _row in (getattr(_kpi_authority_shape, "kpi_rows", None) or []):
+            _obj = SimpleNamespace(**_row)
+            _kid = _row.get("id")
+            if _kid is not None:
+                _deployed_kpis_by_id[str(_kid)] = _obj
+            _kname = _row.get("name")
+            if _kname:
+                kpi_by_name.setdefault(_kname, _obj)
+                kpi_by_name.setdefault(str(_kname).lower(), _obj)
+            _pkid = _row.get("parent_kpi_id")
+            if _pkid is not None:
+                children_by_parent.setdefault(str(_pkid), []).append(_obj)
+
+    if not _kpi_artifact_withheld and (allowed_measure_ids is not None or cls_blocked_measure_ids):
+        # The measure name map resolves the names a KPI expression mentions to
+        # the ids the blocked set is keyed by, so both MUST come from the same
+        # universe (Bug-9490). If one were deployed and the other live, a measure
+        # present in draft but not in the deployment would resolve to an id that
+        # is absent from the blocked set, and the KPI would be served.
+        #
+        # That shared universe is the DEPLOYED one, and it is the only one read
+        # here. The scorecard serves a value evaluated under the deployed
+        # definition, so authorising it against a live definition would let a
+        # draft edit decide what a deployed value was checked for: change a KPI
+        # in draft to stop referencing a restricted measure, and the deployed —
+        # still restricted — value was served.
+        #
+        # Bug-6139 needed a universe wide enough to RESOLVE nested ``kpi()``
+        # references, not one that trusts drafts. The captured shape already
+        # indexes every deployed KPI above (exact and lower-cased names mirroring
+        # the DSL's case handling, plus parent_kpi_id children for composites),
+        # so a nested reference to a KPI absent from the deployment simply does
+        # not resolve and the existing fail-closed path withholds it.
+        measure_name_to_id = {
+            getattr(m, "name"): str(getattr(m, "id"))
+            for m in (getattr(_kpi_authority_shape, "measures", None) or [])
+            if getattr(m, "name", None) and getattr(m, "id", None) is not None
+        }
 
     # Bug-8305: $KPIs presentational metadata (the served kpi_name) must be
     # DEPLOYED-SNAPSHOT-AUTHORITATIVE, mirroring the deploy-pinning contract the
@@ -6196,41 +6696,45 @@ async def _handle_kpi_table_query(
     # query-router without either duplicating that formatter (band-aid) or
     # promoting it to shared/. That half is filed as a scope_request; this fix
     # closes the rename leak, the primary governance concern.
-    _deployed_kpi_name_by_id: dict[str, str] = {}
-    # Resolve the deployed version id from the model directly (the KPI join row
-    # carries the KPI, not the Model). Load the model once. Best-effort: on any
-    # load failure fall back to ``kpi_latest.kpi_name`` (the prior behaviour) —
-    # this is presentational metadata (governance/cosmetic), never a value, so a
-    # transient snapshot-load failure must not fail the scorecard read.
-    if kpi_pairs:
-        try:
-            _mdl = await db.get(Model, model_id)
-            _dvid = getattr(_mdl, "deployed_version_id", None) if _mdl is not None else None
-            if _dvid is not None:
-                _ver = await db.get(ModelVersion, _dvid)
-                _snap = getattr(_ver, "snapshot_json", None) if _ver is not None else None
-                if isinstance(_snap, dict):
-                    for _sk in _snap.get("kpis", []) or []:
-                        _skid = _sk.get("id")
-                        _skname = _sk.get("name")
-                        if _skid and _skname:
-                            _deployed_kpi_name_by_id[str(_skid)] = _skname
-        except Exception:
-            # Fall back to the eval-time name for every KPI (prior behaviour).
-            _deployed_kpi_name_by_id = {}
+    # Bug-8305: the served ``kpi_name`` must be DEPLOYED-SNAPSHOT-AUTHORITATIVE,
+    # mirroring the deploy-pinning the value already follows. ``kpi_latest``
+    # upserts the name from the LIVE KPI row on every evaluation — including
+    # draft evaluations opened in the scorecard — so an undeployed rename would
+    # otherwise surface in $KPIs before redeploy.
+    #
+    # Consolidation: taken from the SAME captured shape that authorises the row,
+    # not from an independent ModelVersion reload. The reload was a third
+    # deployment read in one request and could disagree with the other two. The
+    # name is now read directly off the deployed definition selected in the loop
+    # below, so the name and the authorisation cannot come from different
+    # versions even in principle.
 
     rows: list[dict[str, Any]] = []
     for kpi_latest, kpi in kpi_pairs:
+        # Bug-9490 (review F1): authorise the DEPLOYED definition, which is the
+        # one the served value was evaluated under. A row whose KPI is absent
+        # from the deployment cannot be checked against anything authoritative,
+        # so it is WITHHELD. This is unconditional: there is no live-definition
+        # fallback and no exemption for a deployment whose snapshot carries no
+        # KPI section at all. Such a deployment serves an empty scorecard until
+        # it is redeployed, which is the behaviour operations expects — an
+        # unauthorisable value is never served on the strength of its age.
+        _kpi_definition = _deployed_kpis_by_id.get(str(kpi_latest.kpi_id))
+        if _kpi_definition is None:
+            continue
         if not _kpi_allowed_by_persona(
-            kpi, allowed_measure_ids, measure_name_to_id, cls_blocked_measure_ids,
-            kpi_by_name, children_by_parent,
+            _kpi_definition, allowed_measure_ids, measure_name_to_id,
+            cls_blocked_measure_ids, kpi_by_name, children_by_parent,
         ):
             # Fail-closed: the persona cannot see this KPI's underlying
             # measure(s), or its lineage reaches a restricted column; withhold
             # the row entirely.
             continue
-        _authoritative_kpi_name = _deployed_kpi_name_by_id.get(
-            str(kpi_latest.kpi_id), kpi_latest.kpi_name
+        # The name comes off the very definition that authorised this row, so
+        # an undeployed rename cannot surface. ``kpi_latest.kpi_name`` remains
+        # only for a deployed entry that carries no name at all.
+        _authoritative_kpi_name = (
+            getattr(_kpi_definition, "name", None) or kpi_latest.kpi_name
         )
         rows.append({
             "kpi_name": _authoritative_kpi_name,
@@ -6269,29 +6773,29 @@ async def _handle_kpi_table_query(
     # resolved measures/dimensions — $KPIs is a virtual metadata table) and a
     # RouteDecision tagged ``kpi_metadata``. log_miss=False: $KPIs never runs
     # a source query, so it is not an optimizer miss.
-    routed_sql = f"SELECT * FROM kpi_latest WHERE model_id = '{model_id}'"
+    # Bug-9894: when the artifact was refused, nothing was read from
+    # ``kpi_latest`` -- the audit row and the caller-facing reason must say so
+    # rather than print a read that never happened.
+    if _kpi_artifact_withheld:
+        routed_sql = (
+            "-- no read: the pre-aggregated $KPIs artifact does not carry this "
+            f"persona's filters ({_kpi_artifact_skip_reason})"
+        )
+        _kpi_reason = (
+            "$KPIs virtual table — pre-aggregated artifact withheld "
+            f"({_kpi_artifact_skip_reason}); recompute live on the persona path"
+        )
+    else:
+        routed_sql = f"SELECT * FROM kpi_latest WHERE model_id = '{model_id}'"
+        _kpi_reason = "$KPIs virtual table — reading from kpi_latest"
     # Eager-load project: record_query_success reads model.project.display_name
     # for the per-model metrics labels, and a lazy relationship access outside
     # the load scope raises MissingGreenlet under async SQLAlchemy.
-    from sqlalchemy.orm import selectinload
-
-    model_result = await db.execute(
-        select(Model)
-        .where(Model.id == uuid.UUID(model_id))
-        .options(selectinload(Model.project))
-    )
-    model = model_result.scalar_one_or_none()
-    if model is None:
-        # Bug-5413: a since-deleted model must leave an audit trail and
-        # fail closed rather than silently skipping observation.
-        logger.warning(
-            "$KPIs query for deleted model %s by user=%s — returning 404",
-            model_id, user_identity,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Model {model_id} not found.",
-        )
+    # Consolidation: the model was loaded ONCE at the top of this handler, with
+    # the same eager-loaded project this tail needs, and the deleted-model 404
+    # (Bug-5413) was raised there. Re-querying it here was a second read of the
+    # same row that could observe a different moment.
+    model = _kpi_model
     bound = BoundQuery(
         logical_query=logical_query,
         model=model,
@@ -6302,7 +6806,7 @@ async def _handle_kpi_table_query(
     decision = RouteDecision(
         route_type="kpi_metadata",
         rewritten_query=routed_sql,
-        reason="$KPIs virtual table — reading from kpi_latest",
+        reason=_kpi_reason,
     )
     await record_query_success(
         db,
@@ -6322,7 +6826,7 @@ async def _handle_kpi_table_query(
         rows=rows,
         columns=columns,
         route_type="kpi_metadata",
-        reason="$KPIs virtual table — reading from kpi_latest",
+        reason=_kpi_reason,
         aggregate_id=None,
         pocket_id=None,
         execution_ms=elapsed_ms,
@@ -6332,6 +6836,7 @@ async def _handle_kpi_table_query(
         row_limit=server_row_cap,
         routed_sql=routed_sql,
         security_rules_applied=_kpi_security_rule_ids,
+        kpi_artifact_skip_reason=_kpi_artifact_skip_reason,
     )
 
 
@@ -6599,7 +7104,15 @@ async def _handle_discover_members(
         order_by=[(dim_name, "asc")],
         # Bug-5436a: was a silent 1000-member cap that truncated large dimension
         # filter dropdowns; now configurable (default 100000).
-        limit=_get_settings().MEMBER_DISCOVERY_LIMIT,
+        # Bug-9865: a caller that will emit only its first page says so via
+        # ``body.limit``; the source query is then bounded to that page instead
+        # of scanning and transferring the full completeness cap. The
+        # configured cap stays the ceiling, so a request can only ever narrow
+        # the scan, never widen it past MEMBER_DISCOVERY_LIMIT.
+        limit=min(
+            body.limit or _get_settings().MEMBER_DISCOVERY_LIMIT,
+            _get_settings().MEMBER_DISCOVERY_LIMIT,
+        ),
         offset=None,
         query_fingerprint=fp,
         has_distinct=True,
@@ -6772,10 +7285,12 @@ async def _handle_discover_members(
                 start_ms, "snapshot_unavailable", str(snapshot_exc),
                 persona_id=persona_uuid,
             )
-            raise HTTPException(
+            _mapped = HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=str(snapshot_exc),
             )
+            _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise _mapped
         except Exception as reroute_exc:
             # Bug-7808 discipline: a failure in the fallback re-route must still
             # produce a QueryLog row and a sanitized error, not a bare 500 with
@@ -6789,13 +7304,15 @@ async def _handle_discover_members(
                 start_ms, "routing_error", str(reroute_exc),
                 persona_id=persona_uuid,
             )
-            raise HTTPException(
+            _mapped = HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=(
                     "Failed to query members: "
-                    f"{sanitize_error_for_client(reroute_exc)}"
+                    f"{client_safe_error(reroute_exc)}"
                 ),
             )
+            _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise _mapped
         try:
             audit_filters_present(
                 bound, decision.rewritten_query, decision.route_type,
@@ -6822,31 +7339,37 @@ async def _handle_discover_members(
                 start_ms, "execution_error", str(retry_exc),
                 persona_id=persona_uuid,
             )
-            raise HTTPException(
+            _mapped = HTTPException(
                 status_code=502,
                 detail=(
                     "Failed to query members: "
-                    f"{sanitize_error_for_client(retry_exc)}"
+                    f"{client_safe_error(retry_exc)}"
                 ),
             )
+            _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise _mapped
     except QueryTimeoutError as exc:
         await _log_query_failure(
             db, current_user.email, tenant_id, bound, decision,
             start_ms, "timeout", str(exc), persona_id=persona_uuid,
         )
-        raise HTTPException(
+        _mapped = HTTPException(
             status_code=status.HTTP_408_REQUEST_TIMEOUT, detail=str(exc),
         )
+        _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+        raise _mapped
     except Exception as exc:
         logger.error("Failed to query members: %s", exc, exc_info=True)
         await _log_query_failure(
             db, current_user.email, tenant_id, bound, decision,
             start_ms, "execution_error", str(exc), persona_id=persona_uuid,
         )
-        raise HTTPException(
+        _mapped = HTTPException(
             status_code=502,
-            detail=f"Failed to query members: {sanitize_error_for_client(exc)}",
+            detail=f"Failed to query members: {client_safe_error(exc)}",
         )
+        _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+        raise _mapped
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
 
     try:

@@ -1501,36 +1501,6 @@ async def test_load_physical_column_ids_poisons_ambiguous_name():
     assert id_map["revenue"] == "id-orders-rev"
 
 
-@pytest.mark.asyncio
-async def test_live_metadata_bundle_id_map_poisons_ambiguous_name():
-    """R2 F5: the LIVE-BUNDLE builder (_load_live_metadata_bundle) must poison an
-    ambiguous name too — the third id-map path, so all three are collision-safe."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-    from src.semantic.binder import _load_live_metadata_bundle
-
-    _res = MagicMock()
-    _res.all.return_value = [
-        ("id-A-created", "created_at", False),   # ambiguous
-        ("id-B-created", "created_at", False),
-        ("id-hidden-secret", "secret", True),    # hidden but STILL in the id map
-    ]
-    db = AsyncMock()
-    db.execute = AsyncMock(return_value=_res)
-
-    with patch("src.semantic.binder._load_measures", new=AsyncMock(return_value=[])), \
-         patch("src.semantic.binder._load_dimensions", new=AsyncMock(return_value=[])), \
-         patch("src.semantic.binder._load_hierarchy_level_dimensions",
-               new=AsyncMock(return_value=[])), \
-         patch("src.semantic.binder._load_hidden_column_ids",
-               new=AsyncMock(return_value=set())):
-        bundle = await _load_live_metadata_bundle("m1", db)
-
-    assert "created_at" not in bundle.physical_column_ids       # ambiguous -> poisoned
-    # Hidden column's UNIQUE name is still in the id map (vocabulary parity; hidden
-    # ACCESS is enforced by CLS, not by the id map).
-    assert bundle.physical_column_ids["secret"] == "id-hidden-secret"
-
-
 def test_source_only_expression_binds_no_leaf_ids():
     """R2 F1: an expression the binder marks source-only (unknown function) must NOT
     carry serving leaf ids even when the leaf names resolve — an unknown/volatile

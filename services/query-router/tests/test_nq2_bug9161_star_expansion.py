@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from result_fakes import ScalarResult
 
 if TYPE_CHECKING:
     from src.semantic.snapshot_resolver import DeployedShape
@@ -176,26 +177,27 @@ def test_security_and_population_predicates_disagree_on_limit_distinct_functions
         assert not is_row_preserving_star_definition(defn), defn
 
 
-def test_allowed_fields_narrows_the_expansion() -> None:
-    """NQ2C-F1 mechanism: the serve handler passes the persona/CLS-permitted
-    subset as ``allowed_fields``; the expansion projects ONLY those fields.
-    Non-star definitions ignore the filter (the ordinary gates decide), and an
-    empty narrowing raises the expansion's ValueError (the handler pre-empts
-    this with the CLS-style 403)."""
+def test_the_expansion_never_narrows() -> None:
+    """Bug-9899: the expansion projects the model's FULL exposed field set,
+    for every caller, always.
+
+    It used to accept an ``allowed_fields`` subset the Named Query serve
+    handler pre-computed from its own copy of the persona/CLS star narrowing,
+    which made the live compile's input differ from the refresh build's for a
+    restricted reader. The narrowing now happens in the gates that own it, so
+    build and live expand to the same string again -- the property the
+    population fingerprint depends on."""
+    full = 'SELECT "sale_id", "month_name", "amount" FROM modely'
     assert expand_named_query_star_definition(
-        "SELECT * FROM modely", _snapshot(), allowed_fields={"month_name"},
-    ) == 'SELECT "month_name" FROM modely'
+        "SELECT * FROM modely", _snapshot(),
+    ) == full
     assert expand_named_query_star_definition(
         "SELECT DISTINCT * FROM modely", _snapshot(),
-        allowed_fields={"month_name"},
-    ) == 'SELECT DISTINCT "month_name" FROM modely'
+    ) == full.replace("SELECT ", "SELECT DISTINCT ")
+    # A non-star definition is untouched.
     assert expand_named_query_star_definition(
-        "SELECT branch_id FROM modely", _snapshot(), allowed_fields=set(),
+        "SELECT branch_id FROM modely", _snapshot(),
     ) == "SELECT branch_id FROM modely"
-    with pytest.raises(ValueError):
-        expand_named_query_star_definition(
-            "SELECT * FROM modely", _snapshot(), allowed_fields=set(),
-        )
 
 
 def test_filter_only_star_expands_and_preserves_the_where() -> None:
@@ -516,237 +518,214 @@ def test_nq2c_f2_limited_and_distinct_star_still_reach_the_join_closure(defn) ->
 # NQ2C-F1 — restricted readers narrow, never 403
 # ---------------------------------------------------------------------------
 
-def test_nq2c_f1_persona_allow_list_parity() -> None:
-    """NQ2C-F1: under a persona allow-list the raw star NARROWS silently, but
-    the EXPANDED full projection takes persona_gate's DENY branch (403) — the
-    flip the fix exists to prevent. The NQ narrowing must therefore yield the
-    persona-permitted subset, and THAT subset must pass the REAL
-    ``enforce_persona`` without raising."""
+def _bound_double(select_star: bool, dims: list, measures: list,
+                  star_expanded: bool = False):
+    """A BoundQuery-shaped double for the two narrowing gates."""
+    import types as _t
+
+    return _t.SimpleNamespace(
+        logical_query=_t.SimpleNamespace(
+            select_star=select_star, has_complex_sql=False,
+            star_expanded=star_expanded,
+        ),
+        resolved_dimensions=[
+            _t.SimpleNamespace(
+                id=_id, name=name, hierarchy_id=hier,
+                source_column_id=src, user_defined_attribute_id=None,
+                display_column_id=None, calc_expression=None,
+            )
+            for _id, name, hier, src in dims
+        ],
+        resolved_measures=[
+            _t.SimpleNamespace(
+                id=_id, name=name, measure_type="standard",
+                source_column_id=src, display_column_id=None,
+                user_defined_attribute_id=None, variant_of_measure_id=None,
+                expression=None, calc_expression=None,
+            )
+            for _id, name, src in measures
+        ],
+        resolved_filters=[],
+        persona_narrowed_star=False,
+    )
+
+
+def test_star_expanded_projection_narrows_like_a_star_in_the_persona_gate() -> None:
+    """Bug-9899 / audit row A13: ONE narrowing implementation, in the gate.
+
+    A server-expanded ``SELECT *`` must take ``enforce_persona``'s NARROW
+    branch, exactly as the literal star does. Without the ``star_expanded``
+    mark the same projection takes the DENY branch (403) -- which is the whole
+    reason the Named Query serve path used to carry a second copy of this
+    narrowing. Marking it removes that copy without changing the outcome.
+    """
     import types as _t
 
     from fastapi import HTTPException
+
     from src.security.persona_gate import enforce_persona
 
-    d_ok, d_no = "d-month", "d-sale"
-    m_amount = "m-amount"
+    d_ok, d_no, m_amount = "d-month", "d-sale", "m-amount"
     persona = _t.SimpleNamespace(
         id=uuid.uuid4(), name="restricted", included_measure_ids=[],
         included_dimension_ids=[d_ok], included_hierarchy_ids=[],
         default_filters={},
     )
+    fields = (
+        [(d_ok, "month_name", None, "c-month"),
+         (d_no, "sale_id", None, "c-sale")],
+        [(m_amount, "amount", "c-amount")],
+    )
 
-    def _bound(select_star: bool, dims: list, measures: list):
-        return _t.SimpleNamespace(
-            logical_query=_t.SimpleNamespace(
-                select_star=select_star, has_complex_sql=False,
-            ),
-            resolved_dimensions=[
-                _t.SimpleNamespace(
-                    id=_id, name=name, hierarchy_id=None,
-                    source_column_id=None, user_defined_attribute_id=None,
-                )
-                for _id, name in dims
-            ],
-            resolved_measures=[
-                _t.SimpleNamespace(id=_id, name=name)
-                for _id, name in measures
-            ],
-            persona_narrowed_star=False,
-        )
-
-    # 1. Star -> narrowed silently (the behaviour BI tools rely on).
-    star = _bound(True, [(d_ok, "month_name"), (d_no, "sale_id")],
-                  [(m_amount, "amount")])
+    # 1. Literal star -> narrowed silently (the behaviour BI tools rely on).
+    star = _bound_double(True, *fields)
     enforce_persona(persona, star, None)
     assert [d.name for d in star.resolved_dimensions] == ["month_name"]
+    # No measure allow-list, so the measure is untouched on both paths.
+    assert [m.name for m in star.resolved_measures] == ["amount"]
 
-    # 2. The EXPANDED full projection -> DENY branch -> 403. This is the
-    #    regression the fix removes: without pre-narrowing, every restricted
-    #    reader of a star NQ got exactly this.
-    expanded = _bound(False, [(d_ok, "month_name"), (d_no, "sale_id")],
-                      [(m_amount, "amount")])
+    # 2. An explicit projection a CALLER wrote -> DENY branch -> 403.
+    explicit = _bound_double(False, *fields)
     with pytest.raises(HTTPException) as exc_info:
-        enforce_persona(persona, expanded, None)
+        enforce_persona(persona, explicit, None)
     assert exc_info.value.status_code == 403
 
-    # 3. The NQ narrowing helper mirrors the gate over the SAME exposed rows.
-    #    The measure is dropped too: a projected plain measure binds as a
-    #    measure-as-dimension and the dimension allow-list's deny branch would
-    #    403 it (its id is not in the dimension allow-list) — the narrowing
-    #    must never produce a body the real gate denies.
-    from src.api.routes import _named_query_allowed_star_fields
-
-    allowed = _named_query_allowed_star_fields(
-        persona=persona,
-        snapshot=_snapshot(),
-        persona_allow_lists=True,
-        restricted_column_ids=set(),
-    )
-    assert allowed == {"month_name"}
-
-    # 4. The NARROWED projection passes the REAL gate without raising.
-    narrowed = _bound(False, [(d_ok, "month_name")], [])
-    enforce_persona(persona, narrowed, None)
+    # 3. The SAME projection marked as server-expanded -> narrowed, and to
+    #    exactly what the literal star produced.
+    expanded = _bound_double(False, *fields, star_expanded=True)
+    enforce_persona(persona, expanded, None)
+    assert [d.name for d in expanded.resolved_dimensions] == ["month_name"]
+    assert [m.name for m in expanded.resolved_measures] == ["amount"]
 
 
-def test_nq2c_f1_hierarchy_allow_list_narrows_too() -> None:
-    """NQ2C-F1 hierarchy half: ``included_hierarchy_ids`` narrows the exposed
-    set exactly like enforce_persona's hierarchy star branch — hierarchy-less
-    dims are kept, hierarchy dims not on the list are dropped, measures are
-    unaffected."""
+def test_star_expanded_projection_narrows_by_hierarchy_allow_list_too() -> None:
+    """The hierarchy half of the same branch: a hierarchy-less dimension is
+    kept, a dimension on an unlisted hierarchy is narrowed away, measures are
+    unaffected -- identically for a literal star and a server-expanded one."""
     import types as _t
 
-    from src.api.routes import _named_query_allowed_star_fields
+    from src.security.persona_gate import enforce_persona
 
-    persona = _t.SimpleNamespace(
-        id=uuid.uuid4(), name="hier", included_measure_ids=[],
-        included_dimension_ids=[], included_hierarchy_ids=["h-1"],
-        default_filters={},
+    fields = (
+        [("d-region", "region", "h-1", "c-region"),
+         ("d-branch", "branch_id", None, "c-branch")],
+        [("m-amount", "amount", "c-amount")],
     )
-    snapshot = {
-        "dimensions": [
-            {"id": "d-region", "name": "region", "hierarchy_id": "h-1",
-             "source_column_id": "c-region"},
-            {"id": "d-branch", "name": "branch_id", "hierarchy_id": None,
-             "source_column_id": "c-branch"},
-        ],
-        "measures": [
-            {"id": "m-amount", "name": "amount", "measure_type": "standard",
-             "variant_kind": None, "source_column_id": "c-amount"},
-        ],
-        "columns": [
-            {"id": "c-region", "column_name": "region", "is_hidden": False},
-            {"id": "c-branch", "column_name": "branch_id", "is_hidden": False},
-            {"id": "c-amount", "column_name": "amount", "is_hidden": False},
-        ],
-    }
-    allowed = _named_query_allowed_star_fields(
-        persona=persona,
-        snapshot=snapshot,
-        persona_allow_lists=True,
-        restricted_column_ids=set(),
-    )
-    # h-1's region stays; the hierarchy-less branch dim stays; the measure is
-    # unaffected by the hierarchy list.
-    assert allowed == {"region", "branch_id", "amount"}
 
-    persona_other = _t.SimpleNamespace(
-        id=uuid.uuid4(), name="hier", included_measure_ids=[],
-        included_dimension_ids=[], included_hierarchy_ids=["h-other"],
-        default_filters={},
-    )
-    allowed_other = _named_query_allowed_star_fields(
-        persona=persona_other,
-        snapshot=snapshot,
-        persona_allow_lists=True,
-        restricted_column_ids=set(),
-    )
-    # region (hierarchy h-1) is not on the allow-list -> dropped.
-    assert allowed_other == {"branch_id", "amount"}
+    def _persona(hierarchies):
+        return _t.SimpleNamespace(
+            id=uuid.uuid4(), name="hier", included_measure_ids=[],
+            included_dimension_ids=[], included_hierarchy_ids=hierarchies,
+            default_filters={},
+        )
+
+    on_list = _bound_double(False, *fields, star_expanded=True)
+    enforce_persona(_persona(["h-1"]), on_list, None)
+    assert [d.name for d in on_list.resolved_dimensions] == ["region", "branch_id"]
+    assert [m.name for m in on_list.resolved_measures] == ["amount"]
+
+    off_list = _bound_double(False, *fields, star_expanded=True)
+    enforce_persona(_persona(["h-other"]), off_list, None)
+    assert [d.name for d in off_list.resolved_dimensions] == ["branch_id"]
+    assert [m.name for m in off_list.resolved_measures] == ["amount"]
 
 
-def test_nq2c_f1_cls_data_tag_parity() -> None:
-    """NQ2C-F1 second instance: under CLS data tags, a NON-star projection
-    populates ``blocked`` (the caller 403s) where a star narrows. The NQ
-    narrowing must exclude every restricted-closure field, and the narrowed
-    projection must then pass the REAL ``_check_column_restrictions`` with an
-    empty blocked list."""
-    import types as _t
+def test_star_expanded_projection_narrows_in_the_column_security_gate() -> None:
+    """The second gate, same property: ``_check_column_restrictions`` narrows a
+    server-expanded projection instead of blocking it.
 
-    from src.api.routes import _named_query_allowed_star_fields
-
-    persona = _t.SimpleNamespace(
-        id=uuid.uuid4(), name="tagged", included_measure_ids=[],
-        included_dimension_ids=[], included_hierarchy_ids=[],
-        default_filters={},
-    )
-    snapshot = _snapshot()
-    restricted_ids = {"c-sale"}  # the sale_id column is tag-restricted
-
-    allowed = _named_query_allowed_star_fields(
-        persona=persona,
-        snapshot=snapshot,
-        persona_allow_lists=False,
-        restricted_column_ids=restricted_ids,
-    )
-    # sale_id is dropped (its source column is restricted); month_name and the
-    # plain amount measure stay.
-    assert allowed == {"month_name", "amount"}
-
-    # The narrowed projection passes the REAL runtime CLS check: no blocked
-    # columns -> no 403. (The full projection would block sale_id — the flip
-    # proven end-to-end by the decision-matrix real-_handle_execute CLS cell.)
+    A restricted column in an explicit projection is BLOCKED (the caller named
+    it); in a star, or in a server expansion of one, it is removed and the
+    query proceeds over what remains.
+    """
     import asyncio
+    import types as _t
 
     from src.routing.router import _check_column_restrictions
 
-    async def _run():
-        bound = _t.SimpleNamespace(
-            logical_query=_t.SimpleNamespace(
-                select_star=False, has_complex_sql=False,
-            ),
-            resolved_measures=[
-                _t.SimpleNamespace(
-                    id="m-amount", name="amount", measure_type="standard",
-                    source_column_id="c-amount", display_column_id=None,
-                    user_defined_attribute_id=None, variant_of_measure_id=None,
-                    expression=None, calc_expression=None,
-                ),
-            ],
-            resolved_dimensions=[
-                _t.SimpleNamespace(
-                    id="d-month", name="month_name", hierarchy_id=None,
-                    source_column_id="c-month", display_column_id=None,
-                    user_defined_attribute_id=None, calc_expression=None,
-                ),
-            ],
-            resolved_filters=[],
-            persona_narrowed_star=False,
-        )
-
-        class _ScalarsAll:
-            def __init__(self, rows):
-                self._rows = list(rows)
-
-            def scalars(self):
-                return self
-
-            def all(self):
-                return self._rows
-
-        db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[
-            _ScalarsAll([_t.SimpleNamespace(data_tag_id="tag-1")]),
-            _ScalarsAll(["c-sale"]),
-        ])
-        return await _check_column_restrictions(bound, persona, db)
-
-    blocked = asyncio.run(_run())
-    assert blocked == []
-
-
-def test_nq2c_f1_empty_narrowing_reproduces_the_cls_403_not_the_value_error() -> None:
-    """The empty-narrowed case must reproduce the EXISTING CLS 403
-    (router's star-fully-restricted shape), not the expansion's ValueError —
-    asserted at the helper level: every exposed field restricted -> empty set,
-    and the handler turns that into the OBJECT_NOT_AVAILABLE 403."""
-    import types as _t
-
-    from src.api.routes import _named_query_allowed_star_fields
-
     persona = _t.SimpleNamespace(
         id=uuid.uuid4(), name="tagged", included_measure_ids=[],
         included_dimension_ids=[], included_hierarchy_ids=[],
         default_filters={},
     )
-    snapshot = _snapshot()
-    allowed = _named_query_allowed_star_fields(
-        persona=persona,
-        snapshot=snapshot,
-        persona_allow_lists=False,
-        restricted_column_ids={"c-sale", "c-month", "c-amount"},
+
+    class _ScalarsAll:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def scalars(self):
+            return ScalarResult(self._rows)
+
+        def all(self):
+            return self._rows
+
+    def _db():
+        """Two restriction lookups, then empty results for any follow-on
+        query the gate makes (the derived-expression sweep)."""
+        scripted = [
+            _ScalarsAll([_t.SimpleNamespace(data_tag_id="tag-1")]),
+            _ScalarsAll(["c-sale"]),
+        ]
+
+        async def _execute(*_a, **_kw):
+            return scripted.pop(0) if scripted else _ScalarsAll([])
+
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=_execute)
+        return db
+
+    fields = (
+        [("d-month", "month_name", None, "c-month"),
+         ("d-sale", "sale_id", None, "c-sale")],
+        [("m-amount", "amount", "c-amount")],
     )
-    assert allowed == set()
+
+    # Explicit projection: the restricted column is BLOCKED and reported.
+    explicit = _bound_double(False, *fields)
+    blocked = asyncio.run(_check_column_restrictions(explicit, persona, _db()))
+    assert blocked, "an explicitly named restricted column must be blocked"
+
+    # Server-expanded projection: narrowed, nothing blocked, sale_id gone.
+    expanded = _bound_double(False, *fields, star_expanded=True)
+    assert asyncio.run(
+        _check_column_restrictions(expanded, persona, _db())
+    ) == []
+    assert [d.name for d in expanded.resolved_dimensions] == ["month_name"]
+    assert expanded.persona_narrowed_star is True
+
+
+def test_star_narrowed_to_nothing_refuses_with_object_not_available() -> None:
+    """Bug-9899 (M-2 parity): an allow-list that removes EVERY field must
+    refuse, not hand the pipeline an empty projection.
+
+    The column-level-security gate has raised this since Bug-809; the persona
+    allow-list gate did not, and the Named Query serve path compensated with
+    its own 403 built on its own copy of the narrowing. With the narrowing
+    consolidated, the refusal lives with it.
+    """
+    import types as _t
+
+    from fastapi import HTTPException
+
+    from src.security.persona_gate import enforce_persona
+
+    persona = _t.SimpleNamespace(
+        id=uuid.uuid4(), name="nothing",
+        included_measure_ids=[str(uuid.uuid4())],
+        included_dimension_ids=[str(uuid.uuid4())],
+        included_hierarchy_ids=[], default_filters={},
+    )
+    bound = _bound_double(
+        False,
+        [("d-month", "month_name", None, "c-month")],
+        [("m-amount", "amount", "c-amount")],
+        star_expanded=True,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        enforce_persona(persona, bound, None)
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+    assert "No columns are available" in exc_info.value.detail["message"]
 
 
 def test_physical_repro_build_and_live_send_the_same_expanded_definition() -> None:
@@ -793,6 +772,15 @@ def test_physical_repro_build_and_live_send_the_same_expanded_definition() -> No
     build_body = asyncio.run(_build_body())
     assert build_body["raw_query"] == expanded
     assert build_body["force_route"] == "source"
+    # Bug-9169: the materialised branch serves a bare ``SELECT *`` over the
+    # artifact, so the artifact's column set must be the one the LIVE bind
+    # produces or the two legs would return different columns for the same
+    # Named Query. Both legs take ``include_hidden`` from the SAME canonical
+    # population contract and neither can take it from the caller, which is
+    # what makes the column sets identical by construction.
+    assert build_body["include_hidden"] is False
+    assert build_body["protocol"] == "jdbc"
+    assert build_body["dialect"] == "postgres"
 
     # Live side: drive the REAL central live helper with a HOSTILE outer
     # reference (raw classification + include_hidden + foreign dialect +
@@ -815,7 +803,9 @@ def test_physical_repro_build_and_live_send_the_same_expanded_definition() -> No
         session_vars={"app.x": "1"},
         caption_dimensions=["month_name"],
     )
-    nq = types.SimpleNamespace(name="star_nq")
+    nq = types.SimpleNamespace(
+        name="star_nq", definition_sql="SELECT * FROM modely",
+    )
 
     with patch.object(_routes, "_handle_execute", new=exec_mock):
         response = asyncio.run(
@@ -858,7 +848,9 @@ def test_live_helper_asserts_the_source_route() -> None:
     )
     exec_mock = AsyncMock(return_value=non_source)
     body = _routes.ExecuteRequest(model_id=str(_MODEL_ID), raw_query="x")
-    nq = types.SimpleNamespace(name="star_nq")
+    nq = types.SimpleNamespace(
+        name="star_nq", definition_sql="SELECT * FROM modely",
+    )
 
     with patch.object(_routes, "_handle_execute", new=exec_mock):
         with pytest.raises(HTTPException) as exc_info:
@@ -940,7 +932,10 @@ def test_load_deployed_definition_fails_closed_when_undeployed_or_absent() -> No
     from shared.named_query.refresh import _load_deployed_named_query_definition
 
     model = types.SimpleNamespace(id=_MODEL_ID, deployed_version_id=None)
-    live_nq = types.SimpleNamespace(id=_NQ_ID, name="star_nq")
+    live_nq = types.SimpleNamespace(
+        id=_NQ_ID, name="star_nq",
+        definition_sql="SELECT * FROM modely",
+    )
     db = AsyncMock()
     with pytest.raises(ValueError, match="not deployed"):
         asyncio.run(
@@ -997,7 +992,10 @@ def test_nq2c_f3_snapshot_loads_by_the_captured_build_pointer() -> None:
     model = types.SimpleNamespace(
         id=_MODEL_ID, deployed_version_id=newer_version_id,
     )
-    live_nq = types.SimpleNamespace(id=_NQ_ID, name="star_nq")
+    live_nq = types.SimpleNamespace(
+        id=_NQ_ID, name="star_nq",
+        definition_sql="SELECT * FROM modely",
+    )
     db = AsyncMock()
     db.get = AsyncMock(return_value=captured_version)
 
@@ -1021,7 +1019,10 @@ def test_nq2c_f3_captured_pointer_missing_or_mismatched_fails_closed() -> None:
     from shared.db.models import ModelVersion
     from shared.named_query.refresh import _load_deployed_named_query_definition
 
-    live_nq = types.SimpleNamespace(id=_NQ_ID, name="star_nq")
+    live_nq = types.SimpleNamespace(
+        id=_NQ_ID, name="star_nq",
+        definition_sql="SELECT * FROM modely",
+    )
     model = types.SimpleNamespace(
         id=_MODEL_ID, deployed_version_id=_VERSION_ID,
     )

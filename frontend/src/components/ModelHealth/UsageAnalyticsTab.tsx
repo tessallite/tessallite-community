@@ -39,7 +39,7 @@ const RANGE_OPTIONS = [
 
 const ROUTE_COLORS: Record<string, string> = {
   aggregate: "#4caf50",
-  pocket: "#2196f3",
+  cache: "#2196f3",
   source: "#ff9800",
 };
 
@@ -221,7 +221,7 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
                             bgcolor: ROUTE_COLORS[r.route_type] ?? "grey.500",
                             minWidth: r.pct > 0 ? 2 : 0,
                           }}
-                          title={`${r.route_type}: ${r.count} (${r.pct}%)`}
+                          title={`${t("usageAnalytics.route." + r.route_type)}: ${r.count} (${r.pct}%)`}
                         />
                       ))}
                     </Box>
@@ -237,7 +237,7 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
                             }}
                           />
                           <Typography variant="caption">
-                            {r.route_type}: {r.count} ({r.pct}%)
+                            {t("usageAnalytics.route." + r.route_type)}: {r.count} ({r.pct}%)
                           </Typography>
                         </Box>
                       ))}

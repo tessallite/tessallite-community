@@ -16,6 +16,14 @@ export interface AutoChartSpec {
 const MAX_POINTS = 80;
 const MAX_LABEL_CARDINALITY = 120;
 
+// Bug-7385: chartSpec is a pure, i18n-free builder (shared-ui has no
+// translation dependency of its own — see the package README). These
+// sentinels let the renderer, which does have a `t()`, localize the
+// dimension/label/series-name text instead of it being baked in here.
+export const ROW_DIMENSION = "__row";
+export const MEASURES_DIMENSION = "__measures";
+export const VALUE_SERIES_NAME = "__value";
+
 export function buildAutoChartSpec(
   rows: Record<string, unknown>[],
   maxPoints = MAX_POINTS,
@@ -36,16 +44,16 @@ export function buildAutoChartSpec(
   const dimension =
     dimensionColumns[0] ??
     columns.find((col) => hasUsefulLabels(rows, col)) ??
-    "__row";
+    ROW_DIMENSION;
 
   const filteredRows = rows.filter(
-    (row) => dimension === "__row" || row[dimension] != null,
+    (row) => dimension === ROW_DIMENSION || row[dimension] != null,
   );
   const compactRows = filteredRows.slice(0, maxPoints);
   if (compactRows.length < 2) return null;
 
   const labels = compactRows.map((row, index) => {
-    if (dimension === "__row") return `Row ${index + 1}`;
+    if (dimension === ROW_DIMENSION) return String(index + 1);
     if (dimensionColumns.length > 1) {
       return dimensionColumns.map((col) => formatLabel(row[col])).join(" - ");
     }
@@ -108,11 +116,11 @@ function buildSingleRowSpec(
     usableValues.length;
   return {
     kind: avgLabelLen > 10 || usableValues.length > 5 ? "hbar" : "bar",
-    dimension: "Measures",
+    dimension: MEASURES_DIMENSION,
     labels: usableValues.map((item) => item.label),
     series: [
       {
-        name: "Value",
+        name: VALUE_SERIES_NAME,
         values: usableValues.map((item) => item.value),
       },
     ],

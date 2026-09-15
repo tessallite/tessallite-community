@@ -77,6 +77,7 @@ export const TIME_WINDOW_PRESETS: { preset: TimeWindowPreset; labelKey: string }
   { preset: "last_7_days", labelKey: "kpiBusiness.twLast7Days" },
   { preset: "last_14_days", labelKey: "kpiBusiness.twLast14Days" },
   { preset: "last_30_days", labelKey: "kpiBusiness.twLast30Days" },
+  { preset: "last_60_days", labelKey: "kpiBusiness.twLast60Days" },
   { preset: "last_90_days", labelKey: "kpiBusiness.twLast90Days" },
   { preset: "last_3_months", labelKey: "kpiBusiness.twLast3Months" },
   { preset: "last_6_months", labelKey: "kpiBusiness.twLast6Months" },

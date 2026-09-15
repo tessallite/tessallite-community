@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any, Literal
 
 from src.planning.contracts import (
@@ -16,6 +17,12 @@ from src.planning.enums import AnalyticalShape, AxisRole
 from src.planning.intent import AnalyticalIntent
 from src.planning.quality import evaluate_shape_data_quality
 from src.planning.temporal import temporal_part_sort_value
+
+
+_TEMPORAL_NAME_RE = re.compile(
+    r"(?:date|time|timestamp|year|month|quarter|week|day|hour|period)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -51,6 +58,7 @@ def normalize_result_shape(
     field_roles: list[FieldRole],
     contract: ShapeContract,
     limits: ShapeLimits,
+    filter_where: list[dict[str, Any]] | None = None,
 ) -> ShapedResult:
     dict_rows = _dict_rows(result_columns, result_rows)
     working_contract = replace(
@@ -84,6 +92,7 @@ def normalize_result_shape(
         quality_findings=quality,
         intent=intent,
         output_mode=output_mode,
+        filter_where=filter_where,
     )
     return ShapedResult(
         columns=columns,
@@ -265,6 +274,7 @@ def _narration_facts(
     quality_findings: list[DataQualityFinding],
     intent: AnalyticalIntent,
     output_mode: str,
+    filter_where: list[dict[str, Any]] | None = None,
 ) -> ShapeNarrationFacts:
     x_col = contract.renderer_binding.get("x") or contract.renderer_binding.get("temporal")
     series_col = contract.renderer_binding.get("series")
@@ -290,6 +300,13 @@ def _narration_facts(
         values = [row.get(x_col) for row in rows if row.get(x_col) is not None]
         if values:
             facts.date_range[x_col] = _ordered_bounds(values)
+            filtered_range = _temporal_filter_range_for_axis(x_col, filter_where)
+            if filtered_range is not None:
+                # A grouped temporal label (for example, 2026-01-01 for a
+                # year bucket) is a key, not the source period's coverage.
+                # Use the validated source filter when it is explicitly
+                # related to that derived axis.
+                facts.date_range[x_col] = filtered_range
     if series_col and rows:
         for row in rows:
             series = row.get(series_col)
@@ -360,6 +377,163 @@ def _narration_facts(
     if any(finding.code == "missing_monthly_periods" for finding in quality_findings):
         facts.gaps.append({"code": "missing_monthly_periods"})
     return facts
+
+
+def _temporal_filter_range_for_axis(
+    axis_name: str,
+    filter_where: list[dict[str, Any]] | None,
+) -> tuple[Any, Any] | None:
+    """Return a related ``between`` filter for a grouped temporal axis.
+
+    A raw date axis already reports the observed row bounds. This helper only
+    supplies a filter range when the rendered axis is a derived temporal name
+    such as ``business_date_year`` (or the generic ``period`` helper), so a
+    bucket label cannot be mistaken for the filtered source coverage.
+    """
+    if not isinstance(axis_name, str):
+        return None
+    axis = axis_name.casefold()
+    if axis != "period" and not _TEMPORAL_NAME_RE.search(axis):
+        return None
+    for item in filter_where or []:
+        if not isinstance(item, dict) or item.get("op") != "between":
+            continue
+        filter_name = item.get("name")
+        value = item.get("value")
+        if (
+            not isinstance(filter_name, str)
+            or not _TEMPORAL_NAME_RE.search(filter_name)
+            or not isinstance(value, (list, tuple))
+            or len(value) != 2
+            or any(bound is None for bound in value)
+        ):
+            continue
+        source = filter_name.casefold()
+        if axis == source:
+            continue
+        if axis == "period" or axis.startswith(f"{source}_") or source.startswith(f"{axis}_"):
+            return value[0], value[1]
+    return None
+
+
+def _comparison_target_category(
+    user_message: str | None,
+    categories: list[Any],
+) -> Any | None:
+    """Find one explicitly named category in a benchmark question."""
+    text = " ".join((user_message or "").split())
+    matches: list[Any] = []
+    for category in sorted(categories, key=lambda value: len(str(value)), reverse=True):
+        token = str(category).strip()
+        if not token:
+            continue
+        if re.search(rf"(?<!\w){re.escape(token)}(?!\w)", text, re.IGNORECASE):
+            matches.append(category)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def add_average_comparison_fact(
+    facts: ShapeNarrationFacts,
+    rows: list[dict[str, Any]],
+    *,
+    user_message: str | None,
+    complete: bool,
+    requested: bool,
+) -> None:
+    """Attach a grounded category-versus-average fact to a complete result.
+
+    Stage 1 serves the absolute grouped totals after benchmark containment. It
+    does not run a new reducer for the average. When the returned breakdown is
+    complete and has exactly one numeric value per category, the average and
+    requested category relation can be computed from those returned rows. Any
+    incomplete, duplicated, malformed, or unaddressed result receives an
+    explicit unavailable status so narration cannot infer the answer.
+    """
+    if not requested:
+        return
+
+    def unavailable(reason: str) -> None:
+        facts.average_comparison = {
+            "status": "unavailable",
+            "reason": reason,
+        }
+
+    if not complete:
+        unavailable("complete_grouped_rows_required")
+        return
+    breakdown = facts.breakdown
+    category_field = breakdown.get("category_field") if isinstance(breakdown, dict) else None
+    value_field = facts.value_label
+    if (
+        not isinstance(category_field, str)
+        or not isinstance(value_field, str)
+        or not isinstance(breakdown, dict)
+        or breakdown.get("omitted_rows", 0) != 0
+        or not rows
+    ):
+        unavailable("complete_grouped_breakdown_required")
+        return
+
+    values: list[tuple[Any, Decimal]] = []
+    seen_categories: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            unavailable("complete_grouped_breakdown_required")
+            return
+        category = row.get(category_field)
+        amount = _to_decimal(row.get(value_field))
+        category_key = str(category)
+        if (
+            category is None
+            or category_key in seen_categories
+            or amount is None
+            or not amount.is_finite()
+        ):
+            unavailable("one_numeric_value_per_category_required")
+            return
+        seen_categories.add(category_key)
+        values.append((category, amount))
+
+    if len(values) < 2 or len(values) != breakdown.get("category_count"):
+        unavailable("complete_grouped_breakdown_required")
+        return
+    target = _comparison_target_category(user_message, [category for category, _ in values])
+    if target is None:
+        unavailable("target_category_not_in_complete_grouped_rows")
+        return
+
+    average = sum((amount for _, amount in values), Decimal("0")) / Decimal(len(values))
+    comparison_rows: dict[str, dict[str, Any]] = {}
+    target_value: Decimal | None = None
+    target_key = str(target)
+    for category, amount in values:
+        relation = "above" if amount > average else "below" if amount < average else "equal"
+        comparison_rows[str(category)] = {
+            "value": float(amount),
+            "relation": relation,
+        }
+        if str(category) == target_key:
+            target_value = amount
+    if target_value is None:
+        unavailable("target_category_not_in_complete_grouped_rows")
+        return
+    facts.average_comparison = {
+        "status": "available",
+        "category_field": category_field,
+        "value_field": value_field,
+        "category_count": len(values),
+        "average_value": float(average),
+        "target_category": target,
+        "target_value": float(target_value),
+        "target_relation": (
+            "above" if target_value > average
+            else "below" if target_value < average
+            else "equal"
+        ),
+        "comparisons": comparison_rows,
+    }
 
 
 def _ordered_bounds(values: list[Any]) -> tuple[Any, Any]:

@@ -7,7 +7,7 @@ import {
   RouterProvider,
 } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Box, CircularProgress } from "@mui/material";
+import { Alert, Box, CircularProgress, Snackbar } from "@mui/material";
 import Layout from "./components/Layout";
 import RequireAuth from "./components/RequireAuth";
 import { ConfirmProvider } from "./components/Confirm";
@@ -91,6 +91,14 @@ function IndexRedirect() {
 
 function RootShell() {
   const displayLocale = useBuilderStore((s) => s.displayLocale);
+  // Bug-9559: ONE app-wide toast for every transient/success/outcome
+  // notification, mounted above the whole route tree so it works from any
+  // page — not just the Model Builder, which previously had the only
+  // renderer for this same store slice. Field-adjacent form-validation
+  // errors correctly stay as panel-local inline <Alert>s (a different
+  // message class); this covers only setGlobalMessage callers.
+  const globalMessage = useBuilderStore((s) => s.globalMessage);
+  const clearGlobalMessage = useBuilderStore((s) => s.clearGlobalMessage);
   // Bug-7726: locale bundles are lazy-loaded. Trigger the async load when
   // the display locale changes, then re-render once the bundle is cached.
   const [, setLocaleVersion] = useState(0);
@@ -115,6 +123,21 @@ function RootShell() {
         <Suspense fallback={<RouteFallback />}>
           <Outlet />
         </Suspense>
+        <Snackbar
+          open={!!globalMessage}
+          autoHideDuration={6000}
+          onClose={clearGlobalMessage}
+          anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        >
+          <Alert
+            severity={globalMessage?.severity ?? "info"}
+            onClose={clearGlobalMessage}
+            variant="filled"
+            sx={{ width: "100%" }}
+          >
+            {globalMessage?.text}
+          </Alert>
+        </Snackbar>
       </ConfirmProvider>
     </I18nContext.Provider>
   );

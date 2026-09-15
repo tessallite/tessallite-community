@@ -14,6 +14,8 @@ interface ProfileSwitcherProps {
   onSwitch: (profileId: string) => void;
   onRemove: (profileId: string) => void;
   onLogout: () => void;
+  menuAnchor?: HTMLElement | null;
+  onMenuClose?: () => void;
 }
 
 export default function ProfileSwitcher({
@@ -22,29 +24,29 @@ export default function ProfileSwitcher({
   onSwitch,
   onRemove,
   onLogout,
+  menuAnchor,
+  onMenuClose,
 }: ProfileSwitcherProps) {
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
 
-  const activeName = activeProfile
-    ? (activeProfile.name.length > 18 ? activeProfile.name.slice(0, 17) + '\u2026' : activeProfile.name)
-    : '';
+  const closeMenu = () => { setAnchorEl(null); onMenuClose?.(); };
 
   return (
     <>
-      <IconButton
+      {menuAnchor === undefined && <IconButton
         size="small"
         title={strings.profileSwitcher.title}
         aria-label={strings.profileSwitcher.switchProfileAria}
         onClick={e => setAnchorEl(e.currentTarget)}
       >
         <PersonOutline sx={{ fontSize: 20, color: tokens.colorTextSecondary }} />
-      </IconButton>
+      </IconButton>}
 
       <Menu
-        anchorEl={anchorEl}
-        open={Boolean(anchorEl)}
-        onClose={() => setAnchorEl(null)}
+        anchorEl={menuAnchor === undefined ? anchorEl : menuAnchor}
+        open={Boolean(menuAnchor === undefined ? anchorEl : menuAnchor)}
+        onClose={closeMenu}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
         transformOrigin={{ vertical: 'top', horizontal: 'right' }}
       >
@@ -68,7 +70,7 @@ export default function ProfileSwitcher({
           return (
             <MenuItem
               key={p.id}
-              onClick={() => { onSwitch(p.id); setAnchorEl(null); }}
+              onClick={() => { onSwitch(p.id); closeMenu(); }}
               selected={isActive}
               sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
             >
@@ -96,7 +98,7 @@ export default function ProfileSwitcher({
 
         <Divider />
         <MenuItem
-          onClick={() => { setAnchorEl(null); onLogout(); }}
+          onClick={() => { closeMenu(); onLogout(); }}
           sx={{ color: tokens.colorRed }}
         >
           <ListItemText
@@ -125,7 +127,7 @@ export default function ProfileSwitcher({
             onClick={() => {
               if (removeTarget) onRemove(removeTarget);
               setRemoveTarget(null);
-              setAnchorEl(null);
+              closeMenu();
             }}
             sx={{ textTransform: 'none' }}
           >

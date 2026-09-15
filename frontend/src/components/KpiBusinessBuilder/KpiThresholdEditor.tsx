@@ -138,7 +138,11 @@ export function createDefaultPresentationMeta(
   // scale the fraction-of-target boundaries by |target|. absolute_variance must
   // match the backend, which scales its default absolute_variance bands by
   // |target| (F-017-01) — storing them unscaled would repaint a beating KPI red.
-  const scale = target && Math.abs(target) > 0 ? Math.abs(target) : 100;
+  // Bug-9401: fallback must match the backend's own default-bands fallback
+  // (model-service/src/kpi_threshold.py's absolute_variance scale = `abs(target)
+  // if target not in (None, 0) else 1.0`) so a target of 0/null classifies
+  // identically on both sides instead of the frontend's stale 100x scale.
+  const scale = target && Math.abs(target) > 0 ? Math.abs(target) : 1;
   return {
     evaluation_type: effectiveType,
     bands: baseBands.map((band) => ({

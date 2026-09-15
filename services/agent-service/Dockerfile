@@ -6,12 +6,18 @@ RUN pip install uv --no-cache-dir
 
 COPY services/agent-service/pyproject.toml /app/pyproject.toml
 COPY services/agent-service/uv.lock /app/uv.lock
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# Bug-10014: source edits must reuse the installed dependency layer.
 COPY shared/ /app/shared/
 COPY services/agent-service/config/ /app/config/
 COPY services/agent-service/src/ /app/src/
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+# Bug-9960: shared tenant-readiness code is copied into this image, so prove the
+# production venv can import its Alembic dependency and resolve the shipped head.
+RUN PYTHONPATH=/app /app/.venv/bin/python -c \
+    "from shared.db.tenant_readiness import required_tenant_revision; assert required_tenant_revision()"
 
 # Drop the closed license-policy source (Phase 6). Only model-service enforces
 # caps (calls load_manager); this service never does, so no closed source ships
@@ -26,6 +32,12 @@ RUN if [ -d /app/shared/licensing/closed ]; then \
 
 # ── runtime stage ──
 FROM python:3.13-slim
+
+# Security: the python:3.x-slim base lags Debian security updates (it still ships
+# perl-base 5.40.1-6 while trixie carries 5.40.1-6+deb13u1). Nothing here installs
+# perl, so a rebuild alone never picks the fix up. Apply the available upgrades in
+# the runtime stage so inherited base-layer CVEs do not reach a release artifact.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

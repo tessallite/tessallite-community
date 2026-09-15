@@ -12,8 +12,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from shared.config.settings import get_settings
 from src.dax import credential_cache
+from src.dax.catalog_naming import CATALOG_PART_SEPARATOR
 from src.jdbc.throttle import get_governor
-from src.router_client import login_discover, login_for_token
+from src.router_client import LoginProtocolError, login_discover, login_for_token
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +37,86 @@ def _is_xmla_endpoint(path: str) -> bool:
     )
 
 
+# Bug-5534 item B: how long to tell a client to wait when the auth authority is
+# unreachable. A cold Cloud Run model-service was observed taking ~26s to serve
+# /auth/login, so this is a hint that invites a retry rather than a promise the
+# next one succeeds — a shorter value just produces a second failed attempt, and
+# a much longer one strands a client through a transient blip.
+_BACKEND_UNAVAILABLE_RETRY_AFTER_SECONDS = 15
+
+
+def _is_backend_unavailable(exc: BaseException) -> bool:
+    """True when the auth authority could not ANSWER — not when it said no.
+
+    Deliberately narrow. The first version of this fix treated every
+    non-credential exception as unavailability, which swept in an upstream 429:
+    a tenant lockout is a decision the authority made, not a failure to reach
+    it, and answering 503 to it would tell the client to retry something that
+    is being deliberately refused. Only a transport failure or a 5xx qualifies.
+    """
+    # httpx.TransportError is the family root (timeouts, connect, read, write,
+    # protocol, proxy, pool). Naming selected subclasses meant every transport
+    # failure nobody had listed fell through to the 401 branch.
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response is not None and exc.response.status_code >= 500
+    return False
+
+
+def _upstream_retry_after(exc: BaseException) -> int:
+    """Honour an upstream ``Retry-After`` when it gives a sane number.
+
+    A relayed lockout should carry the authority's own wait, not a number this
+    layer invented. Falls back to the local hint when the header is absent or
+    unparseable, and clamps so a hostile or broken value cannot strand a client.
+    """
+    response = getattr(exc, "response", None)
+    raw = None
+    if response is not None:
+        try:
+            raw = response.headers.get("Retry-After")
+        except Exception:
+            raw = None
+    try:
+        seconds = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _BACKEND_UNAVAILABLE_RETRY_AFTER_SECONDS
+    return max(1, min(seconds, 300))
+
+
+def _is_login_protocol_error(exc: BaseException) -> bool:
+    """True when the login call succeeded at HTTP level but broke its contract."""
+    return isinstance(exc, LoginProtocolError)
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """True when the upstream authority refused because of a rate limit/lockout.
+
+    A decision the authority made, and a different one from "wrong password":
+    the credentials may be perfectly good and simply being throttled.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response is not None and exc.response.status_code == 429
+    return False
+
+
 def _is_credential_failure(exc: BaseException) -> bool:
-    """Return True if *exc* is a legitimate "wrong credentials" response
-    from the upstream auth service. Everything else (DB outage, encoding
-    error, timeout) should NOT be silently masked as an auth failure.
+    """Return True ONLY for a genuine "wrong credentials" upstream rejection.
+
+    Bug-5534 review: this used to end with ``return isinstance(exc, ValueError)``
+    on the belief that ``login_discover`` raises a bare ValueError when every
+    tenant rejects the credentials. Its own docstring says otherwise — an
+    all-tenants rejection is an HTTP 401, so it arrives as ``HTTPStatusError``.
+    The only ValueError the login path actually raises is a MISSING
+    ``access_token`` COOKIE on a 2xx response, which is a backend protocol
+    violation. Classifying that as a credential failure meant a broken backend
+    purged the caller's cached token, logged "wrong credentials", and re-prompted
+    for a password that was never wrong.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response is not None and exc.response.status_code == 401
-    # login_discover raises a plain ValueError when every tenant rejects
-    # the credentials. That's the only other "legitimate failure" shape.
-    return isinstance(exc, ValueError)
+    return False
 
 
 def _is_credential_rejection(exc: BaseException) -> bool:
@@ -97,10 +168,58 @@ def _is_unknown_tenant(exc: BaseException) -> bool:
     404/422 (no such tenant) rather than 401 (wrong password). That is not an
     operational error and not a credential failure — it just means "this
     Catalog is not a tenant", so we fall through to cross-tenant discovery.
+
+    Bug-9799: a 429 is a real lockout response, not evidence that the Catalog
+    is an unknown tenant. Falling through on a generic 429 would let a locked
+    tenant account authenticate through discovery and would erase the selected
+    tenant's lockout boundary. Model-slug Catalogs remain compatible because
+    model-service returns the existing unknown-tenant/credential-rejection
+    response for that tenant-scoped probe, which is handled by the separate
+    credential-failure path.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response is not None and exc.response.status_code in (404, 422)
     return False
+
+
+def _tenant_login_slug(catalog: str) -> str:
+    """The tenant slug to attempt a tenant-scoped login with, or ``""``.
+
+    Bug-9887: the middleware used to pass the raw XMLA ``Catalog`` to
+    ``login_for_token`` as if it were a tenant slug. For every catalogue this
+    product actually publishes it is not one — ``build_catalog_name`` emits
+    ``tenant__project__model`` (optionally ``__persona``) — so that login was
+    DOOMED: model-service rejected it (401 for a user who exists in no such
+    tenant, 404/422 for an unknown tenant) and the request then
+    paid a second, O(active tenants) cross-tenant discovery login. Measured on
+    the local stack that pair cost 2.5–4.2 s on every credential-cache miss.
+
+    The published form CARRIES the tenant, so read it instead of guessing: the
+    first separated part is the tenant slug, and the tenant-scoped login now
+    succeeds on its first attempt — one login per cache miss, not two, and the
+    per-tenant lockout boundary (Bug-9799) is applied to the RIGHT tenant rather
+    than to a slug that never existed.
+
+    A BARE catalogue is left unchanged. It is either a legacy tenant slug or a
+    legacy unqualified model slug and nothing in the name distinguishes them;
+    skipping the tenant-scoped login for it would silently drop that tenant's
+    lockout boundary into cross-tenant discovery, which Bug-9799 forbids. Its
+    repeat cost is removed instead by the identity-keyed credential cache, which
+    pays that fallthrough at most once per TTL per identity rather than once per
+    catalogue switch.
+
+    Deriving by ``split`` is safe here precisely because it is only a HINT: a
+    tenant slug that itself contained the separator would yield a wrong first
+    part, model-service would answer "unknown tenant", and the existing
+    fallthrough to cross-tenant discovery still authenticates the caller — the
+    same outcome as before this change.
+    """
+    if not catalog:
+        return ""
+    head, sep, _rest = catalog.partition(CATALOG_PART_SEPARATOR)
+    if not sep:
+        return catalog
+    return head
 
 
 def _extract_catalog_from_soap(body: bytes) -> str:
@@ -210,6 +329,12 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
             encoded = auth_header[6:]
             decoded = base64.b64decode(encoded).decode("utf-8")
             username, password = decoded.split(":", 1)
+            # Bug-9869: a user name padded with whitespace (" admin@...")
+            # reached the model-service login, which matched the account, while
+            # the credential cache and every later request keyed on the padded
+            # value and answered 401. One normalisation here, before both. The
+            # password is left exactly as typed.
+            username = username.strip()
         except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
             logger.warning("Malformed Basic auth header: %s", exc)
             return self._unauthorized()
@@ -218,11 +343,16 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         body = await request.body()
         catalog = _extract_catalog_from_soap(body)
 
-        # F-002-06: short-TTL credential cache. Excel fires dozens of requests
-        # per pivot interaction with the same credentials; serve the cached JWT
-        # for the burst instead of re-logging-in each time. The handler still
+        # F-002-06: credential cache. Excel fires dozens of requests per pivot
+        # interaction with the same credentials; serve the cached JWT for the
+        # burst instead of re-logging-in each time. The handler still
         # re-validates the JWT's ``exp``, so a stale token is rejected.
-        cached = credential_cache.get(catalog, username, password)
+        #
+        # Bug-9887: keyed on the IDENTITY, not on (catalog, identity). A login
+        # authenticates the user, so a catalogue in the key only fragmented the
+        # cache — switching between a business catalogue and its technical
+        # sibling paid a fresh login for identical credentials.
+        cached = credential_cache.get(username, password)
         if cached:
             request.state.jwt_token = cached
             request.state.username = username
@@ -254,15 +384,18 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
 
         jwt_token = None
 
-        # 1) If Catalog present, try tenant-specific login. Only fall through on
-        #    a legitimate credential failure or an "unknown tenant" response
+        # 1) If Catalog present, try tenant-specific login against the TENANT
+        #    the catalogue names (Bug-9887 — see ``_tenant_login_slug``; the
+        #    catalogue itself is not a tenant slug). Only fall through on a
+        #    legitimate credential failure or an "unknown tenant" response
         #    (F-002-15: the Catalog is a model slug, not a tenant, for Excel
         #    server-endpoint connections). Any other exception is an
         #    operational problem (DB outage, timeout) and must surface.
-        if catalog:
+        tenant_slug = _tenant_login_slug(catalog)
+        if tenant_slug:
             try:
-                jwt_token = await login_for_token(catalog, username, password)
-                logger.info("Authenticated %s against tenant %s", username, catalog)
+                jwt_token = await login_for_token(tenant_slug, username, password)
+                logger.info("Authenticated %s against tenant %s", username, tenant_slug)
             except Exception as exc:
                 if _is_credential_failure(exc) or _is_unknown_tenant(exc):
                     logger.info(
@@ -270,6 +403,33 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                         "(%s) — will try cross-tenant discovery",
                         username, catalog, type(exc).__name__,
                     )
+                elif _is_rate_limited(exc):
+                    # Bug-9799 kept this from falling through to discovery, which
+                    # is still correct; what changes is that the caller is told
+                    # it was rate limited rather than that the password is wrong.
+                    logger.warning(
+                        "Tenant-specific login for %s on catalog %r was rate "
+                        "limited upstream — relaying 429, not a credential "
+                        "rejection (Bug-5534 review)",
+                        username, catalog,
+                    )
+                    return self._rate_limited_upstream(exc)
+                elif _is_login_protocol_error(exc):
+                    logger.error(
+                        "Tenant-specific login for %s on catalog %r returned a "
+                        "malformed response (%s) — the backend broke its "
+                        "contract; this is not a credential failure",
+                        username, catalog, exc,
+                    )
+                    return self._login_protocol_error()
+                elif _is_backend_unavailable(exc):
+                    logger.warning(
+                        "Tenant-specific login for %s on catalog %r could not "
+                        "reach the authority (%s: %s) — reporting it unavailable "
+                        "rather than the credentials wrong (Bug-5534 item B)",
+                        username, catalog, type(exc).__name__, exc,
+                    )
+                    return self._backend_unavailable()
                 else:
                     logger.warning(
                         "Tenant-specific login for %s on catalog %r raised %s: %s",
@@ -284,13 +444,29 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                 jwt_token = await login_discover(username, password)
                 logger.info("Authenticated %s via cross-tenant discovery", username)
             except Exception as exc:
+                if _is_rate_limited(exc):
+                    logger.warning(
+                        "Cross-tenant discovery for %s was rate limited upstream "
+                        "— relaying 429, not a credential rejection "
+                        "(Bug-5534 review)",
+                        username,
+                    )
+                    return self._rate_limited_upstream(exc)
+                if _is_login_protocol_error(exc):
+                    logger.error(
+                        "Cross-tenant discovery for %s returned a malformed "
+                        "response (%s) — the backend broke its contract; this "
+                        "is not a credential failure",
+                        username, exc,
+                    )
+                    return self._login_protocol_error()
                 if _is_credential_failure(exc):
                     # Bug-6309: the authority rejected these credentials (wrong /
                     # changed password, or a disabled account). Purge any JWT
                     # still cached for this user under earlier auth material so a
                     # subsequent request cannot be served a stale token from a
                     # prior cache hit.
-                    credential_cache.invalidate(catalog, username)
+                    credential_cache.invalidate(username)
                     # Bug-8143: record this as a failed-login for the shared
                     # throttle, but ONLY on a genuine 401 rejection — not on an
                     # operational ValueError (missing-cookie) that
@@ -305,6 +481,14 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                         "Cross-tenant discovery login failed for %s (wrong credentials)",
                         username,
                     )
+                elif _is_backend_unavailable(exc):
+                    logger.warning(
+                        "Cross-tenant discovery for %s could not reach the "
+                        "authority (%s: %s) — reporting it unavailable rather "
+                        "than the credentials wrong (Bug-5534 item B)",
+                        username, type(exc).__name__, exc,
+                    )
+                    return self._backend_unavailable()
                 else:
                     logger.warning(
                         "Cross-tenant discovery for %s raised %s: %s",
@@ -312,7 +496,7 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                     )
                 return self._unauthorized()
 
-        credential_cache.put(catalog, username, password, jwt_token)
+        credential_cache.put(username, password, jwt_token)
         # Bug-8143: a successful credential exchange clears THIS identity's
         # failure window so a legitimate user who mistyped once is not held
         # under the throttle after they authenticate correctly (matches JDBC
@@ -335,6 +519,64 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                 "Retry-After": str(retry_after),
                 "Connection": "keep-alive",
             },
+        )
+
+    def _backend_unavailable(self) -> Response:
+        """The auth authority could not answer — NOT a credential rejection.
+
+        Bug-5534 item B: when the model-service is cold (Cloud Run scaled to
+        zero, observed at ~26s to serve /auth/login), ``login_discover`` raises
+        a ReadTimeout. Both login branches caught it and returned 401, so an
+        outage was reported to the client as "wrong credentials" — the exact
+        masking ``_is_credential_failure`` documents must not happen.
+
+        The user-visible cost was real: Power BI showed an authentication
+        failure for a cold start, so the operator re-checked passwords instead
+        of waiting. A 401 also carries ``WWW-Authenticate``, which invites
+        MSOLAP to re-prompt for credentials that were never wrong; 503 asks the
+        client to retry instead, which is what actually succeeds.
+        """
+        return Response(
+            content="Authentication service unavailable",
+            status_code=503,
+            headers={
+                # Deliberately NO WWW-Authenticate: nothing is wrong with the
+                # caller's credentials and re-prompting for them is the wrong
+                # remedy.
+                "Retry-After": str(_BACKEND_UNAVAILABLE_RETRY_AFTER_SECONDS),
+                "Connection": "keep-alive",
+            },
+        )
+
+    def _rate_limited_upstream(self, exc: BaseException) -> Response:
+        """The authority refused for rate limiting, so say THAT.
+
+        Distinct from this gateway's own throttle (``_too_many_requests``),
+        which counts failures per (ip, identity) here. This one relays a refusal
+        the upstream authority made. Both are 429 — the difference is which
+        component decided — so the body names the source.
+
+        No ``WWW-Authenticate``: the credentials may be perfectly correct and
+        merely throttled, and prompting for a new password during a lockout is
+        how a user ends up changing a password that was never wrong.
+        """
+        retry_after = _upstream_retry_after(exc)
+        return Response(
+            content="Upstream authentication service is rate limiting this "
+                    "account. The credentials were not rejected.",
+            status_code=429,
+            headers={
+                "Retry-After": str(retry_after),
+                "Connection": "keep-alive",
+            },
+        )
+
+    def _login_protocol_error(self) -> Response:
+        """The authority answered successfully and broke its own contract."""
+        return Response(
+            content="Authentication service returned a malformed response.",
+            status_code=502,
+            headers={"Connection": "keep-alive"},
         )
 
     def _unauthorized(self) -> Response:

@@ -836,6 +836,22 @@ export default function JoinsPanel() {
                         </IconButton>
                       </Tooltip>
                     )}
+                    {/* Bug-10034: selecting a relationship opens this drawer
+                        over the layout panel, so Lock Route was only reachable
+                        by pressing Escape first — an undocumented workaround
+                        the browser test had to perform. The control belongs
+                        where the user already is. It goes through the same
+                        lock-aware writer as the canvas control. */}
+                    {!isReadOnly && (
+                      <Tooltip title={t("joins.toggleRouteLock")}>
+                        <IconButton size="small" aria-label={t("joins.toggleRouteLock")} data-testid={`join-toggle-route-lock-${j.id}`} onClick={(e) => {
+                          e.stopPropagation();
+                          window.dispatchEvent(new CustomEvent('toggle-edge-route-lock', { detail: j.id }));
+                        }}>
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                        </IconButton>
+                      </Tooltip>
+                    )}
                     {!isReadOnly && (
                       <Tooltip title={t("joins.togglePathing")}>
                         <IconButton size="small" aria-label={t("joins.togglePathing")} data-testid={`join-toggle-pathing-${j.id}`} onClick={(e) => {

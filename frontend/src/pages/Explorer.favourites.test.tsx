@@ -21,6 +21,7 @@ const toggleFavouriteMock = vi.fn();
 const deployModelMock = vi.fn();
 const listProjectsMock = vi.fn();
 const listModelsMock = vi.fn();
+const createModelMock = vi.fn();
 const tenantMeMock = vi.fn();
 
 vi.mock("../api/client", () => ({
@@ -29,6 +30,7 @@ vi.mock("../api/client", () => ({
   },
   modelsApi: {
     list: (...args: unknown[]) => listModelsMock(...args),
+    create: (...args: unknown[]) => createModelMock(...args),
   },
   tenantsApi: {
     me: (...args: unknown[]) => tenantMeMock(...args),
@@ -306,5 +308,24 @@ describe("Bug-8183 — model favourites come from the server", () => {
     expect(screen.getByText("Fact.customer_id ↔ Customer.id")).toBeInTheDocument();
     expect(screen.getByText("Fact.region_id ↔ Region.id")).toBeInTheDocument();
     expect(screen.queryByText(/\[object Object\]/)).not.toBeInTheDocument();
+  });
+});
+
+
+describe("Bug-10020 — model creation explains the failure", () => {
+  it.each([
+    [{ response: { data: { detail: "License not activated. Open License & Edition." } } }, "License not activated. Open License & Edition."],
+    [{ response: { data: { detail: "Model limit reached: 5 of 5." } } }, "Model limit reached: 5 of 5."],
+    [{ response: { data: { detail: "Model with this slug already exists" } } }, "Model with this slug already exists"],
+    [{}, "explorer.failedToCreateModel"],
+  ])("shows backend detail or a fallback", async (error, expected) => {
+    createModelMock.mockRejectedValueOnce(error);
+    renderExplorer();
+    await screen.findByText("Model X");
+    await userEvent.click(screen.getByLabelText("explorer.addModel"));
+    await userEvent.type(screen.getByLabelText("common.slug"), "testmodel11");
+    await userEvent.click(screen.getByRole("button", { name: "common.create" }));
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+    expect(createModelMock).toHaveBeenCalledWith("p1", { slug: "testmodel11", display_name: undefined });
   });
 });

@@ -1,6 +1,8 @@
-import { defineConfig, loadEnv } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
+import { execSync } from "child_process";
+import { readFileSync } from "fs";
 
 /**
  * Bundle splitting strategy (Phase G1 of the known-issues plan).
@@ -23,6 +25,38 @@ import path from "path";
  *    user actually clicks them open. See `App.tsx` and
  *    `pages/ModelBuilder.tsx`.
  */
+/**
+ * libavoid-js instantiates its WebAssembly binary by resolving the path itself
+ * (`libavoid.wasm`). Vite emits that binary hashed, so the runtime's own request
+ * misses and a SPA server answers it with index.html — the loader then fails with
+ * "expected magic word 00 61 73 6d, found 3c 21 64 6f", because `<!do` is HTML.
+ *
+ * The URL cannot be supplied from source: libavoid-js declares an `exports` map
+ * containing only its root entry, so the WASM cannot be imported with `?url` and passed
+ * to `AvoidLib.load(path)`.
+ *
+ * This emits an unhashed copy beside the hashed asset and at the bundle root, since the
+ * loader's resolution base is not observable from source. The bundle keeps referencing
+ * the hashed asset, so caching is unchanged; the copies exist only to satisfy the loader.
+ */
+function emitUnhashedLibavoidWasm(): Plugin {
+  return {
+    name: "emit-unhashed-libavoid-wasm",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (output.type !== "asset") continue;
+        const match = /(^|\/)libavoid-[A-Za-z0-9_-]+\.wasm$/.exec(fileName);
+        if (!match) continue;
+        const beside = fileName.replace(/libavoid-[A-Za-z0-9_-]+\.wasm$/, "libavoid.wasm");
+        for (const target of new Set([beside, "libavoid.wasm"])) {
+          this.emitFile({ type: "asset", fileName: target, source: output.source });
+        }
+      }
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   // Load .env.* variables (only those with a `VITE_` prefix are exposed
   // to client code; the dev-server config can read any var freely here).
@@ -30,8 +64,56 @@ export default defineConfig(({ mode }) => {
   const devPort = Number(env.VITE_DEV_SERVER_PORT) || 5173;
   const proxyTarget = env.VITE_DEV_PROXY_TARGET || "http://localhost:8001";
 
+  // Dev-only fallbacks for the login about line (see the `define` block
+  // below) — never used for a production build, which must keep degrading
+  // to "unknown" when the deploy pipeline forgets to inject the real values.
+  let devVersion = "";
+  let devCommitHash = "";
+  if (mode === "development") {
+    try {
+      devVersion = JSON.parse(readFileSync(path.resolve(__dirname, "package.json"), "utf-8")).version ?? "";
+    } catch {
+      devVersion = "";
+    }
+    try {
+      devCommitHash = execSync("git rev-parse HEAD", { cwd: __dirname }).toString().trim();
+    } catch {
+      devCommitHash = "";
+    }
+  }
+
   return {
-  plugins: [react()],
+  // Bug-9558: build-time injection for the login about line. The build/CI
+  // environment (or a .env file) supplies VITE_TESSALLITE_VERSION,
+  // VITE_DEPLOYMENT_TYPE and VITE_BUILD_COMMIT_HASH for a real release
+  // (Community/Enterprise/Cloud Edition); `env` above merges process.env with
+  // the .env files, process.env winning. A LOCAL DEV SERVER has none of that
+  // deploy plumbing, so it always rendered "unknown" with no type/hash at all
+  // — every developer's login screen looked identical to a broken build.
+  // Fall back to values derived from the repo itself, ONLY when the operator
+  // has not explicitly set the var: package.json's version, the current git
+  // commit, and a fixed "Dev Stack" label for a dev-mode build.
+  define: {
+    "import.meta.env.VITE_TESSALLITE_VERSION": JSON.stringify(
+      env.VITE_TESSALLITE_VERSION || (mode === "development" ? devVersion : ""),
+    ),
+    "import.meta.env.VITE_DEPLOYMENT_TYPE": JSON.stringify(
+      env.VITE_DEPLOYMENT_TYPE || (mode === "development" ? "Dev Stack" : ""),
+    ),
+    "import.meta.env.VITE_BUILD_COMMIT_HASH": JSON.stringify(
+      env.VITE_BUILD_COMMIT_HASH || (mode === "development" ? devCommitHash : ""),
+    ),
+  },
+
+  plugins: [
+    react(),
+    emitUnhashedLibavoidWasm(),
+  ],
+  worker: {
+    // ES modules: the worker uses `import.meta.url` (via libavoid's loader) and
+    // a dynamic import, neither of which is available in an iife worker.
+    format: "es",
+  },
   resolve: {
     alias: {
       "@tessallite/shared-ui": path.resolve(__dirname, "../shared-ui/src"),

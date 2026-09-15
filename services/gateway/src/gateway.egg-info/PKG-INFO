@@ -20,6 +20,7 @@ Requires-Dist: thrift>=0.16.0
 Requires-Dist: pure-sasl>=0.6.2
 Requires-Dist: sqlalchemy>=2.0.30
 Requires-Dist: asyncpg>=0.29.0
+Requires-Dist: alembic>=1.13.0
 Requires-Dist: prometheus-client>=0.20.0
 Requires-Dist: tree-sitter<0.22,>=0.21
 Requires-Dist: setuptools>=69.0.0

@@ -17,9 +17,6 @@ RUN pip install uv --no-cache-dir
 
 COPY services/query-router/pyproject.toml /app/pyproject.toml
 COPY services/query-router/uv.lock /app/uv.lock
-COPY shared/ /app/shared/
-COPY services/query-router/src/ /app/src/
-
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
@@ -31,10 +28,25 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /app/.venv/bin/python "hijri-converter==2.3.1"
 
+# Bug-10014: source edits must reuse the installed dependency layer.
+COPY shared/ /app/shared/
+COPY services/query-router/src/ /app/src/
+
+# Bug-9960: shared tenant-readiness code is copied into this image, so prove the
+# production venv can import its Alembic dependency and resolve the shipped head.
+RUN PYTHONPATH=/app /app/.venv/bin/python -c \
+    "from shared.db.tenant_readiness import required_tenant_revision; assert required_tenant_revision()"
+
 # Source-only export: closed modules removed; native compilation is not required.
 
 # ── runtime stage ──
 FROM python:3.13-slim
+
+# Security: the python:3.x-slim base lags Debian security updates (it still ships
+# perl-base 5.40.1-6 while trixie carries 5.40.1-6+deb13u1). Nothing here installs
+# perl, so a rebuild alone never picks the fix up. Apply the available upgrades in
+# the runtime stage so inherited base-layer CVEs do not reach a release artifact.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsasl2-2 unixodbc curl gnupg && \

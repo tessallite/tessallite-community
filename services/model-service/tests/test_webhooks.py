@@ -381,7 +381,7 @@ class TestSignedDeliveryFailClosed:
 
     @pytest.mark.asyncio
     async def test_attempt_delivery_refuses_unsigned_and_records_failed(self):
-        """An empty signature (missing/placeholder/undecryptable secret) must
+        """An empty signature (missing or placeholder secret) must
         NOT be transmitted and must NOT be recorded as delivered — a terminal
         failed (dlq) outcome with a clear operator-facing error instead.
 
@@ -1483,6 +1483,7 @@ class TestBug8557DestinationPinning:
         ep_result.scalars.return_value.all.return_value = [ep]
 
         db = AsyncMock()
+        db.info = {"tenant_id": TEST_TENANT}
         db.execute = AsyncMock(return_value=ep_result)
         db.add = MagicMock(side_effect=added.append)
         db.flush = AsyncMock()

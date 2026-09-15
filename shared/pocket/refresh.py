@@ -283,6 +283,7 @@ async def _get_rewritten_sql(
         "raw_query": defining_sql,
         "protocol": "jdbc",
         "dialect": "postgres",
+        "client_kind": "maintenance",
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(url, json=body, headers=headers)
@@ -335,6 +336,7 @@ async def _execute_via_router(
         "raw_query": defining_sql,
         "protocol": "jdbc",
         "dialect": "postgres",
+        "client_kind": "maintenance",
     }
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         resp = await client.post(url, json=body, headers=headers)

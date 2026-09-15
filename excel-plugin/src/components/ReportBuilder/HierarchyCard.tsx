@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Box, Typography, Chip, Collapse, Tooltip } from '@mui/material';
-import { ExpandMore, ExpandLess } from '@mui/icons-material';
+import { ExpandMore, ExpandLess, TableRowsOutlined } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import type { Hierarchy, HierarchyLevel } from '../../types/tessallite';
 import { strings, templates } from '../../i18n/strings';
@@ -9,12 +9,6 @@ interface HierarchyCardProps {
   hierarchy: Hierarchy;
   onAssignToRows: (level?: HierarchyLevel) => void;
 }
-
-const typeStyle: Record<string, { bg: string; text: string }> = {
-  date_embedded: { bg: tokens.colorGoldBg, text: tokens.colorGoldDark },
-  explicit: { bg: tokens.colorPurpleBg, text: tokens.colorPurple },
-  segment: { bg: tokens.colorPrimaryBg, text: tokens.colorPrimary },
-};
 
 // Human label for the backend type enum; the chip previously showed the raw
 // token ("date_embedded") -- the Bug-6716 defect class.
@@ -40,7 +34,6 @@ export function deriveDisplayLevels(hierarchy: Pick<Hierarchy, 'levels' | 'level
 
 export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCardProps) {
   const [expanded, setExpanded] = useState(false);
-  const tStyle = typeStyle[hierarchy.type] || typeStyle.explicit;
   const levels = deriveDisplayLevels(hierarchy);
   const levelChain = levels.map(l => l.name).join(' › ');
 
@@ -49,7 +42,7 @@ export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCa
       <Box
         sx={{
           display: 'flex', alignItems: 'center', gap: 0.75,
-          px: 1.5, py: '5px', minHeight: 30, cursor: 'pointer',
+          pl: '10px', pr: '4px', py: 0, height: 28, minHeight: 28, cursor: 'pointer',
           '&:hover .h-action': { opacity: 1 },
         }}
         onClick={() => setExpanded(!expanded)}
@@ -59,14 +52,14 @@ export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCa
           : <ExpandMore sx={{ fontSize: 14, color: tokens.colorTextSecondary, flexShrink: 0 }} />
         }
         <Tooltip title={levelChain} placement="right" arrow enterDelay={500}>
-          <Typography sx={{ fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <Typography sx={{ fontSize: 12, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {hierarchy.display_name || hierarchy.name}
           </Typography>
         </Tooltip>
         <Chip
           label={typeLabel[hierarchy.type] ?? hierarchy.type}
           size="small"
-          sx={{ fontSize: 9, height: 16, bgcolor: tStyle.bg, color: tStyle.text, flexShrink: 0 }}
+          sx={{ fontSize: 9, height: 14, bgcolor: tokens.colorSubtleFill, color: tokens.colorTextSecondary, flexShrink: 0, borderRadius: '7px' }}
         />
         {/* Bug-6708 class: a real button so keyboard users can assign; the
             hover-revealed affordance also reveals on keyboard focus. */}
@@ -76,15 +69,15 @@ export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCa
           onClick={(e) => { e.stopPropagation(); onAssignToRows(); }}
           aria-label={templates.hierarchyCard.addToRowsAria(hierarchy.display_name || hierarchy.name)}
           sx={{
-            opacity: 0, fontSize: 10, px: '5px', py: '2px', borderRadius: 0.5,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            width: 22, height: 22, p: 0, borderRadius: 0.5,
             cursor: 'pointer', color: tokens.colorPrimary, flexShrink: 0,
-            lineHeight: 1.4, transition: 'opacity 0.15s',
+            lineHeight: 1.4,
             border: 'none', bgcolor: 'transparent', fontFamily: 'inherit',
             '&:hover': { bgcolor: tokens.colorPrimaryBg },
-            '&:focus-visible': { opacity: 1 },
           }}
         >
-          Rows
+          <TableRowsOutlined sx={{ fontSize: 15 }} />
         </Box>
       </Box>
 
@@ -95,7 +88,8 @@ export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCa
               key={level.level_number}
               sx={{
                 display: 'flex', alignItems: 'center', gap: 0.5,
-                py: '3px', pl: 1.5,
+                height: 26, pl: '30px', pr: '4px',
+                bgcolor: '#fafafa',
                 position: 'relative',
                 '&:hover .level-action': { opacity: 1 },
                 '&::before': {
@@ -107,9 +101,9 @@ export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCa
             >
               <Typography
                 component="span"
-                sx={{ fontSize: 9, color: tokens.colorTextSecondary, minWidth: 14, textAlign: 'right', mr: 0.25 }}
+                sx={{ fontSize: 11, color: tokens.colorTextSecondary, minWidth: 10, textAlign: 'right', mr: 0.25 }}
               >
-                L{level.level_number}
+                └
               </Typography>
               <Typography sx={{ fontSize: 11, color: tokens.colorCharcoal, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {level.name}
@@ -127,15 +121,14 @@ export default function HierarchyCard({ hierarchy, onAssignToRows }: HierarchyCa
                 onClick={() => onAssignToRows(level)}
                 aria-label={templates.hierarchyCard.addLevelToRowsAria(hierarchy.display_name || hierarchy.name, level.name)}
                 sx={{
-                  opacity: 0, fontSize: 10, px: '5px', py: '2px', borderRadius: 0.5,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  width: 22, height: 22, p: 0, borderRadius: 0.5,
                   cursor: 'pointer', color: tokens.colorPrimary, lineHeight: 1.4,
-                  transition: 'opacity 0.15s',
                   border: 'none', bgcolor: 'transparent', fontFamily: 'inherit',
                   '&:hover': { bgcolor: tokens.colorPrimaryBg },
-                  '&:focus-visible': { opacity: 1 },
                 }}
               >
-                Rows
+                <TableRowsOutlined sx={{ fontSize: 15 }} />
               </Box>
             </Box>
           ))}

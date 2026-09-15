@@ -25,6 +25,7 @@ src/named_set_deploy_resolver.py
 src/solidatus_client.py
 src/solidatus_mapper.py
 src/solidatus_sync.py
+src/startup_migrations.py
 src/api/__init__.py
 src/api/_cascade_delete.py
 src/api/_column_helpers.py
@@ -86,6 +87,7 @@ src/api/model_docs.py
 src/api/model_settings.py
 src/api/models.py
 src/api/named_queries.py
+src/api/named_set_visibility.py
 src/api/named_sets.py
 src/api/notifications.py
 src/api/odc.py
@@ -111,6 +113,8 @@ src/api/security_audit.py
 src/api/solidatus.py
 src/api/sources.py
 src/api/sso.py
+src/api/system_log_ingest.py
+src/api/system_logs.py
 src/api/system_settings.py
 src/api/table_attributes.py
 src/api/table_preview.py
@@ -177,11 +181,25 @@ tests/test_bug7527_8484_8147_audit_events.py
 tests/test_bug8488_adhoc_threshold_preset.py
 tests/test_bug8568_adhoc_error_disposition.py
 tests/test_bug8569_target_leg_context.py
+tests/test_bug8827_startup_migration_gate.py
 tests/test_bug9158_hierarchy_batch.py
 tests/test_bug9158_tables_batch.py
 tests/test_bug9172_named_query_analytics.py
+tests/test_bug9197_platform_action_audit.py
+tests/test_bug9265_variant_regression.py
 tests/test_bug9394_measure_rename_impact.py
+tests/test_bug9396_scratchpad_rename_collision.py
+tests/test_bug9478_9480_9481_9486_l7_residuals.py
 tests/test_bug9487_fiscal_year_label_metadata.py
+tests/test_bug9535_tenant_branding_system_admin.py
+tests/test_bug9602_glossary_share_lifecycle.py
+tests/test_bug9614_webhook_commit_order.py
+tests/test_bug9871_preview_ancestor_bound.py
+tests/test_bug9877_named_set_persona_binding.py
+tests/test_bug9895_preview_over_persona_model_query.py
+tests/test_bug9896_table_preview_modeller_gate.py
+tests/test_bug9900_calendar_coverage_gate.py
+tests/test_bug9946_tenant_readiness_api.py
 tests/test_bug_5942_6033.py
 tests/test_bug_6831_count_distinct_guard.py
 tests/test_bug_7257_named_set_preview_boundary.py
@@ -190,6 +208,7 @@ tests/test_bug_8453_execute_consumers.py
 tests/test_bug_8710_kpi_list_deploy_authority.py
 tests/test_bug_8712_named_set_preview_deploy_authority.py
 tests/test_bug_8899_model_favourites.py
+tests/test_bug_9881_kpi_evaluate_deploy_authority.py
 tests/test_calculated_expression.py
 tests/test_calendar_aggregate_invalidation.py
 tests/test_calendar_auto_register.py
@@ -320,6 +339,7 @@ tests/test_llm_config_secret_gate_8259.py
 tests/test_login_discover.py
 tests/test_logs.py
 tests/test_lookml_export.py
+tests/test_maintenance_origin_payloads.py
 tests/test_measure_additivity_coercion.py
 tests/test_measure_create_fields.py
 tests/test_measure_drill_through_set_patch.py
@@ -383,6 +403,7 @@ tests/test_refresh_stream.py
 tests/test_rehydrator_ordering.py
 tests/test_result_fakes_contract.py
 tests/test_revert_race_guard.py
+tests/test_review_1_1_7_rc_startup_gate_diagnostics.py
 tests/test_row_security_api.py
 tests/test_row_security_ml6.py
 tests/test_row_security_schema.py
@@ -402,6 +423,7 @@ tests/test_solidatus_config_api.py
 tests/test_source_schema_listing.py
 tests/test_sso.py
 tests/test_sso_base_url_injection.py
+tests/test_sso_startup_public_base_url.py
 tests/test_sso_state.py
 tests/test_sync_columns_primary_key_8618.py
 tests/test_system_settings.py

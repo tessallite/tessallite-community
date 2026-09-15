@@ -157,7 +157,7 @@ export default function GitSettingsPanel() {
 
         {saveMut.isError && (
           <Alert severity="error">
-            Save failed.
+            {t("git.saveFailed")}
           </Alert>
         )}
       </Stack>

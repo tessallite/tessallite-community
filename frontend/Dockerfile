@@ -1,7 +1,7 @@
 # Stage 0: Build excel-plugin from source
 # Mirrors the Cloud Run Dockerfile.frontend plugin-builder stage so a fresh
 # clone can build the frontend image without a pre-existing excel-plugin/dist.
-FROM node:20-alpine AS plugin-builder
+FROM node:22-alpine AS plugin-builder
 
 WORKDIR /plugin
 COPY excel-plugin/package.json excel-plugin/package-lock.json ./
@@ -24,10 +24,13 @@ RUN apk add --no-cache gettext && \
     envsubst '$PLUGIN_BASE_URL' < manifest.xml.template > dist/manifest.xml
 
 # Stage 1: build React app
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
+# Bug-8815: postinstall runs scripts/link-shared-ui.js — must exist before
+# `npm ci` triggers it, so it is copied ahead of the full source COPY below.
+COPY frontend/scripts ./scripts
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
@@ -45,6 +48,13 @@ RUN ln -s /app/frontend/node_modules /app/node_modules
 # repo-root help/ tree before building.
 RUN rm -rf public/help
 COPY help/ public/help/
+
+# Bug-10057: public/excel-plugin is a generated tree, not source. Clear it and
+# lay down the freshly built dist BEFORE vite runs, so the bundle can never
+# carry a stale snapshot and no orphaned old asset survives into the image.
+# Matches infra/cloud-run/Dockerfile.frontend, which already did this.
+RUN rm -rf public/excel-plugin
+COPY --from=plugin-builder /plugin/dist/ public/excel-plugin/
 
 # Build-time API URL overrides. Leave empty by default so the SPA uses
 # same-origin relative paths (routed by the nginx proxy in stage 2).
@@ -82,7 +92,27 @@ ENV VITE_GATEWAY_JDBC_HOST=$VITE_GATEWAY_JDBC_HOST
 ENV VITE_GATEWAY_JDBC_PORT=$VITE_GATEWAY_JDBC_PORT
 ENV VITE_MODEL_SERVICE_URL=$VITE_MODEL_SERVICE_URL
 
-RUN npm run build
+# Bug-9558 (DR-02): login "about" line (version / deployment type / commit
+# hash). VITE_BUILD_COMMIT_HASH defaults to the same GIT_REVISION every
+# caller already passes for the image's OCI revision label (Bug-7759), so no
+# deploy script needs to change to get a real commit hash baked in.
+# VITE_TESSALLITE_VERSION defaults to frontend/package.json's own version so
+# it never drifts from the shipped package. VITE_DEPLOYMENT_TYPE has no
+# universal default — it is set explicitly per build (e.g. the community
+# release build in product-control-center/release_bundle.py) and otherwise
+# stays empty, which Login.tsx already omits gracefully.
+ARG GIT_REVISION=""
+ARG VITE_TESSALLITE_VERSION=""
+ARG VITE_DEPLOYMENT_TYPE=""
+ARG VITE_BUILD_COMMIT_HASH=""
+ENV VITE_DEPLOYMENT_TYPE=$VITE_DEPLOYMENT_TYPE
+ENV GIT_REVISION=$GIT_REVISION
+ENV VITE_TESSALLITE_VERSION=$VITE_TESSALLITE_VERSION
+ENV VITE_BUILD_COMMIT_HASH=$VITE_BUILD_COMMIT_HASH
+
+RUN VITE_TESSALLITE_VERSION="${VITE_TESSALLITE_VERSION:-$(node -p "require('./package.json').version")}" \
+    VITE_BUILD_COMMIT_HASH="${VITE_BUILD_COMMIT_HASH:-$GIT_REVISION}" \
+    npm run build
 
 # Stage 2: serve with nginx (same-origin API proxy)
 FROM nginx:1.31.3-alpine
@@ -93,6 +123,13 @@ RUN apk add --no-cache openssl nginx-module-njs && \
     sed -i '1i load_module modules/ngx_http_js_module.so;' /etc/nginx/nginx.conf && \
     mkdir -p /etc/nginx/certs /etc/nginx/njs
 
+# Bug-9584/9589: /var/run/tessallite-edition is the writable-directory target
+# nginx.conf.template's "location = /edition.json" aliases to. Created empty
+# here (Compose writes into it via `docker exec`; Helm replaces it entirely
+# with a ConfigMap volume mount) so a fresh container that never gets an
+# edition.json 404s cleanly rather than 403ing on a missing directory.
+RUN mkdir -p /var/run/tessallite-edition
+
 # Self-heal TLS: nginx.conf.template requires a cert unconditionally. This
 # entrypoint hook (run before nginx by the base image) generates a self-signed
 # default when none is mounted, so a fresh community compose / Helm install does
@@ -100,8 +137,11 @@ RUN apk add --no-cache openssl nginx-module-njs && \
 COPY frontend/docker-entrypoint.d/05-ensure-cert.sh /docker-entrypoint.d/05-ensure-cert.sh
 RUN chmod +x /docker-entrypoint.d/05-ensure-cert.sh
 
+# excel-plugin arrives inside this dist: the builder stage puts the freshly
+# built plugin in public/excel-plugin before vite runs. It is deliberately NOT
+# overlaid again here — a second copy onto an already-populated directory
+# merges rather than replaces, which is how stale assets used to survive.
 COPY --from=builder /app/frontend/dist /usr/share/nginx/html
-COPY --from=plugin-builder /plugin/dist /usr/share/nginx/html/excel-plugin
 COPY frontend/njs/health_and.js /etc/nginx/njs/health_and.js
 COPY frontend/njs/00-njs-health.conf /etc/nginx/conf.d/00-njs-health.conf
 
@@ -133,8 +173,8 @@ ENV GATEWAY_HOST=gateway
 ENV AGENT_SERVICE_URL=http://agent-service:8000
 ENV AGENT_SERVICE_HOST=agent-service
 
-RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d /etc/nginx/certs /etc/nginx/njs && \
-    chmod -R 755 /usr/share/nginx/html && \
+RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d /etc/nginx/certs /etc/nginx/njs /var/run/tessallite-edition && \
+    chmod -R 755 /usr/share/nginx/html /var/run/tessallite-edition && \
     touch /var/run/nginx.pid && chown nginx:nginx /var/run/nginx.pid
 USER nginx
 

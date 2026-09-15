@@ -1664,34 +1664,33 @@ class TestPathQualifiedUnameRoundTrip:
         assert filters["business_date_month"] == ["4", "5"]
         assert filters["business_date_year"] == ["2025"]
 
-    def test_drilldown_member_expansion_uses_deepest_key(self):
-        """DrilldownMember echoing a server-emitted path-qualified uname must
-        expand the member named by the deepest key, not the level caption."""
-        from src.dax.mdx_execute import _extract_drilldown_member_expansions
-        expr = (
-            "DrilldownMember({{DrilldownLevel({[Date].[Cal].[(All)]})}}, "
-            "{[Date].[Cal].[Year].&[2025]})"
+    @pytest.mark.parametrize("key", [" A ", "(A)", "((A))", "All", " ALL "])
+    def test_bug_9806_key_content_is_not_trimmed_or_unwrapped(self, key):
+        filters = self._extract(
+            f"([Date].[Cal].[Month].&[2025]&[{key}])"
         )
-        result = _extract_drilldown_member_expansions(expr)
-        assert result == {"[Date].[Cal]": ["2025"]}
+        assert filters["business_date_month"] == [key]
 
-    def test_drilldown_member_expansion_composite_key_path(self):
-        from src.dax.mdx_execute import _extract_drilldown_member_expansions
-        expr = (
-            "DrilldownMember({{DrilldownLevel({[Date].[Cal].[(All)]})}}, "
-            "{[Date].[Cal].[Month].&[2025]&[4]})"
+    def test_bug_9806_ancestor_key_content_is_preserved(self):
+        filters = self._extract(
+            "([Date].[Cal].[Month].&[(2025)]&[4])"
         )
-        result = _extract_drilldown_member_expansions(expr)
-        assert result == {"[Date].[Cal]": ["4"]}
+        assert filters["business_date_year"] == ["(2025)"]
 
-    def test_drilldown_member_expansion_caption_form_unchanged(self):
-        from src.dax.mdx_execute import _extract_drilldown_member_expansions
-        expr = (
-            "DrilldownMember({{DrilldownLevel({[Time].[Time].[All]})}}, "
-            "{[Time].[Time].[2024]})"
+    def test_bug_9806_range_endpoint_content_is_preserved(self):
+        filters = self._extract(
+            "{[Date].[Cal].[Month].&[2025]&[ A ]:"
+            "[Date].[Cal].[Month].&[2025]&[(Z)]}"
         )
-        result = _extract_drilldown_member_expansions(expr)
-        assert result == {"[Time].[Time]": ["2024"]}
+        assert filters["business_date_month"] == [
+            f"{_RANGE_PREFIX} A {_RANGE_SEP}(Z)"
+        ]
+
+    def test_synthetic_all_is_not_a_filter_but_key_form_all_is_data(self):
+        assert self._extract("([Date].[Cal].[All])") == {}
+        filters = self._extract("([Date].[Cal].&[All])")
+        assert filters["business_date_month"] == ["All"]
+
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from shared.db.tenant_readiness import TenantReadinessError
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,6 +82,11 @@ class AuthChain:
                 identity = await backend.authenticate(
                     tenant_id=tenant_id, email=email, password=password, **kwargs
                 )
+            except TenantReadinessError:
+                # A tenant whose authority or schema cannot be verified is
+                # unavailable, not a credential miss. Preserve the typed 503
+                # through the chain so login cannot turn it into a 401.
+                raise
             except Exception:
                 logger.warning(
                     "Auth backend %r raised during authenticate for %s",
@@ -101,6 +108,9 @@ class AuthChain:
                 identity = await backend.authenticate(
                     tenant_id=tenant_id, email=email, password=password, **kwargs
                 )
+            except TenantReadinessError:
+                # Preserve the common tenant serving boundary's typed 503.
+                raise
             except Exception as exc:
                 logger.warning(
                     "Auth backend %r raised during authenticate for %s",

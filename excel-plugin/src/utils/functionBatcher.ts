@@ -17,6 +17,8 @@
  * running server.
  */
 
+import { CELL_MESSAGES } from './cellMessages';
+
 /** A single pending invocation waiting to be batched. */
 export interface PendingInvocation {
   model: string;
@@ -235,7 +237,7 @@ export class FunctionBatcher {
     }
     const stale = this.pending.splice(0);
     for (const inv of stale) {
-      inv.reject(new Error('Batcher invalidated — values are being refreshed.'));
+      inv.reject(new Error(CELL_MESSAGES.batcherInvalidated));
     }
   }
 
@@ -321,7 +323,7 @@ export class FunctionBatcher {
       // #GETTING_DATA forever: these invocations were already spliced out of
       // `pending`, so invalidate() can never reach them.
       if (this.generation !== capturedGeneration) {
-        const staleError = new Error('Batcher invalidated — values are being refreshed.');
+        const staleError = new Error(CELL_MESSAGES.batcherInvalidated);
         for (const inv of group) {
           inv.reject(staleError);
         }
@@ -343,8 +345,8 @@ export class FunctionBatcher {
       // Bug-6914: settle the promises on EVERY path — a generation change
       // must not swallow the rejection.
       const error = this.generation !== capturedGeneration
-        ? new Error('Batcher invalidated — values are being refreshed.')
-        : (e instanceof Error ? e : new Error('Batch execution failed'));
+        ? new Error(CELL_MESSAGES.batcherInvalidated)
+        : (e instanceof Error ? e : new Error(CELL_MESSAGES.batchFailed));
       for (const inv of group) {
         inv.reject(error);
       }

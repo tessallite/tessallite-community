@@ -14,10 +14,12 @@ model-service -- GET  /api/v1/projects/{pid}/models
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import math
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -28,12 +30,16 @@ from shared.config.bootstrap import (
 )
 from shared.config.settings import get_settings
 from shared.middleware.internal_bypass import internal_request_headers
+from shared.auth.jwt import decode_access_token
+from shared.security.persona_resolver import PRIVILEGED_ROLES
 from shared.semantic.graph_order import is_fact_table
+from src.async_singleflight import run_singleflight
 from src.catalogue_cls import (
     build_closure_context as build_cls_closure_context,
     object_hidden_by_cls,
 )
 from src.dax.kpi_persona_filter import filter_kpis_for_persona
+from src.dax import credential_cache, member_cache
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -414,6 +420,7 @@ async def execute_query(
     client_kind: str | None = None,
     force_route: str | None = None,
     caption_dimensions: list[str] | None = None,
+    grouping_sets: list[list[str]] | None = None,
 ) -> dict[str, Any]:
     """
     POST /api/v1/execute to the query-router.
@@ -471,6 +478,16 @@ async def execute_query(
     # MUST match ``ExecuteRequest.caption_dimensions`` on the router side.
     if caption_dimensions:
         body["caption_dimensions"] = [str(d) for d in caption_dimensions]
+    # Bug-9864: rollup-lattice grouping sets. Each entry is a list of semantic
+    # dimension names that must be a subset of this query's GROUP BY grain; the
+    # query-router renders one GROUP BY GROUPING SETS plus a
+    # ``GROUPING(<col>) AS "_grouping__<dim>"`` marker per grain column, so one
+    # source operation returns every rollup grain instead of one query each.
+    # Requires force_route="source" (the router refuses otherwise: an aggregate
+    # cannot roll COUNT_DISTINCT or AVG up exactly). Field name MUST match
+    # ``ExecuteRequest.grouping_sets`` on the router side.
+    if grouping_sets is not None:
+        body["grouping_sets"] = [[str(d) for d in gs] for gs in grouping_sets]
     async with httpx.AsyncClient(timeout=_t_xlong()) as client:
         resp = await client.post(url, json=body, headers=headers)
         if resp.status_code >= 400:
@@ -550,19 +567,26 @@ async def list_models_for_project(
 # Short-TTL burst cache for the tenant catalog (Bug-5534 follow-up, Excel
 # metadata slowness). Every XMLA request re-enumerated projects + per-project
 # models (1 + N model-service GETs) even within one Excel discovery burst.
-# Keyed by (tenant, JWT) so a persona/tenant switch or re-login never serves a
-# stale scope; the TTL mirrors the metadata burst caches (30 s) — a
+# Keyed by (tenant, security-principal fingerprint) so a persona/tenant switch
+# never serves a stale scope; the TTL mirrors the metadata burst caches (30 s) — a
 # request-burst de-duplicator, not a catalog store.
 _TENANT_MODELS_CACHE_TTL_SECONDS = 30
+_TENANT_MODELS_CACHE_MAX_ENTRIES = 256
 # (stored_at, models, degraded_project_count) — the degraded count travels WITH
 # the entry so a strict reader can refuse a partial answer (Bug-9218).
 _tenant_models_cache: dict[
     tuple[str, str], tuple[float, list[dict[str, Any]], int]
 ] = {}
 _tenant_models_cache_lock = asyncio.Lock()
+_tenant_models_inflight: dict[
+    tuple[str, str], asyncio.Task[tuple[list[dict[str, Any]], int]]
+] = {}
 # Completeness of the most recent listing per (tenant, jwt) — see
 # ``tenant_listing_degraded``.
 _tenant_listing_degraded: dict[tuple[str, str], int] = {}
+_metadata_cache_bypass: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "gateway_metadata_cache_bypass", default=False,
+)
 
 
 def _tenant_models_cache_ttl() -> float:
@@ -601,8 +625,8 @@ def _tenant_models_cache_ttl() -> float:
 #
 # FAIL-CLOSED rules, per the discipline a sibling lane's result cache violated:
 #   * a failure or a DEGRADED fetch is never stored (see the call site);
-#   * the key carries the JWT, so a re-login, tenant switch or persona change
-#     can never read another scope's entry;
+#   * the key carries an authorization-principal fingerprint, so a tenant,
+#     principal, role, or group change cannot read another scope's entry;
 #   * the TTL is short, non-extendable (a read never refreshes ``stored_at``)
 #     and comes from the SAME documented lever as the shipped XMLA metadata
 #     cache — no new knob, and the same bounded staleness posture;
@@ -612,6 +636,7 @@ _METADATA_CACHE_MAX_ENTRIES = 256
 _metadata_cache: dict[
     tuple[str, str, str, str], tuple[float, tuple]
 ] = {}
+_metadata_inflight: dict[tuple[str, str, str, str], asyncio.Task[tuple]] = {}
 
 
 def _metadata_cache_key(
@@ -620,7 +645,12 @@ def _metadata_cache_key(
     jwt_token: str,
     project_slug: str | None,
 ) -> tuple[str, str, str, str]:
-    return (tenant_slug, jwt_token, str(model_id or ""), str(project_slug or ""))
+    return (
+        tenant_slug,
+        member_cache.principal_fingerprint(jwt_token),
+        str(model_id or ""),
+        str(project_slug or ""),
+    )
 
 
 def _metadata_cache_get(
@@ -668,11 +698,82 @@ def _metadata_cache_put(
     ] = (now, value)
 
 
+# ---------------------------------------------------------------------------
+# Bug-9887 — burst cache for the per-model PERSONA fan-out
+# ---------------------------------------------------------------------------
+# ``get_model_personas`` had no cache of its own. The XMLA catalogue builders
+# call it once per model, in parallel, on EVERY DBSCHEMA_CATALOGS,
+# MDSCHEMA_CATALOGS and MDSCHEMA_CUBES request — three of the ~11 calls in
+# Excel's startup Discover sequence — so the same N GETs were re-issued three
+# times per connect for identical data, and the cost grows linearly with the
+# tenant's model count.
+#
+# This deliberately reuses the SHIPPED metadata-cache mechanism rather than
+# introducing a second one: the same ``XMLA_METADATA_CACHE_TTL`` lever
+# (``_tenant_models_cache_ttl``), the same short non-extendable TTL, the same
+# principal-fingerprint scoping, and the same fail-closed rule that a FAILED
+# fetch is never stored. ``for_audience=true`` filters the list by the caller's
+# authorization claims, so those claims must stay in the key; a principal,
+# role, or group change lands on a different key, and the TTL bounds everything
+# else. ``0`` disables it, exactly as it disables the neighbouring caches.
+_PERSONAS_CACHE_MAX_ENTRIES = 256
+_personas_cache: dict[tuple[str, str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+_personas_inflight: dict[
+    tuple[str, str, str, str], asyncio.Task[list[dict[str, Any]]]
+] = {}
+
+
+def _personas_cache_get(
+    model_id: str, tenant_slug: str, jwt_token: str, project_id: str,
+) -> list[dict[str, Any]] | None:
+    import time as _time
+
+    ttl = _tenant_models_cache_ttl()
+    if ttl <= 0:
+        return None
+    entry = _personas_cache.get(
+        _metadata_cache_key(model_id, tenant_slug, jwt_token, project_id)
+    )
+    if entry is None:
+        return None
+    stored_at, value = entry
+    if (_time.monotonic() - stored_at) >= ttl:
+        return None
+    # Copied out so a caller mutating a persona dict (the XMLA row builders
+    # attach display labels) cannot corrupt the shared entry.
+    return [dict(p) for p in value]
+
+
+def _personas_cache_put(
+    model_id: str, tenant_slug: str, jwt_token: str, project_id: str,
+    value: list[dict[str, Any]],
+) -> None:
+    import time as _time
+
+    ttl = _tenant_models_cache_ttl()
+    if ttl <= 0:
+        return
+    now = _time.monotonic()
+    for key in [k for k, (ts, _v) in _personas_cache.items() if (now - ts) >= ttl]:
+        _personas_cache.pop(key, None)
+    if len(_personas_cache) >= _PERSONAS_CACHE_MAX_ENTRIES:
+        oldest = min(_personas_cache, key=lambda k: _personas_cache[k][0])
+        _personas_cache.pop(oldest, None)
+    _personas_cache[
+        _metadata_cache_key(model_id, tenant_slug, jwt_token, project_id)
+    ] = (now, [dict(p) for p in value])
+
+
 def _reset_metadata_caches_for_tests() -> None:
-    """Clear every module-level metadata cache (test isolation only)."""
+    """Clear every module-level metadata cache and registry (test isolation)."""
     _metadata_cache.clear()
+    _metadata_inflight.clear()
+    _personas_cache.clear()
+    _personas_inflight.clear()
     _tenant_models_cache.clear()
+    _tenant_models_inflight.clear()
     _tenant_listing_degraded.clear()
+    _login_inflight.clear()
 
 
 class ModelMetadataUnavailable(Exception):
@@ -700,12 +801,29 @@ def tenant_listing_degraded(tenant_slug: str, jwt_token: str) -> int:
     degrading. Zero when the listing was complete, or when it came from a
     caller-supplied stub (a stub returns a complete list by construction).
     """
-    return _tenant_listing_degraded.get((tenant_slug, jwt_token), 0)
+    key = (
+        tenant_slug,
+        member_cache.principal_fingerprint(jwt_token),
+    )
+    return _tenant_listing_degraded.get(key, 0)
+
+
+def _record_tenant_listing_degraded(
+    key: tuple[str, str], degraded: int,
+) -> None:
+    """Keep the latest listing completeness bounded and scope-specific."""
+    if key not in _tenant_listing_degraded and len(
+        _tenant_listing_degraded
+    ) >= _TENANT_MODELS_CACHE_MAX_ENTRIES:
+        _tenant_listing_degraded.pop(next(iter(_tenant_listing_degraded)), None)
+    _tenant_listing_degraded[key] = degraded
 
 
 async def list_all_models_for_tenant(
     tenant_slug: str,
     jwt_token: str,
+    *,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     """
     List all models across all projects for the tenant.
@@ -717,36 +835,62 @@ async def list_all_models_for_tenant(
     """
     import time as _time
 
-    cache_key = (tenant_slug, jwt_token)
+    cache_key = (
+        tenant_slug,
+        member_cache.principal_fingerprint(jwt_token),
+    )
     ttl = _tenant_models_cache_ttl()
+    if not use_cache or _metadata_cache_bypass.get() or ttl <= 0:
+        result, degraded = await _list_all_models_for_tenant_uncached(
+            tenant_slug, jwt_token,
+        )
+        _record_tenant_listing_degraded(cache_key, degraded)
+        return result
+
     now = _time.monotonic()
     async with _tenant_models_cache_lock:
         entry = _tenant_models_cache.get(cache_key)
         if entry is not None and (now - entry[0]) < ttl:
             _ts, cached, degraded = entry
-            # The degraded count travels WITH the cached entry, so a strict
-            # reader is not fooled by a cache hit on a partial listing.
-            _tenant_listing_degraded[cache_key] = degraded
+            _record_tenant_listing_degraded(cache_key, degraded)
             return [dict(m) for m in cached]
 
-    result, degraded = await _list_all_models_for_tenant_uncached(
-        tenant_slug, jwt_token,
-    )
-
-    async with _tenant_models_cache_lock:
-        # Opportunistic sweep so dead JWTs do not accumulate.
-        expired = [
-            k for k, ent in _tenant_models_cache.items()
-            if (now - ent[0]) >= ttl
-        ]
-        for k in expired:
-            _tenant_models_cache.pop(k, None)
-            _tenant_listing_degraded.pop(k, None)
-        _tenant_models_cache[cache_key] = (
-            now, [dict(m) for m in result], degraded,
+    async def _load() -> tuple[list[dict[str, Any]], int]:
+        result, degraded = await _list_all_models_for_tenant_uncached(
+            tenant_slug, jwt_token,
         )
-        _tenant_listing_degraded[cache_key] = degraded
-    return result
+        _record_tenant_listing_degraded(cache_key, degraded)
+        # Partial/degraded listings remain useful for broad discovery, but they
+        # must be retried rather than pinned as a completed metadata result.
+        if degraded == 0:
+            stored_at = _time.monotonic()
+            async with _tenant_models_cache_lock:
+                expired = [
+                    k for k, ent in _tenant_models_cache.items()
+                    if (stored_at - ent[0]) >= ttl
+                ]
+                for expired_key in expired:
+                    _tenant_models_cache.pop(expired_key, None)
+                    _tenant_listing_degraded.pop(expired_key, None)
+                if len(_tenant_models_cache) >= _TENANT_MODELS_CACHE_MAX_ENTRIES:
+                    oldest = min(
+                        _tenant_models_cache,
+                        key=lambda k: _tenant_models_cache[k][0],
+                    )
+                    _tenant_models_cache.pop(oldest, None)
+                _tenant_models_cache[cache_key] = (
+                    stored_at, [dict(m) for m in result], degraded,
+                )
+        return result, degraded
+
+    result, degraded = await run_singleflight(
+        _tenant_models_inflight,
+        cache_key,
+        _load,
+        max_entries=_TENANT_MODELS_CACHE_MAX_ENTRIES,
+    )
+    _record_tenant_listing_degraded(cache_key, degraded)
+    return [dict(m) for m in result]
 
 
 async def _list_all_models_for_tenant_uncached(
@@ -883,6 +1027,8 @@ async def get_model_named_sets(
     jwt_token: str,
     project_id: str = "",
     persona_id: str | None = None,
+    include_persona_hidden: bool = False,
+    reference_names: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     if not project_id:
         project_id = await _resolve_project_id(model_id, tenant_slug, jwt_token)
@@ -911,9 +1057,16 @@ async def get_model_named_sets(
     # (query-router ``params/named_list_resolver``). Sets created since the last
     # deploy are withheld; certification/governance stays live-overlaid, so the
     # deprecated filter below still reacts without a redeploy.
-    params: dict[str, str] = {"deployed_only": "true"}
+    params: dict[str, str | list[str]] = {"deployed_only": "true"}
     if persona_id:
         params["persona_id"] = str(persona_id)
+    # Bug-9877: only the Execute path asks for the persona-hidden sets, and
+    # only so it can REFUSE a reference to one. Discover never asks, so the
+    # XMLA catalogue advertises exactly the sets that bind for the persona.
+    if include_persona_hidden:
+        params["include_persona_hidden"] = "true"
+    if reference_names is not None:
+        params["reference_name"] = reference_names
     async with httpx.AsyncClient(timeout=_t_default()) as client:
         resp = await client.get(
             url,
@@ -1068,6 +1221,111 @@ async def evaluate_kpi_batch(
             continue
         result[str(row["kpi_id"])] = row
     return result
+
+
+class KpiLiveScorecardError(Exception):
+    """The live ``$KPIs`` recompute could not be produced (Bug-9894).
+
+    Raised instead of falling back to the withheld artifact rowset: an empty
+    scorecard reads as "this model has no KPIs", which is a different and
+    misleading answer from "your persona's values could not be computed".
+    """
+
+
+async def kpi_live_scorecard_rows(
+    model_id: str,
+    tenant_slug: str,
+    jwt_token: str,
+    *,
+    persona_id: str | None = None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Recompute the ``$KPIs`` scorecard LIVE on the caller's persona path.
+
+    Bug-9894 / persona-layering rule 4, audit row A26. ``kpi_latest`` holds one
+    value per KPI computed over ALL rows. When the query-router proves that
+    artifact cannot carry the caller's own narrowing -- an active row-security
+    rule, or persona default filters -- it serves no artifact row and names the
+    channel on ``kpi_artifact_skip_reason``. The scorecard is then produced the
+    way the XMLA KPI members already produce it: one governed
+    ``/kpis/evaluate-batch`` call under the CALLER'S OWN bearer and the resolved
+    relation persona, so every leg re-enters the query-router execute path with
+    that identity and the persona surface is applied by the one authority
+    (``api/kpis.py::_execute_via_router``, audit row A23).
+
+    Returns ``(columns, rows)`` in the exact ``KPI_VIRTUAL_TABLE_COLUMNS``
+    shape the router's own handler returns, so every downstream consumer --
+    projection, WHERE, ORDER BY, LIMIT shaping and column typing -- is
+    unchanged and cannot tell the two sources apart.
+    """
+    columns = [name for name, _ in KPI_VIRTUAL_TABLE_COLUMNS]
+    # Every hop is inside the guard: the deployed-KPI list and the evaluation
+    # are equally required, and either failing means the caller's values could
+    # not be produced. A partial answer here would be a wrong scorecard.
+    try:
+        kpis = await get_model_kpis(model_id, tenant_slug, jwt_token)
+        names_by_id: dict[str, str] = {}
+        for kpi in kpis:
+            kpi_id = kpi.get("id")
+            name = kpi.get("name")
+            if kpi_id and name:
+                names_by_id[str(kpi_id)] = str(name)
+        if not names_by_id:
+            # No deployed KPI at all: an empty scorecard is the honest answer
+            # and matches what the artifact path returns for the same model.
+            return columns, []
+        results = await evaluate_kpi_batch(
+            list(names_by_id),
+            model_id,
+            "",
+            tenant_slug,
+            jwt_token,
+            persona_id=persona_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised as the typed failure
+        raise KpiLiveScorecardError(str(exc)) from exc
+    evaluated_at = datetime.now(timezone.utc).isoformat()
+    rows: list[dict[str, Any]] = []
+    for kpi_id, name in names_by_id.items():
+        result = results.get(kpi_id)
+        if result is None:
+            # Fail closed per KPI: evaluate-batch omits a KPI this persona may
+            # not see (the model-service visibility gate), exactly as the
+            # artifact path omits it. Never substitute a global value.
+            continue
+        rows.append({
+            "kpi_name": name,
+            "value": _kpi_float(result.get("value")),
+            "target": _kpi_float(result.get("target")),
+            "status": _kpi_int(result.get("status")),
+            "status_label": result.get("status_label"),
+            "trend_pct": _kpi_float(result.get("trend_pct")),
+            "formatted_value": result.get("formatted_value"),
+            # A live evaluation is as of now; the artifact path reports the
+            # cached row's own evaluation time. Both answer "when was this
+            # number true", which is what the column means.
+            "evaluated_at": evaluated_at,
+        })
+    return columns, rows
+
+
+def _kpi_float(value: Any) -> float | None:
+    """Coerce an evaluate-batch numeric to the float8 the column advertises."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _kpi_int(value: Any) -> int | None:
+    """Coerce an evaluate-batch status to the int4 the column advertises."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 async def get_model_dimensions(
@@ -1244,25 +1502,60 @@ async def get_model_personas(
         project_id = await _resolve_project_id(model_id, tenant_slug, jwt_token)
     if not project_id:
         return []
-    url = (
-        f"{settings.MODEL_SERVICE_URL}/api/v1/projects/{project_id}"
-        f"/models/{model_id}/personas?for_audience=true"
+    cache_enabled = (
+        _tenant_models_cache_ttl() > 0
+        and not _metadata_cache_bypass.get()
     )
-    async with httpx.AsyncClient(timeout=_t_default()) as client:
-        try:
-            resp = await client.get(url, headers=_headers(jwt_token, tenant_slug))
-            if resp.status_code == 404:
-                return []
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:
-            # A missing persona endpoint (404 above) is a complete "no
-            # personas" answer. Any other failure is an incomplete metadata
-            # fan-out; let the caller retain the base catalogue if appropriate
-            # but mark the result non-cacheable rather than pinning a silently
-            # persona-blind catalogue for the burst TTL (Bug-9061).
-            logger.warning("Failed to list personas for model %s: %s", model_id, exc)
-            raise
+    cache_key = _metadata_cache_key(model_id, tenant_slug, jwt_token, project_id)
+    if cache_enabled:
+        # Bug-9887: burst cache. Excel's startup Discover re-issues this fan-out
+        # on DBSCHEMA_CATALOGS, MDSCHEMA_CATALOGS and MDSCHEMA_CUBES, once per
+        # model each time, for identical data.
+        cached = _personas_cache_get(model_id, tenant_slug, jwt_token, project_id)
+        if cached is not None:
+            return cached
+
+    async def _load() -> list[dict[str, Any]]:
+        url = (
+            f"{settings.MODEL_SERVICE_URL}/api/v1/projects/{project_id}"
+            f"/models/{model_id}/personas?for_audience=true"
+        )
+        async with httpx.AsyncClient(timeout=_t_default()) as client:
+            try:
+                resp = await client.get(url, headers=_headers(jwt_token, tenant_slug))
+                if resp.status_code == 404:
+                    # A complete "no personas" answer, so it is cacheable — the
+                    # 404 is the endpoint's absence, not a failed fetch.
+                    if cache_enabled:
+                        _personas_cache_put(
+                            model_id, tenant_slug, jwt_token, project_id, [],
+                        )
+                    return []
+                resp.raise_for_status()
+                personas = resp.json()
+                if isinstance(personas, list) and cache_enabled:
+                    _personas_cache_put(
+                        model_id, tenant_slug, jwt_token, project_id, personas,
+                    )
+                return personas
+            except Exception as exc:
+                # Any failure is an incomplete metadata fan-out; let the caller
+                # retain the base catalogue if appropriate but mark the result
+                # non-cacheable rather than pinning a silently persona-blind
+                # catalogue for the burst TTL (Bug-9061).
+                logger.warning(
+                    "Failed to list personas for model %s: %s", model_id, exc,
+                )
+                raise
+
+    if not cache_enabled:
+        return await _load()
+    return await run_singleflight(
+        _personas_inflight,
+        cache_key,
+        _load,
+        max_entries=_PERSONAS_CACHE_MAX_ENTRIES,
+    )
 
 
 async def get_model_snapshot(
@@ -1381,18 +1674,29 @@ async def get_hierarchy_preview(
     parent_key: str | None = None,
     persona_id: str | None = None,
     include_key_path: bool = False,
+    ancestor_keys: list[str] | None = None,
+    include_level_counts: bool = True,
 ) -> dict[str, Any]:
     """
     GET /api/v1/projects/{project_id}/models/{model_id}/hierarchies/{hierarchy_id}/preview
+
+    Bug-9871: ``ancestor_keys`` (root first, the levels above ``parent_key``)
+    bound a drill by the full ancestor path so repeated keys under different
+    ancestors (month 9 of every year) are not returned together.
 
     Bug-5424: ``persona_id`` scopes the preview to the resolved persona so
     a restricted persona cannot see hierarchy members it should not —
     mirrors the Bug-5189 pattern for dimension members.
 
     Bug-3617 (Phase 0.5b): ``include_key_path`` asks the model-service to return
-    each member's full ancestor key path when it can (parent-less whole-level
-    enumeration of a single-table hierarchy), so the XMLA layer can build the
-    canonical composite member unique name without per-member drill queries.
+    each member's full ancestor key path when it can (a parent-less whole-level
+    enumeration), so the XMLA layer can build the canonical composite member
+    unique name without per-member drill queries.
+
+    Bug-9895: ``include_level_counts=False`` suppresses the per-level distinct
+    probes. Every one of them is now a routed query on the persona model query,
+    and this path reads only ``members`` — never ``levels_summary`` — so the
+    XMLA caller turns them off rather than paying for counts it discards.
     """
     if not project_id:
         project_id = await _resolve_project_id(model_id, tenant_slug, jwt_token)
@@ -1405,10 +1709,14 @@ async def get_hierarchy_preview(
         params["expand_level"] = expand_level
     if parent_key is not None:
         params["parent_key"] = parent_key
+        if ancestor_keys:
+            params["ancestor_keys"] = list(ancestor_keys)
     if persona_id is not None:
         params["persona_id"] = persona_id
     if include_key_path:
         params["include_key_path"] = True
+    if not include_level_counts:
+        params["include_level_counts"] = False
     async with httpx.AsyncClient(timeout=_t_long()) as client:
         resp = await client.get(url, headers=_headers(jwt_token, tenant_slug), params=params)
         resp.raise_for_status()
@@ -1441,6 +1749,7 @@ async def get_dimension_members(
     jwt_token: str,
     *,
     persona_id: str | None = None,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """
     POST /api/v1/discover/members to the query-router.
@@ -1452,6 +1761,16 @@ async def get_dimension_members(
     Bug-5189: ``persona_id`` scopes the query to the resolved persona so
     a restricted persona cannot enumerate dimension members it should
     not see.
+
+    Bug-9865: ``limit`` bounds the SOURCE query to the number of members the
+    caller will actually emit. Member discovery otherwise always asks for
+    ``MEMBER_DISCOVERY_LIMIT`` (100,000) distinct values, so a whole-cube
+    browse — which discards everything past the XMLA page cap — ran one
+    unbounded ``SELECT DISTINCT ... ORDER BY`` per dimension and threw most of
+    each result away. Pass it ONLY when the caller is genuinely emitting a
+    bounded page; a specific-member lookup must stay uncapped or the member it
+    is resolving can fall off the end. ``None`` preserves the previous
+    behaviour.
     """
     url = f"{settings.QUERY_ROUTER_URL}/api/v1/discover/members"
     headers = {"Authorization": f"Bearer {jwt_token}"}
@@ -1461,6 +1780,8 @@ async def get_dimension_members(
     }
     if persona_id:
         body["persona_id"] = persona_id
+    if limit is not None and limit > 0:
+        body["limit"] = int(limit)
     async with httpx.AsyncClient(timeout=_t_long()) as client:
         try:
             resp = await client.post(url, json=body, headers=headers)
@@ -1470,11 +1791,198 @@ async def get_dimension_members(
             logger.warning("Failed to fetch members for %s.%s: %s", model_id, dimension_name, exc)
             return {"members": [], "levels": []}
 
+class NamedQueryVisibilityUnavailable(RuntimeError):
+    """The Named Query visibility verdict could not be read (C6DR-F1).
+
+    Distinct from an EMPTY verdict, which is a real answer: a persona that
+    narrows away every Named Query is a correct, cacheable result. Unobtainable
+    is not cacheable -- see the Bug-9061 completeness rule in
+    ``fetch_model_metadata``.
+    """
+
+
+async def persona_visible_named_queries(
+    model_id: str,
+    jwt_token: str,
+    persona_id: str | None,
+) -> set[str]:
+    """Lowercased names of the Named Queries that BIND for this surface.
+
+    Bug-9186 / audit rows A14, A15. Rule 4 makes visibility follow from
+    binding, and the query-router owns the bind, so the gateway asks it rather
+    than deciding for itself from a name scan over the definition text. One
+    call per surface, not one per Named Query; the router caches each verdict
+    on (model, persona, definition).
+
+    ``persona_id`` names a persona VARIANT catalogue. It is omitted for the
+    base surface, and the router then resolves the CALLER'S OWN effective
+    persona from the bearer — the same resolution ``/execute`` performs. That
+    matters: a viewer connects to the base catalogue, so deciding "no persona
+    id means no narrowing" here would have left every base-surface catalogue
+    unfiltered, which is the hole this closes. A privileged caller genuinely
+    has no persona and gets every Named Query back.
+
+    Fail CLOSED on any failure -- but SAY SO. The caller still advertises no
+    Named Query relation (the same direction as the rule this replaces, which
+    hid every Named Query on any narrowed surface), and it must also be able to
+    tell "the verdict says nothing binds" from "the verdict could not be read".
+    C6DR-F1: those two were both an empty set, so a metadata build during a
+    brief query-router outage produced an @NQ-less catalogue that the Bug-9061
+    completeness gate then CACHED as a good result, hiding every Named Query
+    relation for the whole TTL. Unobtainable raises; empty returns empty.
+    """
+    url = (
+        f"{settings.QUERY_ROUTER_URL}/api/v1/models/{model_id}/named-objects"
+    )
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+    params = {"persona_id": str(persona_id)} if persona_id else None
+    try:
+        async with httpx.AsyncClient(timeout=_t_long()) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            body = resp.json()
+    except Exception as exc:
+        logger.error(
+            "Bug-9186: the Named Query visibility catalogue could not be read "
+            "for model %s persona %s; advertising no Named Query relations on "
+            "that surface (fail closed): %s", model_id, persona_id, exc,
+        )
+        raise NamedQueryVisibilityUnavailable(str(exc)) from exc
+    return {
+        str(nq.get("name") or "").strip().lower()
+        for nq in (body or {}).get("named_queries") or []
+        if str(nq.get("name") or "").strip()
+    }
+
+
+async def visible_named_queries(
+    named_queries: list[dict[str, Any]],
+    *,
+    model_id: str,
+    persona_id: str | None,
+    jwt_token: str,
+) -> list[dict[str, Any]]:
+    """The deployed Named Queries this surface may advertise.
+
+    Bug-9186 / audit row A15. Keeps the full snapshot dicts (the catalogue
+    needs ``output_columns`` and ``description``) and narrows them to the
+    names the query-router says BIND here, so the XMLA Discover rowsets and
+    the JDBC relation set are derived from the one verdict the executor also
+    applies.
+    """
+    try:
+        visible = await persona_visible_named_queries(model_id, jwt_token, persona_id)
+    except NamedQueryVisibilityUnavailable:
+        # This consumer is per-request and never cached, so failing closed here
+        # costs one response, not a TTL of them (C6DR-F1).
+        return []
+    return [
+        nq for nq in named_queries
+        if str(nq.get("name") or "").strip().lower() in visible
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Metadata helpers -- build INFORMATION_SCHEMA inputs from model-service data
 # ---------------------------------------------------------------------------
 
+def _caller_is_privileged(jwt_token: str) -> bool:
+    """Bug-9855: does the connected user's token carry a privileged role?
+
+    Mirrors ``shared.security.persona_resolver.is_privileged_by_role`` on the
+    token claims the model-service minted (``role`` plus the optional
+    ``roles`` list). An undecodable token counts as non-privileged, so the
+    catalogue never widens on a doubt.
+    """
+    try:
+        payload = decode_access_token(jwt_token)
+    except Exception:
+        return False
+    roles = set(payload.get("roles") or [])
+    if payload.get("role"):
+        roles.add(str(payload["role"]))
+    return bool(roles & PRIVILEGED_ROLES)
+
+
+def _base_relation_persona(
+    personas: list[dict[str, Any]], *, privileged: bool,
+) -> dict[str, Any] | None:
+    """Bug-9855: the persona the query-router will apply to the BASE relation.
+
+    The base relation (``<slug>``, no persona suffix) used to be built
+    unrestricted for every caller, while execution auto-resolves the caller's
+    persona (``resolve_effective_persona``): a viewer with one assigned persona
+    was DESCRIBED the full column set (144) and SERVED the persona's (100), and
+    the gateway's own shape check then refused ``SELECT *``. This mirrors the
+    resolver's no-persona-requested branches on the audience-filtered persona
+    list (``for_audience=true`` applies the same predicate as
+    ``get_assigned_personas``): privileged callers are unrestricted; a
+    technical-persona holder always gets the technical persona; exactly one
+    assigned persona applies; none or several leave the base unrestricted (the
+    router refuses the ambiguous case explicitly at execute time).
+    """
+    if privileged:
+        return None
+    tech = next(
+        (p for p in personas if p.get("includes_hidden_columns")), None,
+    )
+    if tech is not None:
+        return tech
+    if len(personas) == 1:
+        return personas[0]
+    return None
+
+
 async def fetch_model_metadata(
+    model_id: str | None,
+    tenant_slug: str,
+    jwt_token: str,
+    project_slug: str | None = None,
+    *,
+    use_cache: bool = False,
+):
+    """Fetch metadata, coalescing only the cache-enabled startup path."""
+    if not use_cache:
+        bypass_token = _metadata_cache_bypass.set(True)
+        try:
+            return await _fetch_model_metadata_uncached(
+                model_id,
+                tenant_slug,
+                jwt_token,
+                project_slug,
+                use_cache=False,
+            )
+        finally:
+            _metadata_cache_bypass.reset(bypass_token)
+
+    if _tenant_models_cache_ttl() <= 0:
+        return await _fetch_model_metadata_uncached(
+            model_id,
+            tenant_slug,
+            jwt_token,
+            project_slug,
+            use_cache=True,
+        )
+
+    cache_key = _metadata_cache_key(model_id, tenant_slug, jwt_token, project_slug)
+    cached = _metadata_cache_get(model_id, tenant_slug, jwt_token, project_slug)
+    if cached is not None:
+        return cached
+    return await run_singleflight(
+        _metadata_inflight,
+        cache_key,
+        lambda: _fetch_model_metadata_uncached(
+            model_id,
+            tenant_slug,
+            jwt_token,
+            project_slug,
+            use_cache=True,
+        ),
+        max_entries=_METADATA_CACHE_MAX_ENTRIES,
+    )
+
+
+async def _fetch_model_metadata_uncached(
     model_id: str | None,
     tenant_slug: str,
     jwt_token: str,
@@ -1545,7 +2053,13 @@ async def fetch_model_metadata(
     # project makes a real model look absent (Bug-9218).
     strict = model_id is not None
     try:
-        all_models = await list_all_models_for_tenant(tenant_slug, jwt_token)
+        if use_cache:
+            all_models = await list_all_models_for_tenant(tenant_slug, jwt_token)
+        else:
+            # The wrapper's context-local bypass keeps this path uncached while
+            # preserving the long-standing two-argument call contract used by
+            # direct callers and test doubles.
+            all_models = await list_all_models_for_tenant(tenant_slug, jwt_token)
     except ModelMetadataUnavailable:
         raise
     except Exception as exc:
@@ -1595,6 +2109,7 @@ async def fetch_model_metadata(
     # Bug-9061: a model dropped by the degradation path below makes the result
     # incomplete, so it must not be cached (see the return statement).
     _degraded_models = 0
+    _caller_privileged = _caller_is_privileged(jwt_token)
     model_names: list[str] = []
     table_columns: dict[str, list[dict]] = {}
     table_model_id: dict[str, str] = {}
@@ -1825,7 +2340,14 @@ async def fetch_model_metadata(
         def _effective_is_hidden(item: dict) -> bool:
             return bool(item.get("is_hidden")) or _source_column_is_hidden(item)
 
-        variants: list[tuple[str, bool, dict]] = [("", False, {})]
+        # Bug-9855: the base relation carries the columns the router will
+        # actually serve this caller (see ``_base_relation_persona``).
+        _base_persona = _base_relation_persona(personas, privileged=_caller_privileged)
+        variants: list[tuple[str, bool, dict]] = [(
+            "",
+            bool(_base_persona.get("includes_hidden_columns")) if _base_persona else False,
+            _base_persona or {},
+        )]
         for persona in personas:
             slug = persona.get("slug")
             if not slug:
@@ -2064,38 +2586,90 @@ async def fetch_model_metadata(
         # snapshot when ``deployed_version_id`` is set (Bug-7979 pin), so an
         # undeployed Named Query draft never enters the catalogue and an edit
         # needs a deploy before clients can reference it (invariant 7).
+        #
+        # Bug-9186 / audit rows A14, A50 — two defects this block used to have:
+        #
+        # 1. It registered ONE relation per Named Query, unfiltered, so a
+        #    persona-restricted caller's catalogue advertised every deployed
+        #    Named Query and its FULL column list, including ones the executor
+        #    then refused. Visibility now follows the bind, decided by the
+        #    query-router (``persona_visible_named_queries``), so the
+        #    catalogue and the executor agree by construction (rule 4).
+        # 2. It set ``table_persona_id[rel] = None`` unconditionally, so no
+        #    persona ever reached the router through a Named Query relation.
+        #    A privileged caller impersonating a persona through its variant
+        #    catalogue therefore got the UNRESTRICTED Named Query. Each
+        #    variant now carries its own persona id — the ``$KPIs`` pattern
+        #    (``_register_kpi_relation``, F-008-05), which is the model this
+        #    was missing, and decision 4.3: EVERY relation on a persona-variant
+        #    catalogue carries that persona.
+        #
+        # The variant relation is ``@<name>_<persona slug>``; its
+        # ``table_query_name`` is the canonical ``@<name>`` the query-router
+        # intercepts, so ``_rewrite_exposed_relations`` folds it back before
+        # dispatch exactly as it does for a persona-variant model relation.
         if deployed_version_id:
-            for nq in snapshot.get("named_queries") or []:
-                if not isinstance(nq, dict):
-                    continue
-                nq_name = str(nq.get("name") or "").strip()
-                if not nq_name:
-                    continue
-                rel = f"@{nq_name}"
-                _owner = f"{mid}:base:nq:{str(nq.get('id') or '')}"
-                rel = _register_relation(
-                    rel, _owner, m.get("project_slug", "public"),
+            _nq_defs = [
+                nq for nq in (snapshot.get("named_queries") or [])
+                if isinstance(nq, dict) and str(nq.get("name") or "").strip()
+            ]
+            _nq_visible_by_persona: dict[str | None, set[str]] = {}
+            for _v_suffix, _v_hidden, _v_persona in variants:
+                _pid = (
+                    str(_v_persona["id"])
+                    if _v_persona and _v_persona.get("id") else None
                 )
-                model_names.append(rel)
-                table_columns[rel] = build_named_query_relation_columns(nq)
-                table_model_id[rel] = mid
-                table_persona_id[rel] = None
-                table_include_hidden[rel] = False
-                # The query_name is the relation's own @name — the query-router
-                # intercepts the literal ``@name`` reference; rewriting it to a
-                # model slug would make the reference unresolvable.
-                table_query_name[rel] = rel
-                table_row_estimates[rel] = None
-                table_project_slug[rel] = m.get("project_slug", "public")
-                table_descriptions[rel] = (
-                    nq.get("description")
-                    or f"Named Query @{nq_name} (deployed definition)"
+                if _nq_defs and _pid not in _nq_visible_by_persona:
+                    try:
+                        _nq_visible_by_persona[_pid] = (
+                            await persona_visible_named_queries(mid, jwt_token, _pid)
+                        )
+                    except NamedQueryVisibilityUnavailable:
+                        # C6DR-F1: advertise nothing for THIS response (fail
+                        # closed), but count the model degraded so the Bug-9061
+                        # gate refuses to cache it. A transient router blip must
+                        # not pin an @NQ-less catalogue for the whole TTL.
+                        _nq_visible_by_persona[_pid] = set()
+                        _degraded_models += 1
+                _visible = _nq_visible_by_persona.get(_pid, set())
+                _label = (
+                    _v_persona.get("name") or _v_persona.get("slug")
+                    if _v_persona else None
                 )
-                table_trust_meta[rel] = {
-                    "last_refreshed_at": None,
-                    "source_system": (m.get("trust_meta") or {}).get("source_system"),
-                    "owner": (m.get("trust_meta") or {}).get("owner") or "",
-                }
+                for nq in _nq_defs:
+                    nq_name = str(nq["name"]).strip()
+                    if nq_name.lower() not in _visible:
+                        continue
+                    rel = f"@{nq_name}{_v_suffix}"
+                    _owner = (
+                        f"{mid}:{_pid or 'base'}:nq:{str(nq.get('id') or '')}"
+                    )
+                    rel = _register_relation(
+                        rel, _owner, m.get("project_slug", "public"),
+                    )
+                    model_names.append(rel)
+                    table_columns[rel] = build_named_query_relation_columns(nq)
+                    table_model_id[rel] = mid
+                    table_persona_id[rel] = _pid
+                    table_include_hidden[rel] = False
+                    # The canonical ``@name`` the query-router intercepts;
+                    # rewriting it to a model slug would make the reference
+                    # unresolvable.
+                    table_query_name[rel] = f"@{nq_name}"
+                    table_row_estimates[rel] = None
+                    table_project_slug[rel] = m.get("project_slug", "public")
+                    _desc = (
+                        nq.get("description")
+                        or f"Named Query @{nq_name} (deployed definition)"
+                    )
+                    table_descriptions[rel] = (
+                        f"{_desc} ({_label})" if _label else _desc
+                    )
+                    table_trust_meta[rel] = {
+                        "last_refreshed_at": None,
+                        "source_system": (m.get("trust_meta") or {}).get("source_system"),
+                        "owner": (m.get("trust_meta") or {}).get("owner") or "",
+                    }
 
         columns_by_table = {
             column_id: str(column.get("model_table_id"))
@@ -2122,6 +2696,29 @@ async def fetch_model_metadata(
         # Generated LookML uses table-scoped adapter relations. These are a
         # technical surface: hidden fields remain queryable because Looker
         # may need a hidden declared key for symmetric aggregate SQL.
+        #
+        # Bug-9898 / persona-layering rule 4, audit row A42. That technical
+        # shape is exactly why these relations are registered with
+        # ``table_persona_id = None``, ``table_include_hidden = True`` and the
+        # UNFILTERED dimension/measure lists -- no persona allow-list, no
+        # hidden-column filter, no column-level-security closure. Persona-
+        # filtering them would break the symmetric-aggregate SQL Looker
+        # generates, so owner decision 4.5(b) keeps the shape and requires the
+        # surface to run on a PRIVILEGED, documented connection instead
+        # (``LOOKER_GATEWAY_ENABLED``, default off).
+        #
+        # ``_caller_privileged`` is that requirement, enforced. It is the same
+        # predicate ``_base_relation_persona`` uses to decide the base relation
+        # is unrestricted, so the adapter relations are advertised only to an
+        # identity the EXECUTOR also treats as persona-free: what this
+        # catalogue promises equals what ``/execute`` will accept for the same
+        # caller, by construction rather than by two policies kept in step.
+        # A non-privileged caller -- any assigned-persona viewer -- previously
+        # saw this whole persona-blind, hidden-column-exposing relation set on
+        # a plain JDBC connection.
+        _looker_surface_enabled = (
+            settings.LOOKER_GATEWAY_ENABLED and _caller_privileged
+        )
         def _relation_identifier(value: str) -> str:
             normalized = re.sub(r"[^a-z0-9_]+", "_", value.lower())
             normalized = re.sub(r"_+", "_", normalized).strip("_")
@@ -2136,11 +2733,11 @@ async def fetch_model_metadata(
             if not alias:
                 continue
             relation_name = f"{_relation_identifier(str(base_name))}__{alias}"
-            if not settings.LOOKER_GATEWAY_ENABLED:
-                # Detection-only surface when the Looker gateway is off: no
-                # catalogue maps are written for this relation, so no collision
-                # can occur — keep the raw adapter name for exposure/disabled
-                # detection.
+            if not _looker_surface_enabled:
+                # Detection-only surface when the Looker gateway is off OR the
+                # caller is not privileged (Bug-9898): no catalogue maps are
+                # written for this relation, so no collision can occur — keep
+                # the raw adapter name for exposure/disabled detection.
                 looker_relations.add(relation_name)
                 continue
             # Bug-6057 / F-001-20: when the relation IS registered into the
@@ -2369,19 +2966,40 @@ async def fetch_model_metadata(
     return result
 
 
+class LoginProtocolError(ValueError):
+    """The login call SUCCEEDED at the HTTP level but broke its contract.
+
+    Bug-5534 review: a missing ``access_token`` cookie on a 2xx response is a
+    backend protocol violation, not a rejected password. It was raised as a bare
+    ValueError, and the XMLA auth path classified every ValueError as a
+    credential failure — so a broken backend told the user their credentials
+    were wrong, purged their cached token and re-prompted for a password that
+    was never the problem.
+
+    Subclasses ValueError so existing handlers keep working; the distinct type
+    is what lets the auth boundary tell a protocol fault from a rejection.
+    """
+
+
+_LOGIN_INFLIGHT_MAX_ENTRIES = 256
+_login_inflight: dict[str, asyncio.Task[httpx.Response]] = {}
+
+
 def _extract_token_from_response(resp: httpx.Response) -> str:
     """Read the JWT from the httpOnly access_token cookie on the response."""
     token = resp.cookies.get("access_token")
     if token:
         return token
-    raise ValueError("model-service login response missing access_token cookie")
+    raise LoginProtocolError(
+        "model-service login response missing access_token cookie"
+    )
 
 
 def _login_retry_attempts() -> int:
     return int(system_snapshot_get("gateway.login_retry_attempts"))
 
 
-async def _post_login(url: str, body: dict[str, str]) -> httpx.Response:
+async def _post_login_uncached(url: str, body: dict[str, str]) -> httpx.Response:
     """POST a login relay, retrying transient transport timeouts.
 
     Bug-5534 item B: the first login after idle can hit a Cloud Run cold
@@ -2411,6 +3029,23 @@ async def _post_login(url: str, body: dict[str, str]) -> httpx.Response:
     raise last_exc
 
 
+async def _post_login(url: str, body: dict[str, str]) -> httpx.Response:
+    """Coalesce one credential exchange without retaining its response."""
+    username = str(body.get("email", "")).strip()
+    password = str(body.get("password", ""))
+    scope = str(body.get("tenant_id", ""))
+    key = credential_cache.login_key(username, password, url, scope)
+    canonical_body = dict(body)
+    if "email" in canonical_body:
+        canonical_body["email"] = username
+    return await run_singleflight(
+        _login_inflight,
+        key,
+        lambda: _post_login_uncached(url, canonical_body),
+        max_entries=_LOGIN_INFLIGHT_MAX_ENTRIES,
+    )
+
+
 async def login_for_token(tenant_slug: str, email: str, password: str) -> str:
     """
     Exchange email + plain password for a JWT from model-service.
@@ -2423,6 +3058,7 @@ async def login_for_token(tenant_slug: str, email: str, password: str) -> str:
         ValueError             -- if the response is missing the access_token cookie.
     """
     url = f"{settings.MODEL_SERVICE_URL}/api/v1/auth/login"
+    email = email.strip()
     body = {"tenant_id": tenant_slug, "email": email, "password": password}
     # BI clients open many short-lived connections; the gateway's login
     # relay must not be throttled by the model-service login limiter.
@@ -2444,6 +3080,7 @@ async def login_discover(email: str, password: str) -> str:
         ValueError if access_token cookie missing from response.
     """
     url = f"{settings.MODEL_SERVICE_URL}/api/v1/auth/login/discover"
+    email = email.strip()
     body = {"tenant_id": "_discover", "email": email, "password": password}
     resp = await _post_login(url, body)
     return _extract_token_from_response(resp)

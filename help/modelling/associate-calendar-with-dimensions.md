@@ -7,7 +7,7 @@ updated: 2026-07-04
 
 ## What this covers
 
-When you add a date or timestamp dimension to a model, Tessallite offers to associate it with a calendar table. This association is **optional** for standard, fiscal, ISO Week, and Thai Buddhist time variants because period boundaries can be computed from hierarchy calendar rules. Calendar association is required only when you need retail 4-4-5 periods, Hijri periods, dense date enumeration, custom period columns, coverage checks, or role-playing calendar aliases.
+When you add a date or timestamp dimension to a model, Tessallite offers to associate it with a calendar table. This association is **optional** for standard, fiscal, ISO Week, and Thai Buddhist time variants because period boundaries can be computed from hierarchy calendar rules. Calendar association is required only when you need retail 4-4-5 periods, Hijri periods, dense date enumeration, custom period columns, coverage checks, or calendar dimension aliases.
 
 This article explains the calendar association dialog, when to create aliases, and how the association interacts with time variants.
 
@@ -16,7 +16,7 @@ This article explains the calendar association dialog, when to create aliases, a
 ## Before you start
 
 - The dimension must reference a date or timestamp column. Non-date dimensions do not show the calendar association dialog.
-- A calendar table is only needed if you require retail 4-4-5 periods, Hijri periods, dense date enumeration, custom period columns, coverage checks, or role-playing calendar aliases. For standard, fiscal, ISO Week, or Thai Buddhist time variants, set the calendar type on the time hierarchy instead; no calendar table is required. See [Configure Time Variants](configure-time-variants.md).
+- A calendar table is only needed if you require retail 4-4-5 periods, Hijri periods, dense date enumeration, custom period columns, coverage checks, or calendar dimension aliases. For standard, fiscal, ISO Week, or Thai Buddhist time variants, set the calendar type on the time hierarchy instead; no calendar table is required. See [Configure Time Variants](configure-time-variants.md).
 - If you do want to associate a calendar table, at least one must be registered on the model's data source. See [Configure Calendar Table](configure-calendar-table.md).
 
 ---

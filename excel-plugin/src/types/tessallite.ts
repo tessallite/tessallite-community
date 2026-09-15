@@ -45,11 +45,30 @@ export interface Measure {
   effective_description?: string;
   default_agg: string;
   format?: string;
-  measure_type: 'standard' | 'calculated' | 'variant';
+  // Bug-9882: the producer (`GET .../measures`) emits 'physical' | 'standard'
+  // and marks a variant with `variant_of_measure_id`, NOT with a 'variant'
+  // measure_type. The old union invented values the server never sends, which
+  // is why the local-PivotTable safety gate classified every time-variant
+  // measure as freely re-aggregatable.
+  measure_type: 'physical' | 'standard' | 'calculated';
   display_folder?: string;
-  base_measure_id?: string;
+  /** Set when this measure is a time variant of another (producer field). */
+  variant_of_measure_id?: string;
+  /** e.g. 'cagr' | 'lag' | 'lead' | 'moving_avg_n' | 'last_n_periods'. */
+  variant_kind?: string;
   semi_additive_behavior?: string;
-  cross_model_source?: string;
+  /**
+   * Bug-9882: the producer's own verdict on whether this measure may be
+   * combined by ADDITION. It is the product's single definition of effective
+   * additivity (`shared/schemas/domains/dimensions_measures.py`,
+   * `derive_is_additive`): the server has already applied non-additive
+   * aggregation, semi-additive behaviour, time variance and calculated-measure
+   * precedence, AND honours a modeller who declared a plain sum measure
+   * non-additive — a statement nothing about the measure's SHAPE reveals.
+   * Optional because an older server may not send it; consumers must fail
+   * closed on its absence, never open.
+   */
+  is_additive?: boolean;
 }
 
 export interface Dimension {
@@ -246,6 +265,8 @@ export interface SemanticQuery {
   dimensions?: string[];
   timeDimensions?: TimeDimension[];
   filters?: QueryFilter[];
+  /** Predicates over grouped measure values; rendered as HAVING server-side. */
+  measureFilters?: MeasurePredicate[];
   segments?: string[];
   order?: Record<string, 'asc' | 'desc'>;
   limit?: number;
@@ -264,6 +285,15 @@ export interface QueryFilter {
   dimension: string;
   operator: string;
   values?: string[];
+}
+
+export interface MeasurePredicate {
+  /** Stable measure identity, never a display caption. */
+  measureId: string;
+  operator: string;
+  values: string[];
+  /** Copied from the deployed measure metadata for the request contract. */
+  effectiveAggregation: string;
 }
 
 export interface PluginRouteTrace {

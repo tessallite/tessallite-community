@@ -34,11 +34,16 @@ const STRINGS: Record<string, string> = {
   "chat.connectionError": "Connection error. Please try again.",
   "chat.emptyHint": "Ask a question to get started.",
   "chat.emptyTitle": "No messages yet",
+  "chat.compactEmptyTitle": "Ask about your data",
+  "chat.compactEmptyHint": "Questions are answered from the published model under your persona.",
+  "chat.exampleRevenue": "Revenue by region this year",
+  "chat.exampleCustomers": "Top 10 customers by margin",
   "chat.expandThought": "Expand thought stream",
   "chat.requestError": "Something went wrong. Please try again.",
   "chat.retry": "Retry",
   "chat.retryAria": "Retry sending message",
   "chat.scopeMismatch": "That conversation was created under a different model or persona. Starting a new conversation with your current settings.",
+  "chat.scrollToBottomAria": "Scroll to bottom",
   "chat.thinking": "Thinking...",
   "chat.thinkingAria": "Agent is thinking",
   "chat.thoughtStreaming": "Thought stream is available",
@@ -60,6 +65,10 @@ const STRINGS: Record<string, string> = {
   "dataTable.exceedsLimit": "Results exceed the display limit ({{count}} rows). Try refining your query.",
   "dataTable.no": "No",
   "dataTable.yes": "Yes",
+
+  // QueryBlock (Bug-7549)
+  "queryBlock.copied": "Copied",
+  "queryBlock.copy": "Copy",
   "composer.messageInputAria": "Message input",
   "composer.sendAria": "Send message",
   "composer.stopAria": "Stop generating",
@@ -72,6 +81,7 @@ const STRINGS: Record<string, string> = {
   "turn.diagnostics": "Diagnostics",
   "turn.errorFallback": "An error occurred while generating this response.",
   "turn.hideData": "Hide data",
+  "turn.maximizeVisual": "Maximize chart",
   "turn.physicalQuery": "Physical query",
   "turn.refused": "This request was refused",
   "turn.rawRecordsNotSupported": "Raw transaction records are not supported by the aggregate query tools. Ask for a count, total, or grouped summary instead.",
@@ -86,6 +96,8 @@ const STRINGS: Record<string, string> = {
 
   // Badges
   "badges.completed": "Completed",
+  "feedback.helpful": "Helpful",
+  "feedback.notHelpful": "Not helpful",
   "badges.blocked": "Blocked",
 
   // Citations
@@ -104,8 +116,11 @@ const STRINGS: Record<string, string> = {
   "chart.ariaDescription": "Chart of the query result.",
   "chart.distribution": "Distribution",
   "chart.exportTitle": "Save",
+  "chart.measuresDimension": "Measures",
   "chart.result": "Result",
+  "chart.rowsDimension": "Rows",
   "chart.trend": "Trend",
+  "chart.valueSeriesName": "Value",
 
   // Judge
   "judge.evaluating": "Reviewing answer...",
@@ -149,6 +164,7 @@ const STRINGS: Record<string, string> = {
   "badges.rows": "{{count}} rows",
   "badges.seconds": "{{seconds}}s",
   "chart.ariaLabel": "{{title}} chart. Expand the data table below for the underlying values.",
+  "chart.rowLabel": "Row {{n}}",
   "chart.truncated": "Showing first {{count}} of {{total}} rows",
   "composer.tooLong": "Message exceeds {{max}} character limit",
   "steps.header": "Steps ({{n}})",
@@ -159,6 +175,7 @@ const STRINGS: Record<string, string> = {
   "trace.physicalQueryRoute": "Physical query ({{route}})",
   "trace.toolWithValue": "Tool: {{tool}}",
   "turn.calculationSteps": "Calculation steps ({{count}})",
+  "turn.closeVisual": "Close",
   "turn.calcStepFormula": "Formula: {{formula}}",
   "turn.showData": "Show data ({{count}} rows)",
   "turn.answeredBy": "Answered by {{provider}}",

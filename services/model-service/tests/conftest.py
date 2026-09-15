@@ -180,7 +180,6 @@ def mock_emit_webhook():
         patch("src.api.model_settings.emit_webhook", noop),
         patch("src.api.access.emit_webhook", noop),
         patch("src.api.admin.emit_webhook", noop),
-        patch("src.api.tenants.emit_webhook", noop),
         patch("src.api.embed.emit_webhook", noop),
         patch("src.api.export.emit_webhook", noop),
         patch("src.api.glossary.emit_webhook", noop),

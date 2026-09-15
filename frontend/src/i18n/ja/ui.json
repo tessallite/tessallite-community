@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "デモテナント",
   "projectNav.setup": "セットアップ",
   "projectNav.ssoMappings": "SSOマッピング",
+  "projectNav.ssoIdp": "IDプロバイダ",
+  "projectNav.embedTokens": "埋め込みトークン",
   "projectNav.usersAccess": "ユーザーとアクセス権",
   "projectNav.webhooks": "Webhook",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "この変更を反映するにはサービス再起動が必要です",

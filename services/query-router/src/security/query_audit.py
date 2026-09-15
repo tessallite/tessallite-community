@@ -43,6 +43,12 @@ class SecurityAuditError(Exception):
 _STRIP_QUOTES_RE = re.compile(r"[`\"\[\]]")
 
 
+# Bug-9864: must match ``api.routes.GROUPING_MARKER_PREFIX`` and
+# ``rewrite.source_sql.GROUPING_MARKER_PREFIX``. Defined here rather than
+# imported so the security audit never depends on the HTTP layer.
+GROUPING_MARKER_PREFIX = "_grouping__"
+
+
 def _normalise(name: str) -> str:
     return _STRIP_QUOTES_RE.sub("", name).lower().strip()
 
@@ -940,6 +946,21 @@ def audit_result_columns(
         allowed.update(
             getattr(bound_query, "complex_projection_names", None) or set()
         )
+
+    # Bug-9864: rollup-lattice grouping markers. A ``grouping_sets`` request
+    # projects one ``GROUPING(<expr>) AS "_grouping__<dim>"`` per GRAIN column.
+    # The marker is a 0/1 flag saying whether that column was rolled up in a
+    # row -- it reads no new column and carries no member value, and it is
+    # emitted only for a grain column the binder already resolved and the
+    # persona already allows (the execute handler refuses any grouping set
+    # naming a dimension outside the bound grain). So authorising the marker
+    # for an ALREADY-ALLOWED grain name exposes nothing; deriving it from
+    # ``allowed`` rather than from the request is what keeps that true.
+    if getattr(lq, "grouping_sets", None):
+        for grain_name in (getattr(lq, "grain", None) or []):
+            base = _normalise(grain_name)
+            if base in allowed:
+                allowed.add(f"{GROUPING_MARKER_PREFIX}{base}")
 
     # Synthetic / well-known columns
     allowed.update(_SYNTHETIC_COLUMNS)

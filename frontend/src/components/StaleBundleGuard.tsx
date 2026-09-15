@@ -65,6 +65,7 @@ export default function StaleBundleGuard() {
     >
       <Alert
         severity="warning"
+        variant="filled"
         action={
           <Box sx={{ display: "flex", gap: 1 }}>
             <Button color="inherit" size="small" onClick={reload}>

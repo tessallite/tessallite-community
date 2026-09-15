@@ -217,7 +217,7 @@ export default function AggregatesPanel() {
             <FormControlLabel
               control={
                 <Switch
-                  checked={model.data?.include_all_measures ?? false}
+                  checked={model.data?.include_all_measures ?? true}
                   onChange={(e) =>
                     updateModel.mutate({ include_all_measures: e.target.checked })
                   }

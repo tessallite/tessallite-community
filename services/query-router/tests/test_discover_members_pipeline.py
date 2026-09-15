@@ -314,6 +314,7 @@ class TestDiscoverMembersPipeline:
         """SemanticBindingError from binder returns empty response, not 500."""
         from src.ir.logical_query import SemanticBindingError
         db = AsyncMock()
+        db.add = MagicMock()
         db.execute = AsyncMock(return_value=MagicMock(
             all=MagicMock(return_value=[]),
             scalar_one_or_none=MagicMock(return_value=None),
@@ -343,6 +344,7 @@ class TestDiscoverMembersPipeline:
         """ModelNotDeployedError surfaces as HTTP 409."""
         from src.ir.logical_query import ModelNotDeployedError
         db = AsyncMock()
+        db.add = MagicMock()
 
         with (
             patch("src.api.routes.get_tenant_db", _async_gen(db)),
@@ -630,6 +632,7 @@ class TestDiscoverMembersPipeline:
         bound = _make_bound()
         decision = _make_decision()
         db = AsyncMock()
+        db.add = MagicMock()
         db.execute = AsyncMock(return_value=MagicMock(
             all=MagicMock(return_value=[]),
             scalar_one_or_none=MagicMock(return_value=None),

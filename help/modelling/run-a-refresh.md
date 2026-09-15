@@ -15,6 +15,8 @@ A refresh re-executes the aggregate query against the source data and overwrites
 
 ## What a refresh does
 
+A refresh calculates the summary from the model and source data. It does not need another summary to exist first. Model relationships and calculation rules still apply.
+
 During a refresh, the Scheduler service:
 
 1. Connects to the source and runs the aggregate's GROUP BY query.
@@ -24,6 +26,8 @@ During a refresh, the Scheduler service:
 The drop-and-replace approach means the summary table is briefly unavailable during the write. Queries arriving during this window are routed directly to the source fact table and are answered correctly, just without the performance benefit of the aggregate.
 
 ---
+
+For an unavailable aggregate, a failed refresh updates the current error to the latest failure. Earlier failures remain in Refresh History. The aggregate stays unavailable until a successful rebuild.
 
 ## When to trigger a manual refresh
 

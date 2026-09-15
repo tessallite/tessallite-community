@@ -12,6 +12,10 @@ import { initialiseLocale } from './i18n/runtime';
 // the function names.
 import './functions';
 
+// TEST PROFILE build only (VITE_TESSALLITE_TEST_PROFILE=1). A constant `false`
+// branch in every ordinary build, removed by the bundler.
+import { isTestProfileBuild, applyTestProfile } from './testProfile';
+
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -57,9 +61,19 @@ function renderApp() {
   );
 }
 
-if (typeof Office !== 'undefined' && Office.onReady) {
-  Office.onReady(renderApp);
-  window.setTimeout(renderApp, 1500);
+function start(): void {
+  if (typeof Office !== 'undefined' && Office.onReady) {
+    Office.onReady(renderApp);
+    window.setTimeout(renderApp, 1500);
+  } else {
+    renderApp();
+  }
+}
+
+if (isTestProfileBuild) {
+  // Seed the session BEFORE React mounts, so `useAuth` restores it on its first
+  // effect and the login screen never appears. Never rejects.
+  void applyTestProfile().then(start);
 } else {
-  renderApp();
+  start();
 }

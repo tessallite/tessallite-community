@@ -34,6 +34,7 @@ import type {
 import AggregateEstimate from "../AggregateEstimate";
 import { useConfirm } from "../Confirm";
 import { useT } from "../../i18n";
+import { extractApiError } from "../../utils/extractApiError";
 
 type Mode = "create" | "edit";
 
@@ -225,7 +226,7 @@ export default function AggregateDrawer({
       qc.invalidateQueries({ queryKey: ["aggregates", projectId, modelId] });
       onClose();
     },
-    onError: (err: unknown) => setSubmitError(extractError(err, t)),
+    onError: (err: unknown) => setSubmitError(extractApiError(err, t("errors.requestFailed"))),
   });
 
   const confirmRedundantMutation = useMutation({
@@ -254,7 +255,7 @@ export default function AggregateDrawer({
       qc.invalidateQueries({ queryKey: ["aggregates", projectId, modelId] });
       onClose();
     },
-    onError: (err: unknown) => setSubmitError(extractError(err, t)),
+    onError: (err: unknown) => setSubmitError(extractApiError(err, t("errors.requestFailed"))),
   });
 
   const refreshNowMutation = useMutation({
@@ -787,18 +788,5 @@ function KV({ label, value }: { label: string; value: string }) {
       <Typography variant="body2">{value}</Typography>
     </Box>
   );
-}
-
-function extractError(err: unknown, t: ReturnType<typeof useT>): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })
-    ?.response?.data?.detail;
-  if (typeof detail === "string") return detail;
-  if (detail && typeof detail === "object") {
-    const obj = detail as { message?: string };
-    if (obj.message) return obj.message;
-    return JSON.stringify(detail);
-  }
-  if (err instanceof Error) return err.message;
-  return t("errors.requestFailed");
 }
 

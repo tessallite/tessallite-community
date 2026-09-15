@@ -57,7 +57,7 @@ export default function EmbedTokensPanel() {
       )}
       {revokeMut.isError && (
         <Alert severity="error" sx={{ mb: 2 }}>
-          {t("embedTokens.loadFailed")}
+          {t("embedTokens.revokeFailed")}
         </Alert>
       )}
 

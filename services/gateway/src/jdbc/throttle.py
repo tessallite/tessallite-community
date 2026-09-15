@@ -109,6 +109,23 @@ class JdbcConnectionGovernor:
             else:
                 self._active[key] = current - 1
 
+    def active_connection_total(self) -> int:
+        """Total admitted JDBC connections currently held, across all peers.
+
+        Read-only; the governor already maintains this to enforce the per-IP
+        cap, so exposing the sum costs nothing and changes no admission
+        behaviour.
+
+        Bug-9834: the liveness watchdog reports this in the structured event it
+        emits immediately before killing a wedged gateway. The exit destroys
+        that state, and how many sessions were held at the moment the accept
+        loop stopped answering is one of the few facts that distinguishes a
+        resource-exhaustion wedge from an idle one — so it has to be captured
+        before the process goes, not inferred afterwards.
+        """
+        with self._lock:
+            return sum(self._active.values())
+
     # ------------------------------------------------------------------
     # Auth-failure accounting
     # ------------------------------------------------------------------

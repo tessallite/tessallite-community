@@ -23,6 +23,7 @@ beforeEach(() => {
 
 import { configureApiClient } from '../api/client';
 import { createExcelAdapter } from '../api/agentChatAdapter';
+import { buildAnnotationFromCitations, buildChartRowsFromRecords } from '../utils/excelCharts';
 import { getDiagnosticsReport, clearDiagnostics } from '../utils/diagnostics';
 
 beforeEach(() => {
@@ -61,6 +62,27 @@ const CONV_FIXTURE = {
 };
 
 describe('createExcelAdapter', () => {
+  it('Bug-9737: preserves Agent string measures until citation-aware row building', async () => {
+    const adapter = createExcelAdapter(() => 'm1');
+    mockPost([{
+      id: 'turn-9737', user_message: 'base amount by account code', answer_text: null,
+      citations: [
+        { kind: 'measure', id: 'm1', name: 'base_amount', display_name: 'Base amount', value: null },
+        { kind: 'dimension', id: 'd1', name: 'account_code', display_name: 'Account code', value: null },
+      ],
+      query_result_sample: [{ base_amount: '23332917.80', account_code: '0042' }],
+    }]);
+
+    const [turn] = await adapter.getTurns('p1', 'conv-1');
+    expect(turn.query_result_sample).toEqual([{ base_amount: '23332917.80', account_code: '0042' }]);
+    const annotation = buildAnnotationFromCitations(turn.citations);
+    expect(annotation?.measures).toHaveProperty('base_amount');
+    expect(annotation?.dimensions).toHaveProperty('account_code');
+    expect(buildChartRowsFromRecords(
+      ['base_amount', 'account_code'], turn.query_result_sample!, annotation,
+    )).toEqual([[23332917.8, '0042']]);
+  });
+
   describe('createConversation', () => {
     it('sends activeModelId as pinned_model_id, not model_id', async () => {
       const adapter = createExcelAdapter(() => 'm-support');
@@ -115,17 +137,29 @@ describe('createExcelAdapter', () => {
   });
 
   describe('streamMessageRaw', () => {
-    it('passes AbortSignal to fetch', async () => {
+    it('Bug-9815: propagates caller cancellation to the transport signal', async () => {
       const adapter = createExcelAdapter(() => null);
       const controller = new AbortController();
-      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-        new Response('data: {}\n\n', { status: 200 }),
-      );
+      let transportSignal: AbortSignal | undefined;
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementationOnce((_, init) => {
+        transportSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_, reject) => {
+          transportSignal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('The operation was aborted.', 'AbortError')),
+            { once: true },
+          );
+        });
+      });
 
-      await adapter.streamMessageRaw('p1', 'conv-1', 'hello', controller.signal);
+      const request = adapter.streamMessageRaw('p1', 'conv-1', 'hello', controller.signal);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
 
-      const [, init] = fetchMock.mock.calls[0];
-      expect(init?.signal).toBe(controller.signal);
+      expect(transportSignal).not.toBe(controller.signal);
+      expect(transportSignal?.aborted).toBe(false);
+      controller.abort();
+      await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+      expect(transportSignal?.aborted).toBe(true);
     });
 
     it('forwards the idempotency key as the Idempotency-Key header (Bug-6596)', async () => {
